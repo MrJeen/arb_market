@@ -11,15 +11,15 @@ use crate::signing::polymarket::{
 };
 use alloy_primitives::{Address, B256};
 use alloy_signer_local::PrivateKeySigner;
-use rust_decimal::Decimal;
+use futures_util::{SinkExt, StreamExt};
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
-use futures_util::{SinkExt, StreamExt};
 
 const FAK_UNFILLED: &str = "no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.";
 
@@ -113,7 +113,11 @@ impl PolymarketVenue {
             .await?;
         let raw = value
             .get("balance")
-            .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_u64().map(|n| n.to_string())))
+            .and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| v.as_u64().map(|n| n.to_string()))
+            })
             .unwrap_or_else(|| "0".into());
         let units: Decimal = raw.parse().unwrap_or(Decimal::ZERO);
         Ok(units / Decimal::from(1_000_000))
@@ -138,7 +142,11 @@ impl PolymarketVenue {
             .await?;
         let raw = value
             .get("balance")
-            .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_u64().map(|n| n.to_string())))
+            .and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| v.as_u64().map(|n| n.to_string()))
+            })
             .unwrap_or_else(|| "0".into());
         let units: Decimal = raw.parse().unwrap_or(Decimal::ZERO);
         Ok(units / Decimal::from(1_000_000))
@@ -225,13 +233,19 @@ impl PolymarketVenue {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "polymarket tick_size fetched"
         );
-        self.tick_cache.lock().await.insert(token_id.to_string(), tick);
+        self.tick_cache
+            .lock()
+            .await
+            .insert(token_id.to_string(), tick);
         Ok(tick)
     }
 
     pub async fn neg_risk(&self, token_id: &str, fallback: Option<bool>) -> Result<bool> {
         if let Some(v) = fallback {
-            self.neg_risk_cache.lock().await.insert(token_id.to_string(), v);
+            self.neg_risk_cache
+                .lock()
+                .await
+                .insert(token_id.to_string(), v);
             return Ok(v);
         }
         if let Some(v) = self.neg_risk_cache.lock().await.get(token_id).copied() {
@@ -251,7 +265,10 @@ impl PolymarketVenue {
             .or_else(|| value.get("negRisk"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        self.neg_risk_cache.lock().await.insert(token_id.to_string(), flag);
+        self.neg_risk_cache
+            .lock()
+            .await
+            .insert(token_id.to_string(), flag);
         Ok(flag)
     }
 
@@ -466,11 +483,19 @@ async fn init_account(
     let body = match create {
         Ok(v) => v,
         Err(Error::Http { status: 400, .. }) => {
-            send_auth(http, base, "/auth/derive-api-key", reqwest::Method::GET, &headers).await?
+            send_auth(
+                http,
+                base,
+                "/auth/derive-api-key",
+                reqwest::Method::GET,
+                &headers,
+            )
+            .await?
         }
         Err(err) => return Err(err),
     };
-    let api_key = json_str(&body, &["apiKey", "key"]).ok_or_else(|| Error::msg("missing apiKey"))?;
+    let api_key =
+        json_str(&body, &["apiKey", "key"]).ok_or_else(|| Error::msg("missing apiKey"))?;
     let api_secret = json_str(&body, &["secret"]).ok_or_else(|| Error::msg("missing secret"))?;
     let api_passphrase =
         json_str(&body, &["passphrase"]).ok_or_else(|| Error::msg("missing passphrase"))?;
@@ -599,8 +624,15 @@ fn signed_envelope(
 }
 
 pub fn parse_submit(body: &Value, order_hash: String, envelope: Value) -> SubmitResult {
-    let success = body.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-    let status = body.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let success = body
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let status = body
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let order_id = body
         .get("orderID")
         .or_else(|| body.get("orderId"))
@@ -644,7 +676,11 @@ pub fn parse_submit(body: &Value, order_hash: String, envelope: Value) -> Submit
 pub fn parse_book_json(value: &Value) -> (Vec<Level>, Vec<Level>, i64) {
     let ts = value
         .get("timestamp")
-        .and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_i64()))
+        .and_then(|v| {
+            v.as_str()
+                .and_then(|s| s.parse().ok())
+                .or_else(|| v.as_i64())
+        })
         .unwrap_or(0);
     (
         parse_levels(value.get("bids")),
@@ -729,13 +765,24 @@ pub fn parse_trades(raw: &Value) -> Vec<TradeFill> {
             }
             let order_id = order_ids.first().cloned();
             Some(TradeFill {
-                trade_id: item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                trade_id: item
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 order_id,
                 order_ids,
-                coin: item.get("asset_id").and_then(|v| v.as_str()).map(str::to_string),
+                coin: item
+                    .get("asset_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
                 shares: item.get("size").and_then(parse_decimal)?,
                 price: item.get("price").and_then(parse_decimal)?,
-                fee: item.get("fee_amount").or_else(|| item.get("fee")).and_then(parse_decimal).unwrap_or(Decimal::ZERO),
+                fee: item
+                    .get("fee_amount")
+                    .or_else(|| item.get("fee"))
+                    .and_then(parse_decimal)
+                    .unwrap_or(Decimal::ZERO),
                 fee_rate_bps: item.get("fee_rate_bps").and_then(parse_decimal),
                 raw: item,
             })
@@ -749,7 +796,10 @@ pub fn apply_ws_message(
     now: Instant,
 ) -> Vec<(String, bool)> {
     let mut changed = Vec::new();
-    let event = payload.get("event_type").and_then(|v| v.as_str()).unwrap_or("");
+    let event = payload
+        .get("event_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     if event == "book" {
         let token = payload
             .get("asset_id")
@@ -784,11 +834,18 @@ pub fn apply_ws_message(
     } else if event == "price_change" {
         let ts = payload
             .get("timestamp")
-            .and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_i64()))
+            .and_then(|v| {
+                v.as_str()
+                    .and_then(|s| s.parse().ok())
+                    .or_else(|| v.as_i64())
+            })
             .unwrap_or(unix_millis() as i64);
         if let Some(arr) = payload.get("price_changes").and_then(|v| v.as_array()) {
             for change in arr {
-                let token = change.get("asset_id").and_then(|v| v.as_str()).unwrap_or("");
+                let token = change
+                    .get("asset_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let price = change.get("price").and_then(parse_decimal);
                 let size = change.get("size").and_then(parse_decimal);
                 let side = change.get("side").and_then(|v| v.as_str()).unwrap_or("");
@@ -796,8 +853,15 @@ pub fn apply_ws_message(
                     continue;
                 }
                 let is_bid = side.eq_ignore_ascii_case("BUY") || side.eq_ignore_ascii_case("BID");
-                if books.apply_level(POLYMARKET, token, is_bid, price.unwrap(), size.unwrap(), ts, now)
-                {
+                if books.apply_level(
+                    POLYMARKET,
+                    token,
+                    is_bid,
+                    price.unwrap(),
+                    size.unwrap(),
+                    ts,
+                    now,
+                ) {
                     changed.push((token.to_string(), true));
                 }
             }
@@ -852,7 +916,9 @@ pub async fn run_market_ws(
                 if !subscribed.is_empty() {
                     let _ = write
                         .send(Message::Text(
-                            json!({"operation":"subscribe","assets_ids": subscribed}).to_string().into(),
+                            json!({"operation":"subscribe","assets_ids": subscribed})
+                                .to_string()
+                                .into(),
                         ))
                         .await;
                 }
@@ -1014,7 +1080,10 @@ mod tests {
             }),
             now,
         );
-        assert_eq!(books.get(POLYMARKET, "t1").unwrap().tick_size, Some(Decimal::from_str("0.001").unwrap()));
+        assert_eq!(
+            books.get(POLYMARKET, "t1").unwrap().tick_size,
+            Some(Decimal::from_str("0.001").unwrap())
+        );
         apply_ws_message(
             &mut books,
             &json!({
@@ -1026,7 +1095,10 @@ mod tests {
             }),
             now,
         );
-        assert_eq!(books.get(POLYMARKET, "t1").unwrap().tick_size, Some(Decimal::from_str("0.01").unwrap()));
+        assert_eq!(
+            books.get(POLYMARKET, "t1").unwrap().tick_size,
+            Some(Decimal::from_str("0.01").unwrap())
+        );
     }
 
     #[test]
@@ -1083,9 +1155,18 @@ mod tests {
         );
         assert_eq!(applied, vec!["t2".to_string()]);
         assert_eq!(skipped_old, 1);
-        assert_eq!(books.get(POLYMARKET, "t1").unwrap().asks[0].price, Decimal::from_str("0.40").unwrap());
-        assert_eq!(books.get(POLYMARKET, "t2").unwrap().tick_size, Some(Decimal::from_str("0.01").unwrap()));
-        assert_eq!(books.get(POLYMARKET, "t2").unwrap().asks[0].price, Decimal::from_str("0.46").unwrap());
+        assert_eq!(
+            books.get(POLYMARKET, "t1").unwrap().asks[0].price,
+            Decimal::from_str("0.40").unwrap()
+        );
+        assert_eq!(
+            books.get(POLYMARKET, "t2").unwrap().tick_size,
+            Some(Decimal::from_str("0.01").unwrap())
+        );
+        assert_eq!(
+            books.get(POLYMARKET, "t2").unwrap().asks[0].price,
+            Decimal::from_str("0.46").unwrap()
+        );
     }
 
     #[test]

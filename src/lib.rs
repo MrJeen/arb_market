@@ -39,9 +39,7 @@ pub async fn run() -> anyhow::Result<()> {
     let dirty = Arc::new(Mutex::new(DirtyCoalescer::default()));
     let topics = Arc::new(RwLock::new(HashMap::new()));
     let (calc_tx, mut calc_rx) = mpsc::channel::<TopicKey>(256);
-    let calc_tx_resync = cfg
-        .platform_enabled(POLYMARKET)
-        .then(|| calc_tx.clone());
+    let calc_tx_resync = cfg.platform_enabled(POLYMARKET).then(|| calc_tx.clone());
     let (pm_sub_tx, pm_sub_rx) = mpsc::channel::<Vec<String>>(16);
     let (out_sub_tx, out_sub_rx) = mpsc::channel::<Vec<String>>(16);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

@@ -40,12 +40,7 @@ pub fn sign_l1_action(
 ) -> anyhow::Result<(String, String, u8)> {
     let hash = action_hash(action, None, nonce, None)?;
     let source = if is_mainnet { "a" } else { "b" };
-    let domain = domain_separator(
-        "Exchange",
-        "1",
-        1337,
-        Address::ZERO,
-    );
+    let domain = domain_separator("Exchange", "1", 1337, Address::ZERO);
     let mut encoded = Vec::new();
     encoded.extend_from_slice(keccak(AGENT_TYPE.as_bytes()).as_slice());
     encoded.extend_from_slice(keccak(source.as_bytes()).as_slice());

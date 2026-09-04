@@ -127,10 +127,20 @@ pub fn sign_clob_auth(
     Ok(format!("0x{}", hex::encode(sig.as_bytes())))
 }
 
-pub fn l2_hmac_signature(secret_b64: &str, timestamp: u64, method: &str, path: &str, body: &[u8]) -> anyhow::Result<String> {
+pub fn l2_hmac_signature(
+    secret_b64: &str,
+    timestamp: u64,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> anyhow::Result<String> {
     use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
     use base64::Engine;
-    let padded = format!("{}{}", secret_b64, "=".repeat((4 - secret_b64.len() % 4) % 4));
+    let padded = format!(
+        "{}{}",
+        secret_b64,
+        "=".repeat((4 - secret_b64.len() % 4) % 4)
+    );
     let key = URL_SAFE
         .decode(&padded)
         .or_else(|_| URL_SAFE_NO_PAD.decode(secret_b64))

@@ -4,9 +4,11 @@ pub const POLYMARKET_CHAIN_ID: u64 = 137;
 pub const STANDARD_EXCHANGE: &str = "0xE111180000d2663C0091e4f400237545B87B996B";
 pub const NEG_RISK_EXCHANGE: &str = "0xe2222d279d744050d28e00520010520000310F59";
 pub const ORDER_TYPE: &str = "Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)";
-pub const DOMAIN_TYPE: &str = "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
+pub const DOMAIN_TYPE: &str =
+    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
 pub const AGENT_TYPE: &str = "Agent(string source,bytes32 connectionId)";
-pub const CLOB_AUTH_TYPE: &str = "ClobAuth(address address,string timestamp,uint256 nonce,string message)";
+pub const CLOB_AUTH_TYPE: &str =
+    "ClobAuth(address address,string timestamp,uint256 nonce,string message)";
 pub const CLOB_AUTH_MESSAGE: &str = "This message attests that I control the given wallet";
 
 pub mod hyperliquid;

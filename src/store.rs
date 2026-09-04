@@ -1,7 +1,7 @@
+use crate::config::{OUTCOME, POLYMARKET};
 use crate::domain::TopicKey;
 use crate::error::Result;
 use crate::hedge::Positions;
-use crate::config::{OUTCOME, POLYMARKET};
 use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -43,10 +43,7 @@ pub struct LegRow {
 
 impl Store {
     pub async fn connect(uri: &str) -> Result<Self> {
-        let pool = PgPoolOptions::new()
-            .max_connections(8)
-            .connect(uri)
-            .await?;
+        let pool = PgPoolOptions::new().max_connections(8).connect(uri).await?;
         Ok(Self { pool })
     }
 
@@ -146,15 +143,18 @@ impl Store {
         Ok(id)
     }
 
-    pub async fn insert_envelope(&self, leg_id: i64, order_hash: &str, payload: &Value) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO signed_envelopes (leg_id, order_hash, payload) VALUES ($1,$2,$3)",
-        )
-        .bind(leg_id)
-        .bind(order_hash)
-        .bind(payload)
-        .execute(&self.pool)
-        .await?;
+    pub async fn insert_envelope(
+        &self,
+        leg_id: i64,
+        order_hash: &str,
+        payload: &Value,
+    ) -> Result<()> {
+        sqlx::query("INSERT INTO signed_envelopes (leg_id, order_hash, payload) VALUES ($1,$2,$3)")
+            .bind(leg_id)
+            .bind(order_hash)
+            .bind(payload)
+            .execute(&self.pool)
+            .await?;
         let client_id = payload
             .get("cloid")
             .and_then(|v| v.as_str())
@@ -419,15 +419,20 @@ impl Store {
     }
 
     pub async fn refresh_order_actuals(&self, order_id: i64) -> Result<()> {
-        let rows: Vec<(String, String, Option<Decimal>, Option<Decimal>, Option<Decimal>)> =
-            sqlx::query_as(
-                "SELECT side, platform, actual_shares, actual_price, actual_fee
+        let rows: Vec<(
+            String,
+            String,
+            Option<Decimal>,
+            Option<Decimal>,
+            Option<Decimal>,
+        )> = sqlx::query_as(
+            "SELECT side, platform, actual_shares, actual_price, actual_fee
                  FROM legs
                  WHERE order_id = $1 AND status IN ('matched','completed')",
-            )
-            .bind(order_id)
-            .fetch_all(&self.pool)
-            .await?;
+        )
+        .bind(order_id)
+        .fetch_all(&self.pool)
+        .await?;
         let rows: Vec<(String, String, Decimal, Decimal, Decimal)> = rows
             .into_iter()
             .map(|(side, platform, shares, price, fee)| {
@@ -445,7 +450,9 @@ impl Store {
     }
 }
 
-pub fn compute_actuals(rows: &[(String, String, Decimal, Decimal, Decimal)]) -> (Decimal, Decimal, Decimal) {
+pub fn compute_actuals(
+    rows: &[(String, String, Decimal, Decimal, Decimal)],
+) -> (Decimal, Decimal, Decimal) {
     let mut cost = Decimal::ZERO;
     let mut rev = Decimal::ZERO;
     let mut buy_pm = Decimal::ZERO;
@@ -468,10 +475,7 @@ pub fn compute_actuals(rows: &[(String, String, Decimal, Decimal, Decimal)]) -> 
 }
 
 pub async fn connect_common(uri: &str) -> Result<PgPool> {
-    Ok(PgPoolOptions::new()
-        .max_connections(4)
-        .connect(uri)
-        .await?)
+    Ok(PgPoolOptions::new().max_connections(4).connect(uri).await?)
 }
 
 #[cfg(test)]
@@ -496,4 +500,3 @@ mod tests {
         assert_eq!(profit.to_string(), "1.1");
     }
 }
-

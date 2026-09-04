@@ -117,9 +117,9 @@ pub struct Topic {
 impl Topic {
     pub fn token(&self, platform: &str, label: &str) -> Option<&TokenRef> {
         let label = label.to_ascii_lowercase();
-        self.tokens.iter().find(|t| {
-            t.platform == platform && t.label.to_ascii_lowercase() == label
-        })
+        self.tokens
+            .iter()
+            .find(|t| t.platform == platform && t.label.to_ascii_lowercase() == label)
     }
 
     pub fn labels(&self) -> Vec<String> {
@@ -261,9 +261,9 @@ fn build_topic(
                         None
                     }
                 }),
-                side_index: spec.side_index.or_else(|| {
-                    parse_side_coin(&spec.token_id).map(|(_, side)| side)
-                }),
+                side_index: spec
+                    .side_index
+                    .or_else(|| parse_side_coin(&spec.token_id).map(|(_, side)| side)),
                 neg_risk: spec.neg_risk.or(po.neg_risk),
                 fees_enabled: po.fees_enabled,
                 fee_rate: po.fee_schedule.as_ref().and_then(|s| s.rate),

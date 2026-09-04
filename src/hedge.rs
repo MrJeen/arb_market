@@ -262,7 +262,9 @@ fn polymarket_tick(books: &BookStore, platform: &str, token_id: &str) -> Option<
     if platform != POLYMARKET {
         return None;
     }
-    books.get(platform, token_id).and_then(|book| book.tick_size)
+    books
+        .get(platform, token_id)
+        .and_then(|book| book.tick_size)
 }
 
 fn walk_levels(levels: &[Level], need_qty: Decimal) -> Option<Depth> {
@@ -494,17 +496,22 @@ mod tests {
     #[test]
     fn incomplete_positions_are_not_balanced() {
         let mut positions = Positions::new();
-        positions.insert(
-            POLYMARKET.into(),
-            HashMap::from([("yes".into(), d("10"))]),
-        );
+        positions.insert(POLYMARKET.into(), HashMap::from([("yes".into(), d("10"))]));
         assert!(needs_rebalance(&positions, &["no".into(), "yes".into()], d("1.5")).is_none());
         assert_eq!(
-            needs_rebalance(&imbalanced_positions("10", "10"), &["no".into(), "yes".into()], d("1.5")),
+            needs_rebalance(
+                &imbalanced_positions("10", "10"),
+                &["no".into(), "yes".into()],
+                d("1.5")
+            ),
             Some(false)
         );
         assert_eq!(
-            needs_rebalance(&imbalanced_positions("31", "6"), &["no".into(), "yes".into()], d("1.5")),
+            needs_rebalance(
+                &imbalanced_positions("31", "6"),
+                &["no".into(), "yes".into()],
+                d("1.5")
+            ),
             Some(true)
         );
     }

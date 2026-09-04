@@ -8,7 +8,9 @@ use crate::hedge::{needs_rebalance, plan_hedge, HedgeSide};
 use crate::notify::{self, NatsNotifier, PlaceNotice, PlaceResult};
 use crate::platforms::outcome::OutcomeVenue;
 use crate::platforms::polymarket::PolymarketVenue;
-use crate::platforms::{ioc_fill, pm_fak_fill, MarketOrderRequest, OrderSide, SubmitResult, TradeFill};
+use crate::platforms::{
+    ioc_fill, pm_fak_fill, MarketOrderRequest, OrderSide, SubmitResult, TradeFill,
+};
 use crate::store::Store;
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -50,7 +52,12 @@ impl Engine {
         let _ = self.pm_sub_tx.send(pm_tokens.clone()).await;
         let _ = self.out_sub_tx.send(out_tokens.clone()).await;
         *self.topics.write().await = map;
-        tracing::info!(topics = topics.len(), pm = pm_tokens.len(), outcome = out_tokens.len(), "discovery refreshed");
+        tracing::info!(
+            topics = topics.len(),
+            pm = pm_tokens.len(),
+            outcome = out_tokens.len(),
+            "discovery refreshed"
+        );
         Ok(())
     }
 
@@ -71,9 +78,9 @@ impl Engine {
     }
 
     fn fee_context(&self, topic: &Topic) -> FeeContext {
-        let rate = topic.polymarket_fee_rate().unwrap_or_else(|| {
-            self.cfg.polymarket_fee_bps_prior / Decimal::from(10_000)
-        });
+        let rate = topic
+            .polymarket_fee_rate()
+            .unwrap_or_else(|| self.cfg.polymarket_fee_bps_prior / Decimal::from(10_000));
         FeeContext {
             polymarket_fee_rate: rate,
             outcome_taker_rate: self.cfg.outcome_taker_fee_rate,
@@ -92,12 +99,20 @@ impl Engine {
         if self.store.has_active_topic(topic_key).await? {
             return Ok(());
         }
-        if self.store.count_stale_unknown_legs(self.cfg.unknown_leg_timeout).await? > 0 {
+        if self
+            .store
+            .count_stale_unknown_legs(self.cfg.unknown_leg_timeout)
+            .await?
+            > 0
+        {
             tracing::error!("stale unknown legs present; skip new arb");
             return Ok(());
         }
         if self.store.count_active_orders().await? >= self.cfg.max_active_orders as i64 {
-            tracing::warn!(limit = self.cfg.max_active_orders, "max active orders reached");
+            tracing::warn!(
+                limit = self.cfg.max_active_orders,
+                "max active orders reached"
+            );
             return Ok(());
         }
         self.ensure_topic_pm_ticks(&topic).await;
@@ -110,7 +125,14 @@ impl Engine {
         };
         let plan = {
             let books = self.books.lock().await;
-            best_plan(&topic, &books, &fees, &limits, Instant::now(), self.cfg.book_stale)
+            best_plan(
+                &topic,
+                &books,
+                &fees,
+                &limits,
+                Instant::now(),
+                self.cfg.book_stale,
+            )
         };
         let Some(plan) = plan else {
             return Ok(());
@@ -151,7 +173,9 @@ impl Engine {
             .await
         {
             Ok(id) => id,
-            Err(Error::Sqlx(sqlx::Error::Database(db))) if db.code().as_deref() == Some("23505") => {
+            Err(Error::Sqlx(sqlx::Error::Database(db)))
+                if db.code().as_deref() == Some("23505") =>
+            {
                 tracing::info!(topic = %topic.key.as_str(), "active topic already claimed");
                 return Ok(());
             }
@@ -287,7 +311,9 @@ impl Engine {
         for _ in 0..3 {
             match self.pm.balance(&current).await {
                 Ok(bal) if bal >= required => return Ok(current),
-                Ok(bal) => tracing::warn!(funder = %current, %bal, %required, "polymarket balance low"),
+                Ok(bal) => {
+                    tracing::warn!(funder = %current, %bal, %required, "polymarket balance low")
+                }
                 Err(err) => tracing::warn!(funder = %current, error = %err, "balance check failed"),
             }
             current = self
@@ -364,15 +390,30 @@ impl Engine {
             size_matched = poll.shares.filter(|v| *v > Decimal::ZERO);
             poll_price = poll.price.filter(|v| *v > Decimal::ZERO);
             if poll.found && size_matched.is_none() {
-                let _ = self.store.update_leg_submitted(leg.id, "actived", Some(oid), &poll.raw).await;
+                let _ = self
+                    .store
+                    .update_leg_submitted(leg.id, "actived", Some(oid), &poll.raw)
+                    .await;
             }
         }
         let trades = self.pm.poll_trades(funder, &leg.token_id).await?;
-        let matched = filter_trades(&trades, leg.third_order_id.as_deref(), leg.client_order_id.as_deref());
+        let matched = filter_trades(
+            &trades,
+            leg.third_order_id.as_deref(),
+            leg.client_order_id.as_deref(),
+        );
         upsert_fill_rows(&self.store, leg.id, &matched).await?;
         if let Some(shares) = size_matched {
             let (price, fee) = fill_price_and_fee(&matched, poll_price);
-            return close_leg_matched(&self.store, leg.id, leg.third_order_id.as_deref(), shares, price, fee).await;
+            return close_leg_matched(
+                &self.store,
+                leg.id,
+                leg.third_order_id.as_deref(),
+                shares,
+                price,
+                fee,
+            )
+            .await;
         }
         if !matched.is_empty() {
             return apply_fills(&self.store, leg.id, &matched).await;
@@ -389,7 +430,11 @@ impl Engine {
             let _ = self.outcome.poll_order(oid, &leg.token_id).await;
         }
         let fills = self.outcome.poll_fills(Some(&leg.token_id)).await?;
-        let matched = filter_trades(&fills, leg.third_order_id.as_deref(), leg.client_order_id.as_deref());
+        let matched = filter_trades(
+            &fills,
+            leg.third_order_id.as_deref(),
+            leg.client_order_id.as_deref(),
+        );
         if matched.is_empty() {
             return Ok(());
         }
@@ -397,7 +442,12 @@ impl Engine {
     }
 
     pub async fn hedge_once(&self) -> Result<()> {
-        if self.store.count_stale_unknown_legs(self.cfg.unknown_leg_timeout).await? > 0 {
+        if self
+            .store
+            .count_stale_unknown_legs(self.cfg.unknown_leg_timeout)
+            .await?
+            > 0
+        {
             tracing::error!("stale unknown legs present; skip hedge");
             return Ok(());
         }
@@ -415,7 +465,10 @@ impl Engine {
             let positions = self.store.positions_for_order(order.id).await?;
             match needs_rebalance(&positions, &topic.labels(), self.cfg.min_rebalance_qty) {
                 None => {
-                    tracing::warn!(order_id = order.id, "incomplete positions, skip rebalance complete");
+                    tracing::warn!(
+                        order_id = order.id,
+                        "incomplete positions, skip rebalance complete"
+                    );
                     continue;
                 }
                 Some(false) => {
@@ -524,9 +577,7 @@ impl Engine {
                 self.submit_pm(leg_id, &funder, &req).await?;
                 return Ok(());
             }
-            let funder = self
-                .select_funder(action.cap_price * action.shares)
-                .await?;
+            let funder = self.select_funder(action.cap_price * action.shares).await?;
             let req = MarketOrderRequest {
                 token_id: action.token_id.clone(),
                 shares: action.shares,
@@ -666,13 +717,19 @@ impl Engine {
     async fn ensure_pm_tick(&self, token_id: &str) -> Option<Decimal> {
         {
             let books = self.books.lock().await;
-            if let Some(tick) = books.get(POLYMARKET, token_id).and_then(|book| book.tick_size) {
+            if let Some(tick) = books
+                .get(POLYMARKET, token_id)
+                .and_then(|book| book.tick_size)
+            {
                 return Some(tick);
             }
         }
         match self.pm.fetch_tick_size(token_id).await {
             Ok(tick) => {
-                self.books.lock().await.set_tick_size(POLYMARKET, token_id, tick);
+                self.books
+                    .lock()
+                    .await
+                    .set_tick_size(POLYMARKET, token_id, tick);
                 Some(tick)
             }
             Err(err) => {
@@ -707,7 +764,8 @@ async fn persist_submit(
                 ioc_fill(*taking, price)
             };
             if let Some((shares, price)) = fill {
-                close_leg_matched(store, leg_id, Some(order_id), shares, price, Decimal::ZERO).await?;
+                close_leg_matched(store, leg_id, Some(order_id), shares, price, Decimal::ZERO)
+                    .await?;
             } else {
                 store
                     .update_leg_submitted(leg_id, "actived", Some(order_id), envelope)
@@ -715,9 +773,7 @@ async fn persist_submit(
             }
         }
         SubmitResult::NoMatch {
-            envelope,
-            message,
-            ..
+            envelope, message, ..
         } => {
             store
                 .update_leg_fill(
@@ -945,16 +1001,12 @@ mod tests {
 
     #[test]
     fn matches_trade_by_order_id_only() {
-        let trades = vec![
-            fill("t1", "oid-1", "3", &[]),
-            fill("t2", "oid-2", "9", &[]),
-        ];
+        let trades = vec![fill("t1", "oid-1", "3", &[]), fill("t2", "oid-2", "9", &[])];
         let matched = filter_trades(&trades, Some("oid-1"), None);
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].trade_id, "t1");
         assert!(filter_trades(&trades, None, None).is_empty());
-        assert!(filter_trades(&trades, Some("oid-1"), None)[0]
-            .matches(Some("oid-1"), None));
+        assert!(filter_trades(&trades, Some("oid-1"), None)[0].matches(Some("oid-1"), None));
         assert!(!fill("t3", "oid-3", "1", &[]).matches(Some("oid-1"), Some("oid-3-substring")));
     }
 

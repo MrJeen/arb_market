@@ -83,10 +83,7 @@ impl Config {
             pending_leg_timeout: Duration::from_secs(env_u64("PENDING_LEG_TIMEOUT_SECS", 300)),
             unknown_leg_timeout: Duration::from_secs(env_u64("UNKNOWN_LEG_TIMEOUT_SECS", 300)),
             max_active_orders: env_u64("MAX_ACTIVE_ORDERS", 20) as usize,
-            polymarket_clob_url: env_or(
-                "POLYMARKET_CLOB_URL",
-                "https://clob.polymarket.com",
-            ),
+            polymarket_clob_url: env_or("POLYMARKET_CLOB_URL", "https://clob.polymarket.com"),
             polymarket_ws_url: env_or(
                 "POLYMARKET_WS_URL",
                 "wss://ws-subscriptions-clob.polymarket.com/ws/market",
@@ -219,9 +216,10 @@ fn parse_funder_value(funder: &str, value: &serde_json::Value) -> Option<Polymar
                 .or_else(|| map.get("is_wallet_v2"))
                 .and_then(|v| match v {
                     serde_json::Value::Bool(b) => Some(*b),
-                    serde_json::Value::String(s) => {
-                        Some(matches!(s.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
-                    }
+                    serde_json::Value::String(s) => Some(matches!(
+                        s.to_ascii_lowercase().as_str(),
+                        "true" | "1" | "yes"
+                    )),
                     _ => None,
                 })
                 .unwrap_or(false);
@@ -250,7 +248,10 @@ fn env_required(key: &str) -> Result<String> {
 }
 
 fn env_opt(key: &str) -> Option<String> {
-    env::var(key).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    env::var(key)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -265,9 +266,7 @@ fn env_bool(key: &str, default: bool) -> bool {
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    env_opt(key)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    env_opt(key).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 fn env_decimal(key: &str, default: &str) -> Result<Decimal> {

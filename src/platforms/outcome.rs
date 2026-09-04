@@ -1,18 +1,21 @@
-use super::{json_id, parse_decimal, require_positive, MarketOrderRequest, OrderPoll, OrderSide, PreparedOrder, SubmitResult, TradeFill};
-use std::sync::Mutex as StdMutex;
+use super::{
+    json_id, parse_decimal, require_positive, MarketOrderRequest, OrderPoll, OrderSide,
+    PreparedOrder, SubmitResult, TradeFill,
+};
 use crate::book::{BookStore, Level};
 use crate::config::{Config, OUTCOME};
 use crate::domain::TopicKey;
 use crate::error::{Error, Result};
 use crate::signing::hyperliquid::{action_hash, order_action, sign_l1_action};
 use alloy_signer_local::PrivateKeySigner;
+use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
-use futures_util::{SinkExt, StreamExt};
 
 #[derive(Clone)]
 pub struct OutcomeVenue {
@@ -113,7 +116,10 @@ impl OutcomeVenue {
         );
         let nonce = self.next_nonce();
         let (r, s, v) = sign_l1_action(signer, &action, nonce, self.mainnet).map_err(Error::msg)?;
-        let hash = format!("{:#x}", action_hash(&action, None, nonce, None).map_err(Error::msg)?);
+        let hash = format!(
+            "{:#x}",
+            action_hash(&action, None, nonce, None).map_err(Error::msg)?
+        );
         let envelope = json!({
             "order_hash": hash,
             "cloid": cloid,
@@ -382,10 +388,16 @@ pub fn parse_user_fills(raw: &Value) -> Vec<TradeFill> {
                 trade_id: json_id(item.get("tid")).unwrap_or_default(),
                 order_id: order_ids.first().cloned(),
                 order_ids,
-                coin: item.get("coin").and_then(|v| v.as_str()).map(str::to_string),
+                coin: item
+                    .get("coin")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
                 shares: item.get("sz").and_then(parse_decimal)?,
                 price: item.get("px").and_then(parse_decimal)?,
-                fee: item.get("fee").and_then(parse_decimal).unwrap_or(Decimal::ZERO),
+                fee: item
+                    .get("fee")
+                    .and_then(parse_decimal)
+                    .unwrap_or(Decimal::ZERO),
                 fee_rate_bps: None,
                 raw: item,
             })
@@ -421,7 +433,8 @@ pub async fn run_l2_ws(
                 tracing::info!("hyperliquid l2 ws connected");
                 let (mut write, mut read) = ws.split();
                 for coin in &coins {
-                    let msg = json!({"method":"subscribe","subscription":{"type":"l2Book","coin": coin}});
+                    let msg =
+                        json!({"method":"subscribe","subscription":{"type":"l2Book","coin": coin}});
                     let _ = write.send(Message::Text(msg.to_string().into())).await;
                 }
                 loop {

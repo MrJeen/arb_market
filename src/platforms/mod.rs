@@ -185,9 +185,14 @@ mod tests {
 
     #[test]
     fn ioc_fill_requires_positive_shares_and_price() {
-        assert_eq!(ioc_fill(Some(d("5")), Some(d("0.4"))).unwrap().0.to_string(), "5");
+        assert_eq!(
+            ioc_fill(Some(d("5")), Some(d("0.4")))
+                .unwrap()
+                .0
+                .to_string(),
+            "5"
+        );
         assert!(ioc_fill(Some(d("0")), Some(d("0.4"))).is_none());
         assert!(ioc_fill(Some(d("5")), None).is_none());
     }
 }
-

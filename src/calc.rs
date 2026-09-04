@@ -2,8 +2,8 @@ use crate::book::{Level, OrderBook};
 use crate::config::{OUTCOME, POLYMARKET};
 use crate::domain::{TokenRef, Topic};
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use std::str::FromStr;
 
 #[derive(Debug, Clone)]
@@ -169,15 +169,16 @@ fn search_pair(
         let unclipped_cost = unit_cost * max_net;
         // 第一档规模超过预算 3 倍时按剩余额度买满，避免最小 shares 二分把仓位截得过小。
         if unclipped_cost > limits.cost_limit * Decimal::from(3) {
-            if let Some(net) = fill_to_budget(&acc, remain, unit_cost, pm_px, out_px, max_net, fees, limits)
-            {
-                return acc.plus(net, pm_px, out_px).to_plan(pm_token, out_token, fees, limits, pm_tick);
+            if let Some(net) = fill_to_budget(
+                &acc, remain, unit_cost, pm_px, out_px, max_net, fees, limits,
+            ) {
+                return acc
+                    .plus(net, pm_px, out_px)
+                    .to_plan(pm_token, out_token, fees, limits, pm_tick);
             }
         }
 
-        if let Some(net) =
-            find_min_passing(&acc, max_net, pm_px, out_px, fees, limits)
-        {
+        if let Some(net) = find_min_passing(&acc, max_net, pm_px, out_px, fees, limits) {
             let trial = acc.plus(net, pm_px, out_px);
             if trial.passes_all(fees, limits) {
                 return trial.to_plan(pm_token, out_token, fees, limits, pm_tick);
@@ -205,7 +206,10 @@ fn search_pair(
     None
 }
 
-fn peek_first(pm_asks: &[Level], out_asks: &[Level]) -> Option<(Decimal, Decimal, Decimal, Decimal)> {
+fn peek_first(
+    pm_asks: &[Level],
+    out_asks: &[Level],
+) -> Option<(Decimal, Decimal, Decimal, Decimal)> {
     let pm = pm_asks.first()?;
     let out = out_asks.first()?;
     let out_sz = floor_shares(out.size);
@@ -479,7 +483,8 @@ pub fn best_plan(
         if !pm_book.is_fresh(stale, now) || !out_book.is_fresh(stale, now) {
             continue;
         }
-        if let Some(plan) = plan_arbitrage(topic, pm_book, out_book, pm_token, out_token, fees, limits)
+        if let Some(plan) =
+            plan_arbitrage(topic, pm_book, out_book, pm_token, out_token, fees, limits)
         {
             let better = match &best {
                 None => true,
@@ -673,8 +678,15 @@ mod tests {
     }
 
     fn plan_with(books: &BookStore, now: Instant, limits: &ArbLimits) -> ArbPlan {
-        best_plan(&sample_topic(), books, &fees_zero(), limits, now, std::time::Duration::from_secs(5))
-            .expect("plan")
+        best_plan(
+            &sample_topic(),
+            books,
+            &fees_zero(),
+            limits,
+            now,
+            std::time::Duration::from_secs(5),
+        )
+        .expect("plan")
     }
 
     #[test]
@@ -770,7 +782,13 @@ mod tests {
     fn floors_fractional_outcome_size() {
         let mut books = BookStore::default();
         let now = Instant::now();
-        snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "40.9")], now);
+        snapshot(
+            &mut books,
+            POLYMARKET,
+            "pm-yes",
+            vec![("0.40", "40.9")],
+            now,
+        );
         snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "40.9")], now);
         let plan = plan_with(&books, now, &limits("3", "100"));
         assert_eq!(plan.outcome.shares, floor_shares(plan.outcome.shares));
@@ -822,7 +840,10 @@ mod tests {
             extra_cost_multiplier: Decimal::ONE,
         };
         // Official crypto table: 100 shares @ $0.50 → $1.75
-        assert_eq!(estimate_polymarket_fee(d("100"), d("0.50"), &fees), d("1.75"));
+        assert_eq!(
+            estimate_polymarket_fee(d("100"), d("0.50"), &fees),
+            d("1.75")
+        );
         let conservative = FeeContext {
             extra_cost_multiplier: d("1.3"),
             ..fees.clone()
@@ -864,6 +885,9 @@ mod tests {
     fn aligns_buy_to_provided_tick() {
         assert_eq!(align_polymarket_price(d("0.451"), d("0.001")), d("0.451"));
         assert_eq!(align_polymarket_price(d("0.451"), d("0.01")), d("0.46"));
-        assert_eq!(align_polymarket_sell_price(d("0.456"), d("0.01")), d("0.45"));
+        assert_eq!(
+            align_polymarket_sell_price(d("0.456"), d("0.01")),
+            d("0.45")
+        );
     }
 }

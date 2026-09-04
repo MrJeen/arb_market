@@ -275,14 +275,7 @@ mod tests {
             100,
             now,
         ));
-        assert!(!store.replace_snapshot(
-            POLYMARKET,
-            "t1",
-            vec![],
-            vec![],
-            90,
-            now,
-        ));
+        assert!(!store.replace_snapshot(POLYMARKET, "t1", vec![], vec![], 90, now,));
         let book = store.get(POLYMARKET, "t1").unwrap();
         assert_eq!(book.asks[0].price, d("0.5"));
         assert!(!book.stale);
@@ -304,7 +297,10 @@ mod tests {
             1,
             now,
         ));
-        assert_eq!(store.get(POLYMARKET, "t1").unwrap().tick_size, Some(d("0.001")));
+        assert_eq!(
+            store.get(POLYMARKET, "t1").unwrap().tick_size,
+            Some(d("0.001"))
+        );
     }
 
     #[test]

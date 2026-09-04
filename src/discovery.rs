@@ -121,10 +121,7 @@ mod tests {
         let pm = topics[0].token(POLYMARKET, "yes").unwrap();
         assert_eq!(pm.fees_enabled, Some(true));
         assert_eq!(pm.fee_rate.unwrap().to_string(), "0.07");
-        assert_eq!(
-            topics[0].polymarket_fee_rate().unwrap().to_string(),
-            "0.07"
-        );
+        assert_eq!(topics[0].polymarket_fee_rate().unwrap().to_string(), "0.07");
     }
 
     #[test]
