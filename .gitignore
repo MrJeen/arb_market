@@ -1,0 +1,7 @@
+/target
+/dist
+.env
+polymarket_funders.json
+*.log
+.DS_Store
+/reviews

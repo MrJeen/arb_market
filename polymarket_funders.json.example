@@ -1,0 +1,12 @@
+{
+  "0xFunderAddress1": {
+    "walletPrivateKey": "0x...",
+    "isWalletV2": false,
+    "service": "pm-1"
+  },
+  "0xFunderAddress2": {
+    "walletPrivateKey": "0x...",
+    "isWalletV2": true,
+    "service": "pm-2"
+  }
+}

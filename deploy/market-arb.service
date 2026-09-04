@@ -1,0 +1,24 @@
+[Unit]
+Description=Polymarket ↔ Outcome market-order arbitrage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=market-arb
+Group=market-arb
+WorkingDirectory=/var/www/arb_market
+ExecStart=/var/www/arb_market/dist/market-arb
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=120
+TimeoutStopSec=20
+KillSignal=SIGTERM
+Environment=RUST_LOG=info
+# 进程从 WorkingDirectory 读取 .env 与 polymarket_funders.json。
+NoNewPrivileges=true
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
