@@ -33,6 +33,7 @@ pub struct LegRow {
     pub intent: String,
     pub funder_address: Option<String>,
     pub wallet_address: Option<String>,
+    pub service: Option<String>,
     pub req_price: Option<Decimal>,
     pub req_shares: Option<Decimal>,
     pub client_order_id: Option<String>,
@@ -113,6 +114,7 @@ impl Store {
         intent: &str,
         funder: Option<&str>,
         wallet: Option<&str>,
+        service: Option<&str>,
         req_price: Decimal,
         req_shares: Decimal,
         req_fee: Decimal,
@@ -121,9 +123,9 @@ impl Store {
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO legs (
                 order_id, platform, token_id, label, side, intent,
-                funder_address, wallet_address, req_price, req_shares, req_fee,
+                funder_address, wallet_address, service, req_price, req_shares, req_fee,
                 client_order_id, status
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending')
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending')
              RETURNING id",
         )
         .bind(order_id)
@@ -134,6 +136,7 @@ impl Store {
         .bind(intent)
         .bind(funder)
         .bind(wallet)
+        .bind(service)
         .bind(req_price)
         .bind(req_shares)
         .bind(req_fee)
@@ -229,7 +232,7 @@ impl Store {
     pub async fn open_legs(&self) -> Result<Vec<LegRow>> {
         let rows = sqlx::query_as::<_, LegRow>(
             "SELECT id, order_id, platform, token_id, label, side, intent,
-                    funder_address, wallet_address, req_price, req_shares,
+                    funder_address, wallet_address, service, req_price, req_shares,
                     client_order_id, third_order_id, status
              FROM legs
              WHERE status IN ('pending','unknown','actived')

@@ -192,6 +192,7 @@ impl Engine {
                 "arb_buy",
                 Some(&funder),
                 Some(&funder),
+                self.polymarket_service(&funder),
                 plan.pm.cap_price,
                 plan.pm.shares,
                 plan.pm.fee,
@@ -209,6 +210,7 @@ impl Engine {
                 "arb_buy",
                 None,
                 self.outcome.account_address(),
+                None,
                 plan.outcome.cap_price,
                 plan.outcome.shares,
                 plan.outcome.fee,
@@ -262,14 +264,18 @@ impl Engine {
         });
     }
 
-    fn polymarket_platform_label(&self, funder: &str) -> String {
-        let service = self
-            .cfg
+    fn polymarket_service(&self, funder: &str) -> Option<&str> {
+        self.cfg
             .polymarket_funders
             .iter()
             .find(|item| item.funder_address.eq_ignore_ascii_case(funder))
-            .and_then(|item| item.service.as_deref());
-        notify::format_platform_label(POLYMARKET, service)
+            .and_then(|item| item.service.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    fn polymarket_platform_label(&self, funder: &str) -> String {
+        notify::format_platform_label(POLYMARKET, self.polymarket_service(funder))
     }
 
     async fn select_funder(&self, required: Decimal) -> Result<String> {
@@ -508,6 +514,7 @@ impl Engine {
                         "rebalance",
                         Some(&funder),
                         Some(&funder),
+                        self.polymarket_service(&funder),
                         action.cap_price,
                         action.shares,
                         Decimal::ZERO,
@@ -541,6 +548,7 @@ impl Engine {
                     "rebalance",
                     Some(&funder),
                     Some(&funder),
+                    self.polymarket_service(&funder),
                     action.cap_price,
                     action.shares,
                     Decimal::ZERO,
@@ -588,6 +596,7 @@ impl Engine {
                     "rebalance",
                     None,
                     self.outcome.account_address(),
+                    None,
                     action.cap_price,
                     action.shares,
                     Decimal::ZERO,
