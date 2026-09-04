@@ -39,6 +39,11 @@ pub struct Config {
     pub hyperliquid_mainnet: bool,
     pub outcome_agent_private_key: Option<String>,
     pub outcome_account_address: Option<String>,
+    pub nats_url: Option<String>,
+    pub nats_token: Option<String>,
+    pub nats_subject: String,
+    pub nats_channel: String,
+    pub cat: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,6 +98,11 @@ impl Config {
             hyperliquid_mainnet: env_bool("HYPERLIQUID_MAINNET", true),
             outcome_agent_private_key: env_opt("OUTCOME_AGENT_PRIVATE_KEY"),
             outcome_account_address: env_opt("OUTCOME_ACCOUNT_ADDRESS"),
+            nats_url: env_opt("NATS_URL"),
+            nats_token: env_opt("NATS_TOKEN"),
+            nats_subject: env_or("NATS_TG_SUBJECT", "tg.notification"),
+            nats_channel: env_or("NATS_TG_CHANNEL", "ARB"),
+            cat: env_or("CAT", "market-arb"),
         })
     }
 

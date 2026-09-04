@@ -5,6 +5,7 @@ use crate::discovery::load_active_topics;
 use crate::domain::{Topic, TopicKey};
 use crate::error::{Error, Result};
 use crate::hedge::{needs_rebalance, plan_hedge, HedgeSide};
+use crate::notify::{self, NatsNotifier, PlaceNotice, PlaceResult};
 use crate::platforms::outcome::OutcomeVenue;
 use crate::platforms::polymarket::PolymarketVenue;
 use crate::platforms::{MarketOrderRequest, OrderSide, SubmitResult, TradeFill};
@@ -28,6 +29,7 @@ pub struct Engine {
     pub outcome: OutcomeVenue,
     pub pm_sub_tx: mpsc::Sender<Vec<String>>,
     pub out_sub_tx: mpsc::Sender<Vec<String>>,
+    pub notify: Option<NatsNotifier>,
 }
 
 impl Engine {
@@ -201,13 +203,57 @@ impl Engine {
             self.submit_pm(pm_leg, &funder, &pm_req),
             self.submit_outcome(out_leg, &out_req)
         );
-        if let Err(err) = pm_res {
+        if let Err(err) = &pm_res {
             tracing::error!(error = %err, "polymarket submit failed");
         }
-        if let Err(err) = out_res {
+        if let Err(err) = &out_res {
             tracing::error!(error = %err, "outcome submit failed");
         }
+        self.notify_place(order_id, topic, &funder, &plan, pm_res, out_res);
         Ok(())
+    }
+
+    fn notify_place(
+        &self,
+        order_id: i64,
+        topic: &Topic,
+        funder: &str,
+        plan: &ArbPlan,
+        pm_res: Result<SubmitResult>,
+        out_res: Result<SubmitResult>,
+    ) {
+        let Some(notify) = &self.notify else {
+            return;
+        };
+        let pm_platform = self.polymarket_platform_label(funder);
+        let pm = place_result(
+            pm_platform.clone(),
+            plan.pm.label.clone(),
+            plan.pm.token_id.clone(),
+            pm_res,
+        );
+        let outcome = place_result(
+            OUTCOME.to_string(),
+            plan.outcome.label.clone(),
+            plan.outcome.token_id.clone(),
+            out_res,
+        );
+        notify.publish_place(PlaceNotice {
+            order_id,
+            title: topic.title.clone(),
+            platforms: vec![pm_platform, OUTCOME.to_string()],
+            results: vec![pm, outcome],
+        });
+    }
+
+    fn polymarket_platform_label(&self, funder: &str) -> String {
+        let service = self
+            .cfg
+            .polymarket_funders
+            .iter()
+            .find(|item| item.funder_address.eq_ignore_ascii_case(funder))
+            .and_then(|item| item.service.as_deref());
+        notify::format_platform_label(POLYMARKET, service)
     }
 
     async fn select_funder(&self, required: Decimal) -> Result<String> {
@@ -236,22 +282,24 @@ impl Engine {
         leg_id: i64,
         funder: &str,
         req: &MarketOrderRequest,
-    ) -> Result<()> {
+    ) -> Result<SubmitResult> {
         let prepared = self.pm.prepare_market_order(funder, req).await?;
         self.store
             .insert_envelope(leg_id, &prepared.order_hash, &prepared.envelope)
             .await?;
         let result = self.pm.post_prepared(&prepared).await?;
-        persist_submit(&self.store, leg_id, result).await
+        persist_submit(&self.store, leg_id, &result).await?;
+        Ok(result)
     }
 
-    async fn submit_outcome(&self, leg_id: i64, req: &MarketOrderRequest) -> Result<()> {
+    async fn submit_outcome(&self, leg_id: i64, req: &MarketOrderRequest) -> Result<SubmitResult> {
         let prepared = self.outcome.prepare_market_order(req)?;
         self.store
             .insert_envelope(leg_id, &prepared.order_hash, &prepared.envelope)
             .await?;
         let result = self.outcome.post_prepared(prepared).await?;
-        persist_submit(&self.store, leg_id, result).await
+        persist_submit(&self.store, leg_id, &result).await?;
+        Ok(result)
     }
 
     pub async fn reconcile(&self) -> Result<()> {
@@ -396,7 +444,8 @@ impl Engine {
                     None,
                 )
                 .await?;
-            self.submit_pm(leg_id, &funder, &req).await
+            self.submit_pm(leg_id, &funder, &req).await?;
+            Ok(())
         } else {
             let req = MarketOrderRequest {
                 token_id: action.token_id.clone(),
@@ -426,7 +475,8 @@ impl Engine {
                     None,
                 )
                 .await?;
-            self.submit_outcome(leg_id, &req).await
+            self.submit_outcome(leg_id, &req).await?;
+            Ok(())
         }
     }
 
@@ -505,32 +555,36 @@ impl Engine {
     }
 }
 
-async fn persist_submit(store: &Store, leg_id: i64, result: SubmitResult) -> Result<()> {
+async fn persist_submit(store: &Store, leg_id: i64, result: &SubmitResult) -> Result<()> {
     match result {
         SubmitResult::Ack {
             order_id,
-            order_hash: _,
             envelope,
             ..
         } => {
             store
-                .update_leg_submitted(leg_id, "actived", Some(&order_id), &envelope)
+                .update_leg_submitted(leg_id, "actived", Some(order_id), envelope)
                 .await?;
         }
         SubmitResult::NoMatch {
-            order_hash: _,
             envelope,
             message,
+            ..
         } => {
             store
-                .update_leg_submitted(leg_id, "cancelled", None, &json!({"message": message, "envelope": envelope}))
+                .update_leg_submitted(
+                    leg_id,
+                    "cancelled",
+                    None,
+                    &json!({"message": message, "envelope": envelope}),
+                )
                 .await?;
         }
         SubmitResult::Unknown {
             order_id,
-            order_hash: _,
             envelope,
             message,
+            ..
         } => {
             store
                 .update_leg_submitted(
@@ -543,6 +597,35 @@ async fn persist_submit(store: &Store, leg_id: i64, result: SubmitResult) -> Res
         }
     }
     Ok(())
+}
+
+fn place_result(
+    platform: String,
+    label: String,
+    market: String,
+    result: Result<SubmitResult>,
+) -> PlaceResult {
+    let error = match result {
+        Ok(SubmitResult::Ack { .. }) => None,
+        Ok(SubmitResult::NoMatch { message, .. }) | Ok(SubmitResult::Unknown { message, .. }) => {
+            Some(message)
+        }
+        Err(err) => Some(format_place_error(&err)),
+    };
+    PlaceResult {
+        platform,
+        label,
+        market,
+        error,
+    }
+}
+
+fn format_place_error(err: &Error) -> String {
+    match err {
+        Error::Http { status, message } => format!("HTTP {status} {message}"),
+        Error::Rejected { code, message } => format!("{code} {message}"),
+        other => other.to_string(),
+    }
 }
 
 fn filter_trades<'a>(

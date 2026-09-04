@@ -17,6 +17,7 @@ alloy-primitives = { version = "1.0", features = ["serde"] }
 alloy-signer = "1.0"
 alloy-signer-local = "1.0"
 anyhow = "1"
+async-nats = "0.39"
 async-trait = "0.1"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde", "clock"] }

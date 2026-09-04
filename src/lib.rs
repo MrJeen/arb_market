@@ -6,6 +6,7 @@ pub mod domain;
 pub mod error;
 pub mod exec;
 pub mod hedge;
+pub mod notify;
 pub mod platforms;
 pub mod signing;
 pub mod store;
@@ -45,6 +46,7 @@ pub async fn run() -> anyhow::Result<()> {
     let (out_sub_tx, out_sub_rx) = mpsc::channel::<Vec<String>>(16);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+    let notify = crate::notify::connect(&cfg).await;
     let engine = Arc::new(Engine {
         cfg: cfg.clone(),
         store: store.clone(),
@@ -56,6 +58,7 @@ pub async fn run() -> anyhow::Result<()> {
         outcome,
         pm_sub_tx,
         out_sub_tx,
+        notify,
     });
     engine.refresh_discovery().await?;
 
