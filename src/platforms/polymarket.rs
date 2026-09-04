@@ -22,6 +22,9 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 const FAK_UNFILLED: &str = "no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.";
+/// CLOB FAK 市价单精度：maker 最多 2 位小数，taker 最多 5 位小数。向下截断，避免超付。
+const MARKET_MAKER_DECIMALS: u32 = 2;
+const MARKET_TAKER_DECIMALS: u32 = 5;
 
 #[derive(Clone)]
 pub struct PolymarketAccount {
@@ -546,15 +549,7 @@ fn build_unsigned_order(
     if price < tick {
         return Err(Error::msg("price below tick"));
     }
-    let size = req.shares;
-    let (maker_amount, taker_amount) = if req.side == OrderSide::Buy {
-        (base_units(size * price), base_units(size))
-    } else {
-        (base_units(size), base_units(size * price))
-    };
-    if maker_amount == 0 || taker_amount == 0 {
-        return Err(Error::msg("order amounts round to zero"));
-    }
+    let (maker_amount, taker_amount) = market_order_base_units(req.side, req.shares, price)?;
     let maker: Address = account
         .funder
         .parse()
@@ -1017,6 +1012,31 @@ async fn handle_ws_text(
     }
 }
 
+fn market_order_base_units(
+    side: OrderSide,
+    size: Decimal,
+    price: Decimal,
+) -> Result<(u128, u128)> {
+    let (maker, taker) = match side {
+        OrderSide::Buy => {
+            let shares = size.trunc_with_scale(MARKET_TAKER_DECIMALS);
+            let usdc = (shares * price).trunc_with_scale(MARKET_MAKER_DECIMALS);
+            (usdc, shares)
+        }
+        OrderSide::Sell => {
+            let shares = size.trunc_with_scale(MARKET_MAKER_DECIMALS);
+            let usdc = (shares * price).trunc_with_scale(MARKET_TAKER_DECIMALS);
+            (shares, usdc)
+        }
+    };
+    let maker_amount = base_units(maker);
+    let taker_amount = base_units(taker);
+    if maker_amount == 0 || taker_amount == 0 {
+        return Err(Error::msg("order amounts round to zero"));
+    }
+    Ok((maker_amount, taker_amount))
+}
+
 fn base_units(value: Decimal) -> u128 {
     let scaled = (value * Decimal::from(1_000_000)).round();
     scaled.to_u128().unwrap_or(0)
@@ -1198,5 +1218,45 @@ mod tests {
         assert!(trades[0].matches(Some("maker-9"), None));
         assert!(trades[0].matches(Some("taker-1"), None));
         assert!(!trades[0].matches(Some("other"), None));
+    }
+
+    fn d(s: &str) -> Decimal {
+        Decimal::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn market_buy_floors_maker_usdc_to_2_decimals() {
+        let (maker, taker) = market_order_base_units(OrderSide::Buy, d("7"), d("0.333")).unwrap();
+        assert_eq!(maker, 2_330_000);
+        assert_eq!(taker, 7_000_000);
+    }
+
+    #[test]
+    fn market_buy_floors_taker_shares_to_5_decimals() {
+        let (maker, taker) =
+            market_order_base_units(OrderSide::Buy, d("1.234567"), d("0.50")).unwrap();
+        assert_eq!(taker, 1_234_560);
+        assert_eq!(maker, 610_000);
+    }
+
+    #[test]
+    fn market_buy_keeps_cent_usdc_unchanged() {
+        let (maker, taker) = market_order_base_units(OrderSide::Buy, d("10"), d("0.45")).unwrap();
+        assert_eq!(maker, 4_500_000);
+        assert_eq!(taker, 10_000_000);
+    }
+
+    #[test]
+    fn market_sell_floors_maker_shares_to_2_decimals() {
+        let (maker, taker) =
+            market_order_base_units(OrderSide::Sell, d("5.129"), d("0.40")).unwrap();
+        assert_eq!(maker, 5_120_000);
+        assert_eq!(taker, 2_048_000);
+    }
+
+    #[test]
+    fn market_buy_rejects_when_usdc_floors_to_zero() {
+        let err = market_order_base_units(OrderSide::Buy, d("5"), d("0.001")).unwrap_err();
+        assert!(err.to_string().contains("round to zero"));
     }
 }
