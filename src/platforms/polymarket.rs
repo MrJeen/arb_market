@@ -119,6 +119,31 @@ impl PolymarketVenue {
         Ok(units / Decimal::from(1_000_000))
     }
 
+    pub async fn token_balance(&self, funder: &str, token_id: &str) -> Result<Decimal> {
+        let account = self
+            .account(funder)
+            .ok_or_else(|| Error::msg("unknown polymarket funder"))?;
+        let value = self
+            .l2_json(
+                account,
+                reqwest::Method::GET,
+                "/balance-allowance",
+                &[
+                    ("asset_type", "CONDITIONAL"),
+                    ("token_id", token_id),
+                    ("signature_type", &account.signature_type.to_string()),
+                ],
+                None,
+            )
+            .await?;
+        let raw = value
+            .get("balance")
+            .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| v.as_u64().map(|n| n.to_string())))
+            .unwrap_or_else(|| "0".into());
+        let units: Decimal = raw.parse().unwrap_or(Decimal::ZERO);
+        Ok(units / Decimal::from(1_000_000))
+    }
+
     pub async fn rest_book(&self, token_id: &str) -> Result<(Vec<Level>, Vec<Level>, i64)> {
         let url = format!("{}/book", self.base);
         let value: Value = self
@@ -488,7 +513,11 @@ fn build_unsigned_order(
     req: &MarketOrderRequest,
     tick: Decimal,
 ) -> Result<SignedOrder> {
-    let price = crate::calc::align_polymarket_price(req.cap_price, tick);
+    let price = if req.side == OrderSide::Buy {
+        crate::calc::align_polymarket_price(req.cap_price, tick)
+    } else {
+        crate::calc::align_polymarket_sell_price(req.cap_price, tick)
+    };
     if price < tick {
         return Err(Error::msg("price below tick"));
     }
@@ -664,10 +693,7 @@ pub fn parse_order_poll(raw: Value, order_id: &str) -> OrderPoll {
         found: true,
         status,
         order_id: Some(order_id.to_string()),
-        shares: raw
-            .get("size_matched")
-            .or_else(|| raw.get("original_size"))
-            .and_then(parse_decimal),
+        shares: raw.get("size_matched").and_then(parse_decimal),
         price: raw.get("price").and_then(parse_decimal),
         fee: raw.get("fee").and_then(parse_decimal),
         raw,
@@ -684,13 +710,29 @@ pub fn parse_trades(raw: &Value) -> Vec<TradeFill> {
     items
         .into_iter()
         .filter_map(|item| {
+            let mut order_ids = Vec::new();
+            if let Some(id) = item
+                .get("taker_order_id")
+                .or_else(|| item.get("order_id"))
+                .and_then(|v| v.as_str())
+            {
+                order_ids.push(id.to_string());
+            }
+            if let Some(makers) = item.get("maker_orders").and_then(|v| v.as_array()) {
+                for maker in makers {
+                    if let Some(id) = maker.get("order_id").and_then(|v| v.as_str()) {
+                        if !order_ids.iter().any(|existing| existing == id) {
+                            order_ids.push(id.to_string());
+                        }
+                    }
+                }
+            }
+            let order_id = order_ids.first().cloned();
             Some(TradeFill {
                 trade_id: item.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                order_id: item
-                    .get("taker_order_id")
-                    .or_else(|| item.get("order_id"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
+                order_id,
+                order_ids,
+                coin: item.get("asset_id").and_then(|v| v.as_str()).map(str::to_string),
                 shares: item.get("size").and_then(parse_decimal)?,
                 price: item.get("price").and_then(parse_decimal)?,
                 fee: item.get("fee_amount").or_else(|| item.get("fee")).and_then(parse_decimal).unwrap_or(Decimal::ZERO),
@@ -824,6 +866,18 @@ pub async fn run_market_ws(
                         }
                         msg = sub_rx.recv() => {
                             let Some(tokens) = msg else { return; };
+                            let dropped: Vec<_> = subscribed
+                                .iter()
+                                .filter(|id| !tokens.contains(*id))
+                                .cloned()
+                                .collect();
+                            if !dropped.is_empty() {
+                                if write.send(Message::Text(
+                                    json!({"operation":"unsubscribe","assets_ids": dropped}).to_string().into()
+                                )).await.is_err() {
+                                    break;
+                                }
+                            }
                             subscribed = tokens;
                             if write.send(Message::Text(
                                 json!({"operation":"subscribe","assets_ids": subscribed}).to_string().into()
@@ -1032,5 +1086,35 @@ mod tests {
         assert_eq!(books.get(POLYMARKET, "t1").unwrap().asks[0].price, Decimal::from_str("0.40").unwrap());
         assert_eq!(books.get(POLYMARKET, "t2").unwrap().tick_size, Some(Decimal::from_str("0.01").unwrap()));
         assert_eq!(books.get(POLYMARKET, "t2").unwrap().asks[0].price, Decimal::from_str("0.46").unwrap());
+    }
+
+    #[test]
+    fn parse_order_poll_ignores_original_size() {
+        let poll = parse_order_poll(
+            json!({"status": "MATCHED", "original_size": "20", "size_matched": "3", "price": "0.4"}),
+            "oid-1",
+        );
+        assert_eq!(poll.shares.unwrap().to_string(), "3");
+        let empty = parse_order_poll(
+            json!({"status": "MATCHED", "original_size": "20", "price": "0.4"}),
+            "oid-1",
+        );
+        assert!(empty.shares.is_none());
+    }
+
+    #[test]
+    fn parse_trades_includes_maker_order_ids() {
+        let trades = parse_trades(&json!({"data": [{
+            "id": "t1",
+            "taker_order_id": "taker-1",
+            "size": "5",
+            "price": "0.4",
+            "fee": "0.01",
+            "maker_orders": [{"order_id": "maker-9", "owner": "0xabc"}]
+        }]}));
+        assert_eq!(trades[0].order_id.as_deref(), Some("taker-1"));
+        assert!(trades[0].matches(Some("maker-9"), None));
+        assert!(trades[0].matches(Some("taker-1"), None));
+        assert!(!trades[0].matches(Some("other"), None));
     }
 }

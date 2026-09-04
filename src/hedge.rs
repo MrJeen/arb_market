@@ -52,11 +52,10 @@ pub fn position_diffs(positions: &Positions, labels: &[String]) -> Option<(Decim
     Some((diff1, diff2))
 }
 
-pub fn needs_rebalance(positions: &Positions, labels: &[String], min_qty: Decimal) -> bool {
-    match position_diffs(positions, labels) {
-        Some((d1, d2)) => d1.abs() > min_qty || d2.abs() > min_qty,
-        None => false,
-    }
+/// `None` 表示持仓不完整，不能当成已平衡。
+pub fn needs_rebalance(positions: &Positions, labels: &[String], min_qty: Decimal) -> Option<bool> {
+    let (d1, d2) = position_diffs(positions, labels)?;
+    Some(d1.abs() > min_qty || d2.abs() > min_qty)
 }
 
 pub fn plan_hedge(
@@ -490,5 +489,23 @@ mod tests {
         let now = Instant::now();
         let actions = plan(&books, &HashMap::new(), now, "10", "6");
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn incomplete_positions_are_not_balanced() {
+        let mut positions = Positions::new();
+        positions.insert(
+            POLYMARKET.into(),
+            HashMap::from([("yes".into(), d("10"))]),
+        );
+        assert!(needs_rebalance(&positions, &["no".into(), "yes".into()], d("1.5")).is_none());
+        assert_eq!(
+            needs_rebalance(&imbalanced_positions("10", "10"), &["no".into(), "yes".into()], d("1.5")),
+            Some(false)
+        );
+        assert_eq!(
+            needs_rebalance(&imbalanced_positions("31", "6"), &["no".into(), "yes".into()], d("1.5")),
+            Some(true)
+        );
     }
 }

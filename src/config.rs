@@ -30,6 +30,9 @@ pub struct Config {
     pub min_rebalance_qty: Decimal,
     pub polymarket_fee_bps_prior: Decimal,
     pub outcome_taker_fee_rate: Decimal,
+    pub pending_leg_timeout: Duration,
+    pub unknown_leg_timeout: Duration,
+    pub max_active_orders: usize,
     pub polymarket_clob_url: String,
     pub polymarket_ws_url: String,
     pub polymarket_funders: Vec<PolymarketFunderConfig>,
@@ -57,7 +60,7 @@ pub struct PolymarketFunderConfig {
 impl Config {
     pub fn from_env() -> Result<Self> {
         let _ = dotenvy::dotenv();
-        let enabled = parse_enabled_platforms(env_opt("ENABLED_PLATFORMS"));
+        let enabled = parse_enabled_platforms(env_opt("ENABLED_PLATFORMS"))?;
         let funders = load_funders()?;
         Ok(Self {
             common_postgres_uri: env_required("COMMON_POSTGRES_URI")?,
@@ -75,8 +78,11 @@ impl Config {
             arb_cost_limit: env_decimal("ARB_COST_LIMIT", "100")?,
             extra_cost_multiplier: env_decimal("ARB_EXTRA_COST_MULTIPLIER", "1.3")?,
             min_rebalance_qty: env_decimal("MIN_REBALANCE_QTY", "1.5")?,
-            polymarket_fee_bps_prior: env_decimal("POLYMARKET_FEE_BPS_PRIOR", "0")?,
+            polymarket_fee_bps_prior: env_decimal("POLYMARKET_FEE_BPS_PRIOR", "700")?,
             outcome_taker_fee_rate: env_decimal("OUTCOME_TAKER_FEE_RATE", "0.00035")?,
+            pending_leg_timeout: Duration::from_secs(env_u64("PENDING_LEG_TIMEOUT_SECS", 300)),
+            unknown_leg_timeout: Duration::from_secs(env_u64("UNKNOWN_LEG_TIMEOUT_SECS", 300)),
+            max_active_orders: env_u64("MAX_ACTIVE_ORDERS", 20) as usize,
             polymarket_clob_url: env_or(
                 "POLYMARKET_CLOB_URL",
                 "https://clob.polymarket.com",
@@ -111,7 +117,7 @@ impl Config {
     }
 }
 
-pub fn parse_enabled_platforms(raw: Option<String>) -> HashSet<String> {
+pub fn parse_enabled_platforms(raw: Option<String>) -> Result<HashSet<String>> {
     let text = raw.unwrap_or_default();
     let parts: Vec<String> = text
         .split(',')
@@ -123,10 +129,14 @@ pub fn parse_enabled_platforms(raw: Option<String>) -> HashSet<String> {
     } else {
         parts
     };
-    selected
-        .into_iter()
-        .filter(|p| p == POLYMARKET || p == OUTCOME || true)
-        .collect()
+    let mut out = HashSet::new();
+    for p in selected {
+        if p != POLYMARKET && p != OUTCOME {
+            return Err(Error::Config(format!("unknown platform {p}")));
+        }
+        out.insert(p);
+    }
+    Ok(out)
 }
 
 const DEFAULT_FUNDER_KEYS_FILE: &str = "polymarket_funders.json";
@@ -271,9 +281,15 @@ mod tests {
 
     #[test]
     fn parses_enabled_platforms() {
-        let set = parse_enabled_platforms(Some("polymarket, outcome".into()));
+        let set = parse_enabled_platforms(Some("polymarket, outcome".into())).unwrap();
         assert!(set.contains(POLYMARKET));
         assert!(set.contains(OUTCOME));
+    }
+
+    #[test]
+    fn rejects_unknown_platform_name() {
+        let err = parse_enabled_platforms(Some("polymarket,typo".into())).unwrap_err();
+        assert!(err.to_string().contains("unknown platform typo"));
     }
 
     #[test]

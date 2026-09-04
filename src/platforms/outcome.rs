@@ -1,4 +1,5 @@
-use super::{parse_decimal, require_positive, MarketOrderRequest, OrderPoll, OrderSide, PreparedOrder, SubmitResult, TradeFill};
+use super::{json_id, parse_decimal, require_positive, MarketOrderRequest, OrderPoll, OrderSide, PreparedOrder, SubmitResult, TradeFill};
+use std::sync::Mutex as StdMutex;
 use crate::book::{BookStore, Level};
 use crate::config::{Config, OUTCOME};
 use crate::domain::TopicKey;
@@ -21,6 +22,7 @@ pub struct OutcomeVenue {
     mainnet: bool,
     signer: Option<PrivateKeySigner>,
     account: Option<String>,
+    nonce: Arc<StdMutex<u64>>,
 }
 
 impl OutcomeVenue {
@@ -42,11 +44,20 @@ impl OutcomeVenue {
             mainnet: cfg.hyperliquid_mainnet,
             signer,
             account: cfg.outcome_account_address.clone(),
+            nonce: Arc::new(StdMutex::new(0)),
         })
     }
 
     pub fn account_address(&self) -> Option<&str> {
         self.account.as_deref()
+    }
+
+    fn next_nonce(&self) -> u64 {
+        let now = unix_millis();
+        let mut last = self.nonce.lock().unwrap_or_else(|e| e.into_inner());
+        let next = now.max(last.saturating_add(1));
+        *last = next;
+        next
     }
 
     pub async fn rest_book(&self, coin: &str) -> Result<(Vec<Level>, Vec<Level>, i64)> {
@@ -100,7 +111,7 @@ impl OutcomeVenue {
             &shares.trunc().to_string(),
             Some(&cloid),
         );
-        let nonce = unix_millis();
+        let nonce = self.next_nonce();
         let (r, s, v) = sign_l1_action(signer, &action, nonce, self.mainnet).map_err(Error::msg)?;
         let hash = format!("{:#x}", action_hash(&action, None, nonce, None).map_err(Error::msg)?);
         let envelope = json!({
@@ -192,20 +203,40 @@ impl OutcomeVenue {
             .account
             .clone()
             .ok_or_else(|| Error::msg("missing OUTCOME_ACCOUNT_ADDRESS"))?;
-        let mut body = json!({"type": "userFills", "user": user});
-        if let Some(coin) = coin {
-            body["coin"] = json!(coin);
-        }
         let value: Value = self
             .http
             .post(&self.info_url)
-            .json(&body)
+            .json(&json!({"type": "userFills", "user": user}))
             .send()
             .await?
             .error_for_status()?
             .json()
             .await?;
-        Ok(parse_user_fills(&value))
+        let fills = parse_user_fills(&value);
+        Ok(match coin {
+            Some(want) => fills
+                .into_iter()
+                .filter(|fill| fill.coin.as_deref() == Some(want))
+                .collect(),
+            None => fills,
+        })
+    }
+
+    pub async fn token_balance(&self, coin: &str) -> Result<Decimal> {
+        let user = self
+            .account
+            .clone()
+            .ok_or_else(|| Error::msg("missing OUTCOME_ACCOUNT_ADDRESS"))?;
+        let value: Value = self
+            .http
+            .post(&self.info_url)
+            .json(&json!({"type": "spotClearinghouseState", "user": user}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(parse_coin_balance(&value, coin))
     }
 }
 
@@ -338,14 +369,20 @@ pub fn parse_user_fills(raw: &Value) -> Vec<TradeFill> {
     items
         .into_iter()
         .filter_map(|item| {
+            let mut order_ids = Vec::new();
+            if let Some(oid) = json_id(item.get("oid")) {
+                order_ids.push(oid);
+            }
+            if let Some(cloid) = item.get("cloid").and_then(|v| v.as_str()) {
+                if !order_ids.iter().any(|id| id == cloid) {
+                    order_ids.push(cloid.to_string());
+                }
+            }
             Some(TradeFill {
-                trade_id: item
-                    .get("tid")
-                    .map(|v| v.to_string())
-                    .unwrap_or_default(),
-                order_id: item.get("oid").map(|v| v.to_string()).or_else(|| {
-                    item.get("cloid").and_then(|v| v.as_str()).map(|s| s.to_string())
-                }),
+                trade_id: json_id(item.get("tid")).unwrap_or_default(),
+                order_id: order_ids.first().cloned(),
+                order_ids,
+                coin: item.get("coin").and_then(|v| v.as_str()).map(str::to_string),
                 shares: item.get("sz").and_then(parse_decimal)?,
                 price: item.get("px").and_then(parse_decimal)?,
                 fee: item.get("fee").and_then(parse_decimal).unwrap_or(Decimal::ZERO),
@@ -391,6 +428,17 @@ pub async fn run_l2_ws(
                     tokio::select! {
                         msg = sub_rx.recv() => {
                             let Some(next) = msg else { return; };
+                            let dropped: Vec<_> = coins
+                                .iter()
+                                .filter(|coin| !next.contains(*coin))
+                                .cloned()
+                                .collect();
+                            for coin in dropped {
+                                let payload = json!({"method":"unsubscribe","subscription":{"type":"l2Book","coin": coin}});
+                                if write.send(Message::Text(payload.to_string().into())).await.is_err() {
+                                    break;
+                                }
+                            }
                             coins = next;
                             for coin in &coins {
                                 let payload = json!({"method":"subscribe","subscription":{"type":"l2Book","coin": coin}});
@@ -461,6 +509,14 @@ fn unix_millis() -> u64 {
 }
 
 fn parse_usdc_balance(value: &Value) -> Decimal {
+    let usdc = parse_coin_balance(value, "USDC");
+    if usdc > Decimal::ZERO {
+        return usdc;
+    }
+    parse_coin_balance(value, "USDH")
+}
+
+fn parse_coin_balance(value: &Value, want: &str) -> Decimal {
     let balances = value
         .pointer("/balances")
         .and_then(|v| v.as_array())
@@ -468,7 +524,7 @@ fn parse_usdc_balance(value: &Value) -> Decimal {
         .unwrap_or_default();
     for item in balances {
         let coin = item.get("coin").and_then(|v| v.as_str()).unwrap_or("");
-        if coin.eq_ignore_ascii_case("USDC") || coin.eq_ignore_ascii_case("USDH") {
+        if coin.eq_ignore_ascii_case(want) {
             return item
                 .get("total")
                 .or_else(|| item.get("hold"))
@@ -500,5 +556,39 @@ mod tests {
         assert_eq!(ts, 10);
         assert_eq!(bids[0].price.to_string(), "0.40");
         assert_eq!(asks[0].size.to_string(), "8");
+    }
+
+    #[test]
+    fn parse_user_fills_keeps_coin_and_ids() {
+        let fills = parse_user_fills(&json!([{
+            "tid": 1,
+            "oid": 99,
+            "cloid": "0xabc",
+            "coin": "#5160",
+            "sz": "3",
+            "px": "0.4",
+            "fee": "0.01"
+        }, {
+            "tid": 2,
+            "oid": 100,
+            "coin": "#5161",
+            "sz": "4",
+            "px": "0.5",
+            "fee": "0"
+        }]));
+        assert_eq!(fills.len(), 2);
+        assert_eq!(fills[0].coin.as_deref(), Some("#5160"));
+        assert!(fills[0].matches(Some("99"), Some("0xabc")));
+        assert!(!fills[1].matches(Some("99"), None));
+    }
+
+    #[test]
+    fn parse_coin_balance_reads_named_token() {
+        let raw = json!({"balances": [
+            {"coin": "USDC", "total": "10"},
+            {"coin": "#5160", "total": "7"}
+        ]});
+        assert_eq!(parse_coin_balance(&raw, "#5160").to_string(), "7");
+        assert_eq!(parse_usdc_balance(&raw).to_string(), "10");
     }
 }

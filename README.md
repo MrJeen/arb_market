@@ -26,7 +26,7 @@ cp polymarket_funders.json.example polymarket_funders.json
 cargo run --release
 ```
 
-`ENABLE_BUY=false` 时只计算不下单。配置项见 `.env.example`。
+`ENABLE_BUY=false` 时只计算、不下新套利单，也不提交自动对冲。配置项见 `.env.example`。
 
 ## 本机交叉编译
 

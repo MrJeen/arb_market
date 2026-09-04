@@ -1,9 +1,11 @@
 use crate::domain::TopicKey;
 use crate::error::Result;
 use crate::hedge::Positions;
+use crate::config::{OUTCOME, POLYMARKET};
 use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::{postgres::PgPoolOptions, PgPool};
+use std::time::Duration;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -338,6 +340,128 @@ impl Store {
         .await?;
         Ok(())
     }
+
+    pub async fn has_open_rebalance_legs(&self, order_id: i64) -> Result<bool> {
+        let exists: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM legs
+             WHERE order_id = $1
+               AND intent = 'rebalance'
+               AND status IN ('pending','unknown','actived')
+             LIMIT 1",
+        )
+        .bind(order_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(exists.is_some())
+    }
+
+    pub async fn fail_stale_pending_without_envelope(&self, timeout: Duration) -> Result<u64> {
+        let secs = timeout.as_secs() as i64;
+        let result = sqlx::query(
+            "UPDATE legs SET status = 'failed', updated_at = NOW(),
+                    last_order_info = jsonb_build_object('reason','pending_timeout_no_envelope')
+             WHERE status = 'pending'
+               AND created_at < NOW() - make_interval(secs => $1)
+               AND NOT EXISTS (
+                 SELECT 1 FROM signed_envelopes e WHERE e.leg_id = legs.id
+               )",
+        )
+        .bind(secs)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn count_active_orders(&self) -> Result<i64> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM arb_orders WHERE status IN ('pending','actived')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    pub async fn count_stale_unknown_legs(&self, timeout: Duration) -> Result<i64> {
+        let secs = timeout.as_secs() as i64;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM legs
+             WHERE status = 'unknown'
+               AND updated_at < NOW() - make_interval(secs => $1)",
+        )
+        .bind(secs)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    pub async fn buy_funder_for_token(
+        &self,
+        order_id: i64,
+        platform: &str,
+        token_id: &str,
+    ) -> Result<Option<String>> {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT funder_address FROM legs
+             WHERE order_id = $1 AND platform = $2 AND token_id = $3
+               AND status = 'matched' AND UPPER(side) = 'BUY'
+               AND funder_address IS NOT NULL
+             ORDER BY id DESC LIMIT 1",
+        )
+        .bind(order_id)
+        .bind(platform)
+        .bind(token_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|item| item.0))
+    }
+
+    pub async fn refresh_order_actuals(&self, order_id: i64) -> Result<()> {
+        let rows: Vec<(String, String, Option<Decimal>, Option<Decimal>, Option<Decimal>)> =
+            sqlx::query_as(
+                "SELECT side, platform, actual_shares, actual_price, actual_fee
+                 FROM legs
+                 WHERE order_id = $1 AND status IN ('matched','completed')",
+            )
+            .bind(order_id)
+            .fetch_all(&self.pool)
+            .await?;
+        let rows: Vec<(String, String, Decimal, Decimal, Decimal)> = rows
+            .into_iter()
+            .map(|(side, platform, shares, price, fee)| {
+                (
+                    side,
+                    platform,
+                    shares.unwrap_or(Decimal::ZERO),
+                    price.unwrap_or(Decimal::ZERO),
+                    fee.unwrap_or(Decimal::ZERO),
+                )
+            })
+            .collect();
+        let (cost, rev, profit) = compute_actuals(&rows);
+        self.update_actuals(order_id, cost, rev, profit).await
+    }
+}
+
+pub fn compute_actuals(rows: &[(String, String, Decimal, Decimal, Decimal)]) -> (Decimal, Decimal, Decimal) {
+    let mut cost = Decimal::ZERO;
+    let mut rev = Decimal::ZERO;
+    let mut buy_pm = Decimal::ZERO;
+    let mut buy_out = Decimal::ZERO;
+    for (side, platform, shares, price, fee) in rows {
+        if side.eq_ignore_ascii_case("SELL") {
+            rev += *shares * *price - *fee;
+        } else {
+            cost += *shares * *price + *fee;
+            if platform == POLYMARKET {
+                buy_pm += *shares;
+            } else if platform == OUTCOME {
+                buy_out += *shares;
+            }
+        }
+    }
+    let locked = buy_pm.min(buy_out);
+    rev += locked;
+    (cost, rev, rev - cost)
 }
 
 pub async fn connect_common(uri: &str) -> Result<PgPool> {
@@ -346,3 +470,27 @@ pub async fn connect_common(uri: &str) -> Result<PgPool> {
         .connect(uri)
         .await?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal::prelude::FromStr;
+
+    fn d(s: &str) -> Decimal {
+        Decimal::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn actuals_lock_min_buy_shares_and_add_sell_rev() {
+        let rows = vec![
+            ("BUY".into(), POLYMARKET.into(), d("10"), d("0.4"), d("0.1")),
+            ("BUY".into(), OUTCOME.into(), d("8"), d("0.5"), d("0")),
+            ("SELL".into(), POLYMARKET.into(), d("2"), d("0.6"), d("0")),
+        ];
+        let (cost, rev, profit) = compute_actuals(&rows);
+        assert_eq!(cost.to_string(), "8.1");
+        assert_eq!(rev.to_string(), "9.2");
+        assert_eq!(profit.to_string(), "1.1");
+    }
+}
+

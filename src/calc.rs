@@ -864,5 +864,6 @@ mod tests {
     fn aligns_buy_to_provided_tick() {
         assert_eq!(align_polymarket_price(d("0.451"), d("0.001")), d("0.451"));
         assert_eq!(align_polymarket_price(d("0.451"), d("0.01")), d("0.46"));
+        assert_eq!(align_polymarket_sell_price(d("0.456"), d("0.01")), d("0.45"));
     }
 }
