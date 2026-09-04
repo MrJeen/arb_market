@@ -117,6 +117,22 @@ pub fn format_place_notice(tag: &str, notice: &PlaceNotice) -> String {
     lines.join("\n")
 }
 
+pub fn format_unknown_timeout_notice(tag: &str, legs: &[crate::store::ClosedLegRef]) -> String {
+    let mut lines = vec![
+        format!("⚠️ {tag}unknown 腿超时无成交，已标 cancelled"),
+        format!("📋 count: {}", legs.len()),
+    ];
+    for leg in legs.iter().take(8) {
+        lines.push(format!(
+            "- orderId={} legId={} platform={}",
+            leg.order_id,
+            leg.id,
+            escape_markdown(&leg.platform)
+        ));
+    }
+    lines.join("\n")
+}
+
 pub fn format_platform_label(platform: &str, service: Option<&str>) -> String {
     match service.map(str::trim).filter(|s| !s.is_empty()) {
         Some(service) => format!("{platform} ({service})"),
@@ -159,6 +175,10 @@ pub async fn connect(cfg: &Config) -> Option<NatsNotifier> {
 impl NatsNotifier {
     pub fn publish_place(&self, notice: PlaceNotice) {
         self.publish(format_place_notice(&self.tag, &notice));
+    }
+
+    pub fn publish_alert(&self, body: String) {
+        self.publish(body);
     }
 
     fn publish(&self, body: String) {
@@ -242,5 +262,19 @@ mod tests {
         assert!(text.contains("polymarket (rewards-11)"));
         assert!(text.contains("label=yes market=#12270: HTTP 429"));
         assert!(!text.contains("Real_Sociedad"));
+    }
+
+    #[test]
+    fn unknown_timeout_notice_lists_legs() {
+        let text = format_unknown_timeout_notice(
+            "【market-arb】",
+            &[crate::store::ClosedLegRef {
+                id: 9,
+                order_id: 3,
+                platform: "outcome".into(),
+            }],
+        );
+        assert!(text.contains("unknown 腿超时无成交"));
+        assert!(text.contains("orderId=3 legId=9 platform=outcome"));
     }
 }

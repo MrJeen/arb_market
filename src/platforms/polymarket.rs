@@ -659,6 +659,7 @@ pub fn parse_submit(body: &Value, order_hash: String, envelope: Value) -> Submit
             envelope,
             making: body.get("makingAmount").and_then(parse_decimal),
             taking: body.get("takingAmount").and_then(parse_decimal),
+            avg_px: None,
         };
     }
     SubmitResult::Unknown {

@@ -275,18 +275,53 @@ fn parse_hl_levels(value: &Value) -> Vec<Level> {
     }
 }
 
+pub fn is_explicit_order_reject(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("could not immediately match")
+        || m.contains("no liquidity")
+        || m.contains("could not fill")
+        || m.contains("minimum value")
+        || m.contains("divisible by tick")
+        || m.contains("tick size")
+}
+
 pub fn parse_exchange_submit(
     body: &Value,
     order_hash: String,
     envelope: Value,
     cloid: &str,
 ) -> SubmitResult {
+    let statuses = body
+        .pointer("/response/data/statuses")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(first) = statuses.first() {
+        if let Some(err) = first.get("error").and_then(|v| v.as_str()) {
+            return SubmitResult::NoMatch {
+                order_hash,
+                envelope,
+                message: err.to_string(),
+            };
+        }
+        let oid = json_id(first.pointer("/resting/oid"))
+            .or_else(|| json_id(first.pointer("/filled/oid")))
+            .unwrap_or_else(|| cloid.to_string());
+        let taking = first.pointer("/filled/totalSz").and_then(parse_decimal);
+        let avg_px = first.pointer("/filled/avgPx").and_then(parse_decimal);
+        return SubmitResult::Ack {
+            order_id: oid,
+            order_hash,
+            envelope,
+            making: None,
+            taking,
+            avg_px,
+        };
+    }
     let status = body.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    let message = body.to_string();
     if status != "ok" {
-        let message = body.to_string();
-        if message.to_ascii_lowercase().contains("no liquidity")
-            || message.to_ascii_lowercase().contains("could not fill")
-        {
+        if is_explicit_order_reject(&message) {
             return SubmitResult::NoMatch {
                 order_hash,
                 envelope,
@@ -300,50 +335,11 @@ pub fn parse_exchange_submit(
             message,
         };
     }
-    let statuses = body
-        .pointer("/response/data/statuses")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    if let Some(first) = statuses.first() {
-        if let Some(err) = first.get("error").and_then(|v| v.as_str()) {
-            if err.to_ascii_lowercase().contains("no liquidity") {
-                return SubmitResult::NoMatch {
-                    order_hash,
-                    envelope,
-                    message: err.to_string(),
-                };
-            }
-            return SubmitResult::Unknown {
-                order_id: None,
-                order_hash,
-                envelope,
-                message: err.to_string(),
-            };
-        }
-        let oid = first
-            .pointer("/resting/oid")
-            .or_else(|| first.pointer("/filled/oid"))
-            .and_then(|v| match v {
-                Value::Number(n) => Some(n.to_string()),
-                Value::String(s) => Some(s.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| cloid.to_string());
-        return SubmitResult::Ack {
-            order_id: oid,
-            order_hash,
-            envelope,
-            making: None,
-            taking: first.pointer("/filled/totalSz").and_then(parse_decimal),
-        };
-    }
-    SubmitResult::Ack {
-        order_id: cloid.to_string(),
+    SubmitResult::Unknown {
+        order_id: None,
         order_hash,
         envelope,
-        making: None,
-        taking: None,
+        message,
     }
 }
 
@@ -603,5 +599,81 @@ mod tests {
         ]});
         assert_eq!(parse_coin_balance(&raw, "#5160").to_string(), "7");
         assert_eq!(parse_usdc_balance(&raw).to_string(), "10");
+    }
+
+    fn exchange_ok(status_item: Value) -> Value {
+        json!({
+            "status": "ok",
+            "response": {"type": "order", "data": {"statuses": [status_item]}}
+        })
+    }
+
+    #[test]
+    fn parse_submit_ioc_unfilled_is_no_match() {
+        let body = exchange_ok(json!({
+            "error": "Order could not immediately match against any resting orders."
+        }));
+        match parse_exchange_submit(&body, "0x1".into(), json!({}), "cloid") {
+            SubmitResult::NoMatch { message, .. } => {
+                assert!(message.contains("immediately match"));
+            }
+            other => panic!("expected NoMatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_submit_min_notional_is_no_match() {
+        let body = exchange_ok(json!({"error": "Order must have minimum value of $10."}));
+        assert!(matches!(
+            parse_exchange_submit(&body, "0x1".into(), json!({}), "cloid"),
+            SubmitResult::NoMatch { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_submit_no_liquidity_is_no_match() {
+        let body = exchange_ok(json!({"error": "No liquidity available for market order."}));
+        assert!(matches!(
+            parse_exchange_submit(&body, "0x1".into(), json!({}), "cloid"),
+            SubmitResult::NoMatch { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_submit_filled_reads_avg_px() {
+        let body = exchange_ok(json!({
+            "filled": {"totalSz": "5", "avgPx": "0.55", "oid": 777}
+        }));
+        match parse_exchange_submit(&body, "0x1".into(), json!({}), "cloid") {
+            SubmitResult::Ack {
+                order_id,
+                taking,
+                avg_px,
+                ..
+            } => {
+                assert_eq!(order_id, "777");
+                assert_eq!(taking.unwrap().to_string(), "5");
+                assert_eq!(avg_px.unwrap().to_string(), "0.55");
+            }
+            other => panic!("expected Ack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_submit_top_level_err_and_ok_share_classifier() {
+        let err_body = json!({
+            "status": "err",
+            "response": "Order could not immediately match against any resting orders."
+        });
+        assert!(matches!(
+            parse_exchange_submit(&err_body, "0x1".into(), json!({}), "cloid"),
+            SubmitResult::NoMatch { .. }
+        ));
+        let ok_empty =
+            json!({"status": "ok", "response": {"type": "order", "data": {"statuses": []}}});
+        assert!(matches!(
+            parse_exchange_submit(&ok_empty, "0x1".into(), json!({}), "cloid"),
+            SubmitResult::Unknown { .. }
+        ));
     }
 }

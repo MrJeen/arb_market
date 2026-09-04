@@ -9,7 +9,8 @@ use crate::notify::{self, NatsNotifier, PlaceNotice, PlaceResult};
 use crate::platforms::outcome::OutcomeVenue;
 use crate::platforms::polymarket::PolymarketVenue;
 use crate::platforms::{
-    ioc_fill, pm_fak_fill, MarketOrderRequest, OrderSide, SubmitResult, TradeFill,
+    ioc_fill, pm_fak_fill, MarketOrderRequest, OrderPoll, OrderSide, PreparedOrder, SubmitResult,
+    TradeFill,
 };
 use crate::store::Store;
 use rust_decimal::Decimal;
@@ -333,7 +334,12 @@ impl Engine {
     ) -> Result<SubmitResult> {
         let prepared = self.pm.prepare_market_order(funder, req).await?;
         self.store
-            .insert_envelope(leg_id, &prepared.order_hash, &prepared.envelope)
+            .insert_envelope(
+                leg_id,
+                &prepared.order_hash,
+                &prepared.envelope,
+                &prepared.payload,
+            )
             .await?;
         let result = self.pm.post_prepared(&prepared).await?;
         persist_submit(&self.store, leg_id, POLYMARKET, req.side, &result).await?;
@@ -343,7 +349,12 @@ impl Engine {
     async fn submit_outcome(&self, leg_id: i64, req: &MarketOrderRequest) -> Result<SubmitResult> {
         let prepared = self.outcome.prepare_market_order(req)?;
         self.store
-            .insert_envelope(leg_id, &prepared.order_hash, &prepared.envelope)
+            .insert_envelope(
+                leg_id,
+                &prepared.order_hash,
+                &prepared.envelope,
+                &prepared.payload,
+            )
             .await?;
         let result = self.outcome.post_prepared(prepared).await?;
         persist_submit(&self.store, leg_id, OUTCOME, req.side, &result).await?;
@@ -357,6 +368,54 @@ impl Engine {
             .await?;
         if expired > 0 {
             tracing::warn!(expired, "failed stale pending legs without envelope");
+        }
+        let promoted = self.store.promote_submitted_pending_to_unknown().await?;
+        if promoted > 0 {
+            tracing::warn!(
+                promoted,
+                "pending legs with submit timestamp marked unknown"
+            );
+        }
+        let unsent = self
+            .store
+            .stale_unsent_pending_envelopes(self.cfg.pending_leg_timeout)
+            .await?;
+        for row in unsent {
+            if let Err(err) = self.replay_unsent_leg(&row).await {
+                tracing::error!(
+                    leg_id = row.id,
+                    error = %err,
+                    "unsent envelope replay failed"
+                );
+                let _ = self
+                    .store
+                    .update_leg_fill(
+                        row.id,
+                        "failed",
+                        None,
+                        Decimal::ZERO,
+                        Decimal::ZERO,
+                        Decimal::ZERO,
+                        &json!({"reason": "envelope_replay_failed", "error": err.to_string()}),
+                    )
+                    .await;
+            }
+        }
+        let timed_out = self
+            .store
+            .cancel_stale_unknown_without_fills(self.cfg.unknown_leg_timeout)
+            .await?;
+        if !timed_out.is_empty() {
+            tracing::error!(
+                count = timed_out.len(),
+                "stale unknown legs cancelled as no-fill timeout"
+            );
+            if let Some(notify) = &self.notify {
+                notify.publish_alert(notify::format_unknown_timeout_notice(
+                    &notify::format_notify_tag(&self.cfg.cat),
+                    &timed_out,
+                ));
+            }
         }
         let legs = self.store.open_legs().await?;
         for leg in legs {
@@ -381,76 +440,103 @@ impl Engine {
             .funder_address
             .as_deref()
             .ok_or_else(|| Error::msg("missing funder"))?;
-        let mut order_found = false;
-        let mut size_matched = None;
-        let mut poll_price = None;
-        if let Some(oid) = &leg.third_order_id {
-            let poll = self.pm.poll_order(funder, oid).await?;
-            order_found = poll.found;
-            size_matched = poll.shares.filter(|v| *v > Decimal::ZERO);
-            poll_price = poll.price.filter(|v| *v > Decimal::ZERO);
-            if poll.found && size_matched.is_none() {
-                let _ = self
-                    .store
-                    .update_leg_submitted(leg.id, "actived", Some(oid), &poll.raw)
-                    .await;
-            }
-        }
+        let poll = if let Some(oid) = &leg.third_order_id {
+            Some(self.pm.poll_order(funder, oid).await?)
+        } else {
+            None
+        };
         let trades = self.pm.poll_trades(funder, &leg.token_id).await?;
         let matched = filter_trades(
             &trades,
             leg.third_order_id.as_deref(),
             leg.client_order_id.as_deref(),
         );
-        upsert_fill_rows(&self.store, leg.id, &matched).await?;
-        if let Some(shares) = size_matched {
-            let (price, fee) = fill_price_and_fee(&matched, poll_price);
-            return close_leg_matched(
-                &self.store,
-                leg.id,
-                leg.third_order_id.as_deref(),
-                shares,
-                price,
-                fee,
-            )
-            .await;
-        }
-        if !matched.is_empty() {
-            return apply_fills(&self.store, leg.id, &matched).await;
-        }
-        if !order_found && matches!(leg.status.as_str(), "unknown" | "pending") {
-            // FAK 404 is not proof of no fill; wait until a later pass still has no trades.
-            return Ok(());
-        }
-        Ok(())
+        self.apply_remote_leg(leg, poll.as_ref(), &matched).await
     }
 
     async fn reconcile_outcome(&self, leg: &crate::store::LegRow) -> Result<()> {
-        if let Some(oid) = &leg.third_order_id {
-            let _ = self.outcome.poll_order(oid, &leg.token_id).await;
-        }
+        let poll = if let Some(oid) = &leg.third_order_id {
+            Some(self.outcome.poll_order(oid, &leg.token_id).await?)
+        } else {
+            None
+        };
         let fills = self.outcome.poll_fills(Some(&leg.token_id)).await?;
         let matched = filter_trades(
             &fills,
             leg.third_order_id.as_deref(),
             leg.client_order_id.as_deref(),
         );
-        if matched.is_empty() {
-            return Ok(());
+        self.apply_remote_leg(leg, poll.as_ref(), &matched).await
+    }
+
+    async fn apply_remote_leg(
+        &self,
+        leg: &crate::store::LegRow,
+        poll: Option<&OrderPoll>,
+        matched: &[&TradeFill],
+    ) -> Result<()> {
+        if !matched.is_empty() {
+            return apply_fills(&self.store, leg.id, matched).await;
         }
-        apply_fills(&self.store, leg.id, &matched).await
+        match remote_leg_terminal(poll, false) {
+            Some(RemoteLegTerminal::Matched) => {
+                let shares = poll.and_then(|p| p.shares).unwrap_or(Decimal::ZERO);
+                if shares <= Decimal::ZERO {
+                    return Ok(());
+                }
+                let price = poll.and_then(|p| p.price).unwrap_or(Decimal::ZERO);
+                let fee = poll.and_then(|p| p.fee).unwrap_or(Decimal::ZERO);
+                close_leg_matched(
+                    &self.store,
+                    leg.id,
+                    leg.third_order_id.as_deref(),
+                    shares,
+                    price,
+                    fee,
+                )
+                .await
+            }
+            Some(RemoteLegTerminal::Cancelled) => {
+                close_leg_cancelled(
+                    &self.store,
+                    leg.id,
+                    &json!({
+                        "reason": "remote_terminal_no_fill",
+                        "poll": poll.map(|p| p.raw.clone())
+                    }),
+                )
+                .await
+            }
+            None => Ok(()),
+        }
+    }
+
+    async fn replay_unsent_leg(&self, row: &crate::store::UnsentEnvelopeRow) -> Result<()> {
+        let envelope = json!({
+            "cloid": row.client_order_id,
+            "price": row.req_price.map(|p| p.to_string()),
+            "order_hash": row.order_hash,
+        });
+        let prepared = PreparedOrder {
+            order_hash: row.order_hash.clone(),
+            envelope,
+            payload: row.payload.clone(),
+            funder: row.funder_address.clone(),
+        };
+        let side = if row.side.eq_ignore_ascii_case("SELL") {
+            OrderSide::Sell
+        } else {
+            OrderSide::Buy
+        };
+        let result = if row.platform == POLYMARKET {
+            self.pm.post_prepared(&prepared).await?
+        } else {
+            self.outcome.post_prepared(prepared).await?
+        };
+        persist_submit(&self.store, row.id, &row.platform, side, &result).await
     }
 
     pub async fn hedge_once(&self) -> Result<()> {
-        if self
-            .store
-            .count_stale_unknown_legs(self.cfg.unknown_leg_timeout)
-            .await?
-            > 0
-        {
-            tracing::error!("stale unknown legs present; skip hedge");
-            return Ok(());
-        }
         let orders = self.store.completed_unbalanced_orders().await?;
         for order in orders {
             let key = TopicKey::new(order.event_id, order.unified_index);
@@ -753,17 +839,24 @@ async fn persist_submit(
             envelope,
             making,
             taking,
+            avg_px,
             ..
         } => {
-            let fill = if platform == POLYMARKET {
-                pm_fak_fill(side, *making, *taking)
-            } else {
-                let price = envelope
-                    .get("price")
-                    .and_then(crate::platforms::parse_decimal);
-                ioc_fill(*taking, price)
-            };
+            let fill = ack_fill(platform, side, *making, *taking, *avg_px, envelope);
             if let Some((shares, price)) = fill {
+                let trade_id = format!("ack:{order_id}");
+                let trade = TradeFill {
+                    trade_id: trade_id.clone(),
+                    order_id: Some(order_id.clone()),
+                    order_ids: vec![order_id.clone()],
+                    coin: None,
+                    shares,
+                    price,
+                    fee: Decimal::ZERO,
+                    fee_rate_bps: None,
+                    raw: json!({"source": "submit_ack", "avg_px": avg_px}),
+                };
+                upsert_fill_rows(store, leg_id, &[&trade]).await?;
                 close_leg_matched(store, leg_id, Some(order_id), shares, price, Decimal::ZERO)
                     .await?;
             } else {
@@ -804,6 +897,26 @@ async fn persist_submit(
         }
     }
     Ok(())
+}
+
+pub fn ack_fill(
+    platform: &str,
+    side: OrderSide,
+    making: Option<Decimal>,
+    taking: Option<Decimal>,
+    avg_px: Option<Decimal>,
+    envelope: &serde_json::Value,
+) -> Option<(Decimal, Decimal)> {
+    if platform == POLYMARKET {
+        pm_fak_fill(side, making, taking)
+    } else {
+        let price = avg_px.or_else(|| {
+            envelope
+                .get("price")
+                .and_then(crate::platforms::parse_decimal)
+        });
+        ioc_fill(taking, price)
+    }
 }
 
 fn place_result(
@@ -885,6 +998,20 @@ fn fill_price_and_fee(fills: &[&TradeFill], fallback_price: Option<Decimal>) -> 
     (price, fee)
 }
 
+async fn close_leg_cancelled(store: &Store, leg_id: i64, info: &serde_json::Value) -> Result<()> {
+    store
+        .update_leg_fill(
+            leg_id,
+            "cancelled",
+            None,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            info,
+        )
+        .await
+}
+
 async fn close_leg_matched(
     store: &Store,
     leg_id: i64,
@@ -922,6 +1049,48 @@ async fn apply_fills(store: &Store, leg_id: i64, fills: &[&TradeFill]) -> Result
         fee,
     )
     .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteLegTerminal {
+    Matched,
+    Cancelled,
+}
+
+pub fn remote_leg_terminal(
+    poll: Option<&OrderPoll>,
+    has_positive_fills: bool,
+) -> Option<RemoteLegTerminal> {
+    if has_positive_fills {
+        return Some(RemoteLegTerminal::Matched);
+    }
+    let poll = poll?;
+    if !poll.found {
+        return None;
+    }
+    if poll.shares.filter(|v| *v > Decimal::ZERO).is_some() {
+        return Some(RemoteLegTerminal::Matched);
+    }
+    if is_terminal_no_fill_status(&poll.status) {
+        return Some(RemoteLegTerminal::Cancelled);
+    }
+    None
+}
+
+fn is_terminal_no_fill_status(status: &str) -> bool {
+    let s = status.to_ascii_lowercase().replace(['_', '-', ' '], "");
+    matches!(
+        s.as_str(),
+        "cancelled"
+            | "canceled"
+            | "expired"
+            | "unmatched"
+            | "rejected"
+            | "ioccancelrejected"
+            | "mintradentlrejected"
+            | "tickrejected"
+            | "marketordernoliquidityrejected"
+    ) || s.contains("ioccancel")
 }
 
 pub fn parent_terminal_status(has_open_legs: bool, positive_matched: bool) -> Option<&'static str> {
@@ -1022,5 +1191,81 @@ mod tests {
         assert_eq!(parent_terminal_status(true, true), None);
         assert_eq!(parent_terminal_status(false, true), Some("completed"));
         assert_eq!(parent_terminal_status(false, false), Some("cancelled"));
+        // 单腿 matched + 另一腿 cancelled：无 open 腿且有正成交 → completed
+        assert_eq!(parent_terminal_status(false, true), Some("completed"));
+    }
+
+    fn poll(status: &str, found: bool, shares: Option<&str>) -> OrderPoll {
+        OrderPoll {
+            found,
+            status: status.into(),
+            order_id: Some("1".into()),
+            shares: shares.map(d),
+            price: Some(d("0.4")),
+            fee: None,
+            raw: json!({"status": status}),
+        }
+    }
+
+    #[test]
+    fn remote_terminal_cancelled_zero_fill() {
+        let p = poll("iocCancelRejected", true, None);
+        assert_eq!(
+            remote_leg_terminal(Some(&p), false),
+            Some(RemoteLegTerminal::Cancelled)
+        );
+        let p = poll("CANCELLED", true, None);
+        assert_eq!(
+            remote_leg_terminal(Some(&p), false),
+            Some(RemoteLegTerminal::Cancelled)
+        );
+        let p = poll("unmatched", true, Some("0"));
+        assert_eq!(
+            remote_leg_terminal(Some(&p), false),
+            Some(RemoteLegTerminal::Cancelled)
+        );
+    }
+
+    #[test]
+    fn remote_terminal_matched_on_fills_or_shares() {
+        let p = poll("open", true, None);
+        assert_eq!(
+            remote_leg_terminal(Some(&p), true),
+            Some(RemoteLegTerminal::Matched)
+        );
+        let p = poll("matched", true, Some("3"));
+        assert_eq!(
+            remote_leg_terminal(Some(&p), false),
+            Some(RemoteLegTerminal::Matched)
+        );
+        let p = poll("live", true, None);
+        assert_eq!(remote_leg_terminal(Some(&p), false), None);
+        let missing = poll("cancelled", false, None);
+        assert_eq!(remote_leg_terminal(Some(&missing), false), None);
+    }
+
+    #[test]
+    fn ack_fill_uses_avg_px_not_cap() {
+        let (shares, price) = ack_fill(
+            OUTCOME,
+            OrderSide::Buy,
+            None,
+            Some(d("5")),
+            Some(d("0.55")),
+            &json!({"price": "0.60"}),
+        )
+        .unwrap();
+        assert_eq!(shares.to_string(), "5");
+        assert_eq!(price.to_string(), "0.55");
+        let cap_only = ack_fill(
+            OUTCOME,
+            OrderSide::Buy,
+            None,
+            Some(d("5")),
+            None,
+            &json!({"price": "0.60"}),
+        )
+        .unwrap();
+        assert_eq!(cap_only.1.to_string(), "0.60");
     }
 }

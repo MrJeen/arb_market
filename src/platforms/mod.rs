@@ -48,6 +48,7 @@ pub enum SubmitResult {
         envelope: Value,
         making: Option<Decimal>,
         taking: Option<Decimal>,
+        avg_px: Option<Decimal>,
     },
     NoMatch {
         order_hash: String,

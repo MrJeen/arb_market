@@ -41,6 +41,26 @@ pub struct LegRow {
     pub status: String,
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ClosedLegRef {
+    pub id: i64,
+    pub order_id: i64,
+    pub platform: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UnsentEnvelopeRow {
+    pub id: i64,
+    pub order_id: i64,
+    pub platform: String,
+    pub side: String,
+    pub funder_address: Option<String>,
+    pub client_order_id: Option<String>,
+    pub req_price: Option<Decimal>,
+    pub order_hash: String,
+    pub payload: Value,
+}
+
 impl Store {
     pub async fn connect(uri: &str) -> Result<Self> {
         let pool = PgPoolOptions::new().max_connections(8).connect(uri).await?;
@@ -147,23 +167,26 @@ impl Store {
         &self,
         leg_id: i64,
         order_hash: &str,
-        payload: &Value,
+        envelope: &Value,
+        http_payload: &Value,
     ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO signed_envelopes (leg_id, order_hash, payload) VALUES ($1,$2,$3)")
             .bind(leg_id)
             .bind(order_hash)
-            .bind(payload)
-            .execute(&self.pool)
+            .bind(http_payload)
+            .execute(&mut *tx)
             .await?;
-        let client_id = payload
+        let client_id = envelope
             .get("cloid")
             .and_then(|v| v.as_str())
             .unwrap_or(order_hash);
         sqlx::query("UPDATE legs SET client_order_id = $2, updated_at = NOW() WHERE id = $1")
             .bind(leg_id)
             .bind(client_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -176,7 +199,8 @@ impl Store {
     ) -> Result<()> {
         sqlx::query(
             "UPDATE legs SET status = $2, third_order_id = COALESCE($3, third_order_id),
-                    last_order_info = $4, updated_at = NOW()
+                    last_order_info = $4, submitted_at = COALESCE(submitted_at, NOW()),
+                    updated_at = NOW()
              WHERE id = $1",
         )
         .bind(leg_id)
@@ -201,7 +225,8 @@ impl Store {
         sqlx::query(
             "UPDATE legs SET status = $2, third_order_id = COALESCE($3, third_order_id),
                     actual_price = $4, actual_shares = $5, actual_fee = $6,
-                    last_order_info = $7, updated_at = NOW()
+                    last_order_info = $7, submitted_at = COALESCE(submitted_at, NOW()),
+                    updated_at = NOW()
              WHERE id = $1",
         )
         .bind(leg_id)
@@ -373,6 +398,69 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    pub async fn cancel_stale_unknown_without_fills(
+        &self,
+        timeout: Duration,
+    ) -> Result<Vec<ClosedLegRef>> {
+        let secs = timeout.as_secs() as i64;
+        let rows = sqlx::query_as::<_, ClosedLegRef>(
+            "UPDATE legs SET status = 'cancelled',
+                    actual_price = 0, actual_shares = 0, actual_fee = 0,
+                    last_order_info = COALESCE(last_order_info, '{}'::jsonb)
+                        || jsonb_build_object('reason','unknown_timeout_no_fill'),
+                    updated_at = NOW()
+             WHERE status = 'unknown'
+               AND updated_at < NOW() - make_interval(secs => $1)
+               AND NOT EXISTS (
+                 SELECT 1 FROM fills f
+                 WHERE f.leg_id = legs.id AND COALESCE(f.shares, 0) > 0
+               )
+             RETURNING id, order_id, platform",
+        )
+        .bind(secs)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn promote_submitted_pending_to_unknown(&self) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE legs SET status = 'unknown', updated_at = NOW(),
+                    last_order_info = COALESCE(last_order_info, '{}'::jsonb)
+                        || jsonb_build_object('reason','pending_after_submit')
+             WHERE status = 'pending'
+               AND submitted_at IS NOT NULL
+               AND EXISTS (
+                 SELECT 1 FROM signed_envelopes e WHERE e.leg_id = legs.id
+               )",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn stale_unsent_pending_envelopes(
+        &self,
+        timeout: Duration,
+    ) -> Result<Vec<UnsentEnvelopeRow>> {
+        let secs = timeout.as_secs() as i64;
+        let rows = sqlx::query_as::<_, UnsentEnvelopeRow>(
+            "SELECT DISTINCT ON (l.id)
+                    l.id, l.order_id, l.platform, l.side, l.funder_address,
+                    l.client_order_id, l.req_price, e.order_hash, e.payload
+             FROM legs l
+             JOIN signed_envelopes e ON e.leg_id = l.id
+             WHERE l.status = 'pending'
+               AND l.submitted_at IS NULL
+               AND l.created_at < NOW() - make_interval(secs => $1)
+             ORDER BY l.id, e.id DESC",
+        )
+        .bind(secs)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     pub async fn count_active_orders(&self) -> Result<i64> {
