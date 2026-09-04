@@ -82,4 +82,86 @@ mod tests {
             Some(100_005_160)
         );
     }
+
+    #[test]
+    fn copies_polymarket_fee_schedule_rate() {
+        let unified = json!([{
+            "index": 0,
+            "title": "will it happen",
+            "platformOptions": [
+                {
+                    "platform": "polymarket",
+                    "optionId": "0xabc",
+                    "feesEnabled": true,
+                    "feeSchedule": { "rate": 0.07, "exponent": 1 },
+                    "outcomes": [
+                        {"tokenId": "111", "label": "Yes"},
+                        {"tokenId": "222", "label": "No"}
+                    ]
+                },
+                {
+                    "platform": "outcome",
+                    "optionId": 516,
+                    "outcomes": [
+                        {"tokenId": "#5160", "label": "Yes", "assetId": 100005160, "sideIndex": 0},
+                        {"tokenId": "#5161", "label": "No", "assetId": 100005161, "sideIndex": 1}
+                    ]
+                }
+            ]
+        }]);
+        let options: Vec<UnifiedOption> = serde_json::from_value(unified).unwrap();
+        let event = CatalogEvent {
+            id: Uuid::nil(),
+            title: "evt".into(),
+            end_date: None,
+            unified_options: options,
+        };
+        let enabled = HashSet::from([POLYMARKET.to_string(), OUTCOME.to_string()]);
+        let topics = tradable_topics(&event, &enabled);
+        let pm = topics[0].token(POLYMARKET, "yes").unwrap();
+        assert_eq!(pm.fees_enabled, Some(true));
+        assert_eq!(pm.fee_rate.unwrap().to_string(), "0.07");
+        assert_eq!(
+            topics[0].polymarket_fee_rate().unwrap().to_string(),
+            "0.07"
+        );
+    }
+
+    #[test]
+    fn disabled_fee_schedule_is_zero() {
+        let unified = json!([{
+            "index": 0,
+            "title": "will it happen",
+            "platformOptions": [
+                {
+                    "platform": "polymarket",
+                    "optionId": "0xabc",
+                    "feesEnabled": false,
+                    "feeSchedule": { "rate": 0.07 },
+                    "outcomes": [
+                        {"tokenId": "111", "label": "Yes"},
+                        {"tokenId": "222", "label": "No"}
+                    ]
+                },
+                {
+                    "platform": "outcome",
+                    "optionId": 516,
+                    "outcomes": [
+                        {"tokenId": "#5160", "label": "Yes", "assetId": 100005160, "sideIndex": 0},
+                        {"tokenId": "#5161", "label": "No", "assetId": 100005161, "sideIndex": 1}
+                    ]
+                }
+            ]
+        }]);
+        let options: Vec<UnifiedOption> = serde_json::from_value(unified).unwrap();
+        let event = CatalogEvent {
+            id: Uuid::nil(),
+            title: "evt".into(),
+            end_date: None,
+            unified_options: options,
+        };
+        let enabled = HashSet::from([POLYMARKET.to_string(), OUTCOME.to_string()]);
+        let topics = tradable_topics(&event, &enabled);
+        assert_eq!(topics[0].polymarket_fee_rate().unwrap().to_string(), "0");
+    }
 }

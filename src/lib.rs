@@ -38,6 +38,9 @@ pub async fn run() -> anyhow::Result<()> {
     let dirty = Arc::new(Mutex::new(DirtyCoalescer::default()));
     let topics = Arc::new(RwLock::new(HashMap::new()));
     let (calc_tx, mut calc_rx) = mpsc::channel::<TopicKey>(256);
+    let calc_tx_resync = cfg
+        .platform_enabled(POLYMARKET)
+        .then(|| calc_tx.clone());
     let (pm_sub_tx, pm_sub_rx) = mpsc::channel::<Vec<String>>(16);
     let (out_sub_tx, out_sub_rx) = mpsc::channel::<Vec<String>>(16);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -119,6 +122,25 @@ pub async fn run() -> anyhow::Result<()> {
             }
         }
     });
+
+    if let Some(calc_tx_resync) = calc_tx_resync {
+        let engine_resync = engine.clone();
+        let resync_interval = cfg.book_resync;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(resync_interval);
+            loop {
+                tick.tick().await;
+                match engine_resync.resync_stale_pm_books().await {
+                    Ok(topics) => {
+                        for topic in topics {
+                            let _ = calc_tx_resync.send(topic).await;
+                        }
+                    }
+                    Err(err) => tracing::error!(error = %err, "polymarket book resync failed"),
+                }
+            }
+        });
+    }
 
     shutdown_signal().await;
     let _ = shutdown_tx.send(true);

@@ -68,6 +68,17 @@ impl Engine {
         result
     }
 
+    fn fee_context(&self, topic: &Topic) -> FeeContext {
+        let rate = topic.polymarket_fee_rate().unwrap_or_else(|| {
+            self.cfg.polymarket_fee_bps_prior / Decimal::from(10_000)
+        });
+        FeeContext {
+            polymarket_fee_rate: rate,
+            outcome_taker_rate: self.cfg.outcome_taker_fee_rate,
+            extra_cost_multiplier: self.cfg.extra_cost_multiplier,
+        }
+    }
+
     async fn evaluate_topic(&self, topic_key: TopicKey) -> Result<()> {
         let topic = {
             let topics = self.topics.read().await;
@@ -79,15 +90,8 @@ impl Engine {
         if self.store.has_active_topic(topic_key).await? {
             return Ok(());
         }
-        let pm_bps = self
-            .store
-            .polymarket_prior_bps("", self.cfg.polymarket_fee_bps_prior)
-            .await?;
-        let fees = FeeContext {
-            polymarket_fee_bps: pm_bps,
-            outcome_taker_rate: self.cfg.outcome_taker_fee_rate,
-            extra_cost_multiplier: self.cfg.extra_cost_multiplier,
-        };
+        self.ensure_topic_pm_ticks(&topic).await;
+        let fees = self.fee_context(&topic);
         let limits = ArbLimits {
             cost_limit: self.cfg.arb_cost_limit,
             min_profit: self.cfg.arb_min_profit,
@@ -138,13 +142,14 @@ impl Engine {
         self.store.mark_order_status(order_id, "actived").await?;
         let pm_token = topic.token(POLYMARKET, &plan.pm.label);
         let out_token = topic.token(OUTCOME, &plan.outcome.label);
+        let pm_tick = self.ensure_pm_tick(&plan.pm.token_id).await;
         let pm_req = MarketOrderRequest {
             token_id: plan.pm.token_id.clone(),
             shares: plan.pm.shares,
             cap_price: plan.pm.cap_price,
             side: OrderSide::Buy,
             neg_risk: pm_token.and_then(|t| t.neg_risk),
-            tick_size: None,
+            tick_size: pm_tick,
             asset_id: None,
             funder_address: Some(funder.clone()),
         };
@@ -290,7 +295,7 @@ impl Engine {
             }
             return Ok(());
         }
-        apply_fills(&self.store, &self.cfg, POLYMARKET, &leg.token_id, leg.id, &matched).await
+        apply_fills(&self.store, leg.id, &matched).await
     }
 
     async fn reconcile_outcome(&self, leg: &crate::store::LegRow) -> Result<()> {
@@ -302,7 +307,7 @@ impl Engine {
         if matched.is_empty() {
             return Ok(());
         }
-        apply_fills(&self.store, &self.cfg, OUTCOME, &leg.token_id, leg.id, &matched).await
+        apply_fills(&self.store, leg.id, &matched).await
     }
 
     pub async fn hedge_once(&self) -> Result<()> {
@@ -327,15 +332,8 @@ impl Engine {
             if let Ok(bal) = self.outcome.user_state().await {
                 balances.insert(OUTCOME.to_string(), bal);
             }
-            let pm_bps = self
-                .store
-                .polymarket_prior_bps("", self.cfg.polymarket_fee_bps_prior)
-                .await?;
-            let fees = FeeContext {
-                polymarket_fee_bps: pm_bps,
-                outcome_taker_rate: self.cfg.outcome_taker_fee_rate,
-                extra_cost_multiplier: self.cfg.extra_cost_multiplier,
-            };
+            let fees = self.fee_context(&topic);
+            self.ensure_topic_pm_ticks(&topic).await;
             let actions = {
                 let books = self.books.lock().await;
                 plan_hedge(
@@ -377,7 +375,7 @@ impl Engine {
                 cap_price: action.cap_price,
                 side,
                 neg_risk: None,
-                tick_size: None,
+                tick_size: self.ensure_pm_tick(&action.token_id).await,
                 asset_id: None,
                 funder_address: Some(funder.clone()),
             };
@@ -429,6 +427,80 @@ impl Engine {
                 )
                 .await?;
             self.submit_outcome(leg_id, &req).await
+        }
+    }
+
+    pub async fn resync_stale_pm_books(&self) -> Result<Vec<TopicKey>> {
+        let limit = self.cfg.book_resync_batch.min(500);
+        let stale = {
+            let books = self.books.lock().await;
+            books.stale_pm_tokens(self.cfg.book_stale, Instant::now(), limit)
+        };
+        if stale.is_empty() {
+            tracing::debug!(stale = 0, "polymarket book resync skipped");
+            return Ok(Vec::new());
+        }
+        let started = Instant::now();
+        let payloads = match self.pm.rest_books(&stale).await {
+            Ok(payloads) => payloads,
+            Err(err) => {
+                tracing::warn!(
+                    stale = stale.len(),
+                    error = %err,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "polymarket book resync failed"
+                );
+                return Err(err);
+            }
+        };
+        let now = Instant::now();
+        let (applied, skipped_old, topics) = {
+            let mut books = self.books.lock().await;
+            let (applied, skipped_old) =
+                crate::platforms::polymarket::apply_rest_books(&mut books, &payloads, now);
+            let mut topics = Vec::new();
+            for token in &applied {
+                topics.extend(books.topics_for(POLYMARKET, token));
+            }
+            (applied, skipped_old, topics)
+        };
+        tracing::info!(
+            stale = stale.len(),
+            requested = stale.len(),
+            applied = applied.len(),
+            skipped_old,
+            topics = topics.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "polymarket book resync"
+        );
+        Ok(topics)
+    }
+
+    async fn ensure_topic_pm_ticks(&self, topic: &Topic) {
+        for token in &topic.tokens {
+            if token.platform == POLYMARKET {
+                let _ = self.ensure_pm_tick(&token.token_id).await;
+            }
+        }
+    }
+
+    /// 盘口已有 tick 则直接用；没有才请求一次 `/tick-size` 并写回订单簿。
+    async fn ensure_pm_tick(&self, token_id: &str) -> Option<Decimal> {
+        {
+            let books = self.books.lock().await;
+            if let Some(tick) = books.get(POLYMARKET, token_id).and_then(|book| book.tick_size) {
+                return Some(tick);
+            }
+        }
+        match self.pm.fetch_tick_size(token_id).await {
+            Ok(tick) => {
+                self.books.lock().await.set_tick_size(POLYMARKET, token_id, tick);
+                Some(tick)
+            }
+            Err(err) => {
+                tracing::warn!(token_id, error = %err, "polymarket tick_size fetch failed");
+                None
+            }
         }
     }
 }
@@ -496,14 +568,7 @@ fn filter_trades<'a>(
         .collect()
 }
 
-async fn apply_fills(
-    store: &Store,
-    cfg: &Config,
-    platform: &str,
-    token_id: &str,
-    leg_id: i64,
-    fills: &[&TradeFill],
-) -> Result<()> {
+async fn apply_fills(store: &Store, leg_id: i64, fills: &[&TradeFill]) -> Result<()> {
     let mut shares = Decimal::ZERO;
     let mut notional = Decimal::ZERO;
     let mut fee = Decimal::ZERO;
@@ -529,12 +594,6 @@ async fn apply_fills(
         notional += fill.shares * fill.price;
         fee += fill.fee;
         last_oid = fill.order_id.clone();
-        if notional > Decimal::ZERO && fill.fee > Decimal::ZERO {
-            let sample = (fill.fee / notional) * Decimal::from(10_000);
-            let _ = store
-                .update_fee_ema(platform, token_id, sample, cfg.fee_ema_alpha)
-                .await;
-        }
     }
     let avg = if shares > Decimal::ZERO {
         notional / shares

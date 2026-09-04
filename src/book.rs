@@ -35,6 +35,8 @@ pub struct OrderBook {
     pub exchange_ts_ms: i64,
     pub received_at: Instant,
     pub stale: bool,
+    /// Polymarket 最小价格档位。来自盘口字段、`tick_size_change`，或缺失时一次 REST `/tick-size`。
+    pub tick_size: Option<Decimal>,
 }
 
 impl OrderBook {
@@ -47,6 +49,7 @@ impl OrderBook {
             exchange_ts_ms: 0,
             received_at: Instant::now(),
             stale: true,
+            tick_size: None,
         }
     }
 
@@ -72,6 +75,7 @@ impl BookStore {
         now: Instant,
     ) -> bool {
         let key = TokenBookKey::new(platform, token_id);
+        let prev_tick = self.books.get(&key).and_then(|book| book.tick_size);
         if let Some(existing) = self.books.get(&key) {
             if exchange_ts_ms < existing.exchange_ts_ms {
                 return false;
@@ -91,6 +95,7 @@ impl BookStore {
                 exchange_ts_ms,
                 received_at: now,
                 stale: false,
+                tick_size: prev_tick,
             },
         );
         true
@@ -139,6 +144,17 @@ impl BookStore {
         true
     }
 
+    pub fn set_tick_size(&mut self, platform: &str, token_id: &str, tick_size: Decimal) {
+        if tick_size <= Decimal::ZERO {
+            return;
+        }
+        let book = self
+            .books
+            .entry(TokenBookKey::new(platform, token_id))
+            .or_insert_with(|| OrderBook::empty(platform, token_id));
+        book.tick_size = Some(tick_size);
+    }
+
     pub fn mark_platform_stale(&mut self, platform: &str) {
         for book in self.books.values_mut() {
             if book.platform == platform {
@@ -184,6 +200,23 @@ impl BookStore {
         outcome.sort();
         outcome.dedup();
         (pm, outcome)
+    }
+
+    pub fn stale_pm_tokens(&self, max_age: Duration, now: Instant, limit: usize) -> Vec<String> {
+        let mut tokens: Vec<String> = self
+            .token_topics
+            .keys()
+            .filter(|key| key.platform == POLYMARKET)
+            .filter(|key| match self.books.get(*key) {
+                Some(book) => !book.is_fresh(max_age, now),
+                None => true,
+            })
+            .map(|key| key.token_id.clone())
+            .collect();
+        tokens.sort();
+        tokens.dedup();
+        tokens.truncate(limit);
+        tokens
     }
 }
 
@@ -256,6 +289,25 @@ mod tests {
     }
 
     #[test]
+    fn keeps_tick_size_across_snapshots() {
+        let mut store = BookStore::default();
+        let now = Instant::now();
+        store.set_tick_size(POLYMARKET, "t1", d("0.001"));
+        assert!(store.replace_snapshot(
+            POLYMARKET,
+            "t1",
+            vec![Level {
+                price: d("0.40"),
+                size: d("10"),
+            }],
+            vec![],
+            1,
+            now,
+        ));
+        assert_eq!(store.get(POLYMARKET, "t1").unwrap().tick_size, Some(d("0.001")));
+    }
+
+    #[test]
     fn coalesces_dirty_topics() {
         let mut dirty = DirtyCoalescer::default();
         let topic = TopicKey {
@@ -266,5 +318,62 @@ mod tests {
         assert!(dirty.mark(topic).is_none());
         assert!(dirty.finish(topic).is_some());
         assert!(dirty.finish(topic).is_none());
+    }
+
+    fn topic_key(index: i32) -> TopicKey {
+        TopicKey {
+            event_id: uuid::Uuid::nil(),
+            unified_index: index,
+        }
+    }
+
+    #[test]
+    fn lists_stale_indexed_pm_tokens() {
+        let mut store = BookStore::default();
+        let now = Instant::now();
+        store.index_token(POLYMARKET, "fresh", topic_key(0));
+        store.index_token(POLYMARKET, "stale", topic_key(1));
+        store.index_token(POLYMARKET, "missing", topic_key(2));
+        store.index_token(OUTCOME, "#10", topic_key(0));
+        assert!(store.replace_snapshot(
+            POLYMARKET,
+            "fresh",
+            vec![],
+            vec![Level {
+                price: d("0.5"),
+                size: d("8"),
+            }],
+            100,
+            now,
+        ));
+        assert!(store.replace_snapshot(
+            POLYMARKET,
+            "stale",
+            vec![],
+            vec![Level {
+                price: d("0.4"),
+                size: d("8"),
+            }],
+            100,
+            now,
+        ));
+        store.mark_platform_stale(POLYMARKET);
+        // mark_platform_stale 把 fresh 也标过期了，重新写一份新鲜快照。
+        assert!(store.replace_snapshot(
+            POLYMARKET,
+            "fresh",
+            vec![],
+            vec![Level {
+                price: d("0.5"),
+                size: d("8"),
+            }],
+            101,
+            now,
+        ));
+        let stale = store.stale_pm_tokens(Duration::from_secs(5), now, 80);
+        assert_eq!(stale, vec!["missing".to_string(), "stale".to_string()]);
+        let truncated = store.stale_pm_tokens(Duration::from_secs(5), now, 1);
+        assert_eq!(truncated.len(), 1);
+        assert_eq!(truncated[0], "missing");
     }
 }

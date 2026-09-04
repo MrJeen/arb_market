@@ -184,7 +184,12 @@ fn eval_sell(
             label: label.into(),
             side: HedgeSide::Sell,
             shares: qty,
-            cap_price: align_hedge_price(platform, false, depth.worst),
+            cap_price: align_hedge_price(
+                platform,
+                false,
+                depth.worst,
+                polymarket_tick(books, platform, token_id),
+            )?,
             marginal_value: revenue,
         },
     })
@@ -225,7 +230,12 @@ fn eval_buy(
             label: label.into(),
             side: HedgeSide::Buy,
             shares: qty,
-            cap_price: align_hedge_price(platform, true, cap),
+            cap_price: align_hedge_price(
+                platform,
+                true,
+                cap,
+                polymarket_tick(books, platform, token_id),
+            )?,
             // 补齐后锁定兑付 $1/share，边际价值 = 锁定兑付 - 买入成本。
             marginal_value: qty - cost,
         },
@@ -247,6 +257,13 @@ fn walk_book(
     }
     let levels = if buy { &book.asks } else { &book.bids };
     walk_levels(levels, need_qty)
+}
+
+fn polymarket_tick(books: &BookStore, platform: &str, token_id: &str) -> Option<Decimal> {
+    if platform != POLYMARKET {
+        return None;
+    }
+    books.get(platform, token_id).and_then(|book| book.tick_size)
 }
 
 fn walk_levels(levels: &[Level], need_qty: Decimal) -> Option<Depth> {
@@ -297,7 +314,7 @@ mod tests {
 
     fn fees() -> FeeContext {
         FeeContext {
-            polymarket_fee_bps: Decimal::ZERO,
+            polymarket_fee_rate: Decimal::ZERO,
             outcome_taker_rate: Decimal::ZERO,
             extra_cost_multiplier: d("1.3"),
         }
@@ -313,6 +330,8 @@ mod tests {
             asset_id: None,
             side_index: None,
             neg_risk: None,
+            fees_enabled: None,
+            fee_rate: None,
         }
     }
 
@@ -415,6 +434,7 @@ mod tests {
             1,
             now,
         );
+        books.set_tick_size(POLYMARKET, "pm-yes", d("0.01"));
         let mut balances = HashMap::new();
         balances.insert(OUTCOME.into(), d("100"));
         let actions = plan(&books, &balances, now, "31", "6");
@@ -452,6 +472,7 @@ mod tests {
             1,
             now,
         );
+        books.set_tick_size(POLYMARKET, "pm-yes", d("0.01"));
         let mut balances = HashMap::new();
         balances.insert(OUTCOME.into(), d("100"));
         let actions = plan(&books, &balances, now, "46", "6");

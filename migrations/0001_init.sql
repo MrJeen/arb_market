@@ -82,12 +82,3 @@ CREATE TABLE IF NOT EXISTS fills (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_trade
     ON fills (leg_id, trade_id, third_order_id);
-
-CREATE TABLE IF NOT EXISTS fee_estimates (
-    platform    VARCHAR(32) NOT NULL,
-    token_id    TEXT NOT NULL DEFAULT '',
-    ema_bps     NUMERIC(20, 8) NOT NULL,
-    samples     INTEGER NOT NULL DEFAULT 0,
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (platform, token_id)
-);

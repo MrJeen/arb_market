@@ -15,7 +15,6 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Mutex};
@@ -134,10 +133,49 @@ impl PolymarketVenue {
         Ok(parse_book_json(&value))
     }
 
-    pub async fn tick_size(&self, token_id: &str) -> Result<Decimal> {
+    pub async fn rest_books(&self, token_ids: &[String]) -> Result<Vec<Value>> {
+        if token_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let started = Instant::now();
+        let body: Vec<Value> = token_ids
+            .iter()
+            .map(|token_id| json!({ "token_id": token_id }))
+            .collect();
+        let resp = self
+            .http
+            .post(format!("{}/books", self.base))
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Error::Http {
+                status: status.as_u16(),
+                message: redact_http(&text),
+            });
+        }
+        let parsed: Value = serde_json::from_str(&text).unwrap_or(json!([]));
+        let items = match parsed {
+            Value::Array(items) => items,
+            other => vec![other],
+        };
+        tracing::info!(
+            requested = token_ids.len(),
+            returned = items.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "polymarket books fetched"
+        );
+        Ok(items)
+    }
+
+    /// 仅在内存未命中时请求 `/tick-size`，结果写入 venue 缓存。
+    pub async fn fetch_tick_size(&self, token_id: &str) -> Result<Decimal> {
         if let Some(v) = self.tick_cache.lock().await.get(token_id).copied() {
             return Ok(v);
         }
+        let started = Instant::now();
         let value: Value = self
             .http
             .get(format!("{}/tick-size", self.base))
@@ -150,8 +188,18 @@ impl PolymarketVenue {
         let tick = value
             .get("minimum_tick_size")
             .or_else(|| value.get("tickSize"))
+            .or_else(|| value.get("tick_size"))
             .and_then(parse_decimal)
-            .unwrap_or_else(|| Decimal::from_str("0.01").unwrap());
+            .ok_or_else(|| Error::msg("tick-size response missing minimum_tick_size"))?;
+        if tick <= Decimal::ZERO {
+            return Err(Error::msg("invalid polymarket tick_size"));
+        }
+        tracing::info!(
+            token_id,
+            %tick,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "polymarket tick_size fetched"
+        );
         self.tick_cache.lock().await.insert(token_id.to_string(), tick);
         Ok(tick)
     }
@@ -194,7 +242,7 @@ impl PolymarketVenue {
             .clone();
         let tick = match req.tick_size {
             Some(v) => v,
-            None => self.tick_size(&req.token_id).await?,
+            None => self.fetch_tick_size(&req.token_id).await?,
         };
         let neg_risk = self.neg_risk(&req.token_id, req.neg_risk).await?;
         let unsigned = build_unsigned_order(&account, req, tick)?;
@@ -440,7 +488,7 @@ fn build_unsigned_order(
     req: &MarketOrderRequest,
     tick: Decimal,
 ) -> Result<SignedOrder> {
-    let price = crate::calc::align_polymarket_price(req.cap_price);
+    let price = crate::calc::align_polymarket_price(req.cap_price, tick);
     if price < tick {
         return Err(Error::msg("price below tick"));
     }
@@ -576,6 +624,22 @@ pub fn parse_book_json(value: &Value) -> (Vec<Level>, Vec<Level>, i64) {
     )
 }
 
+fn apply_book_tick(books: &mut BookStore, token: &str, payload: &Value) {
+    if let Some(tick) = parse_tick_size(payload) {
+        books.set_tick_size(POLYMARKET, token, tick);
+    }
+}
+
+fn parse_tick_size(value: &Value) -> Option<Decimal> {
+    value
+        .get("tick_size")
+        .or_else(|| value.get("tickSize"))
+        .or_else(|| value.get("minimum_tick_size"))
+        .or_else(|| value.get("order_price_min_tick_size"))
+        .and_then(parse_decimal)
+        .filter(|tick| *tick > Decimal::ZERO)
+}
+
 fn parse_levels(value: Option<&Value>) -> Vec<Level> {
     let Some(Value::Array(items)) = value else {
         return Vec::new();
@@ -655,7 +719,25 @@ pub fn apply_ws_message(
         }
         let (bids, asks, ts) = parse_book_json(payload);
         if books.replace_snapshot(POLYMARKET, token, bids, asks, ts, now) {
+            apply_book_tick(books, token, payload);
             changed.push((token.to_string(), true));
+        }
+    } else if event == "tick_size_change" {
+        let token = payload
+            .get("asset_id")
+            .or_else(|| payload.get("assetId"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if token.is_empty() {
+            return changed;
+        }
+        if let Some(tick) = payload
+            .get("new_tick_size")
+            .or_else(|| payload.get("newTickSize"))
+            .and_then(parse_decimal)
+        {
+            books.set_tick_size(POLYMARKET, token, tick);
+            changed.push((token.to_string(), false));
         }
     } else if event == "price_change" {
         let ts = payload
@@ -680,6 +762,33 @@ pub fn apply_ws_message(
         }
     }
     changed
+}
+
+pub fn apply_rest_books(
+    books: &mut BookStore,
+    payloads: &[Value],
+    now: Instant,
+) -> (Vec<String>, usize) {
+    let mut applied = Vec::new();
+    let mut skipped_old = 0usize;
+    for payload in payloads {
+        let token = payload
+            .get("asset_id")
+            .or_else(|| payload.get("assetId"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if token.is_empty() {
+            continue;
+        }
+        let (bids, asks, ts) = parse_book_json(payload);
+        if books.replace_snapshot(POLYMARKET, token, bids, asks, ts, now) {
+            apply_book_tick(books, token, payload);
+            applied.push(token.to_string());
+        } else {
+            skipped_old += 1;
+        }
+    }
+    (applied, skipped_old)
 }
 
 pub async fn run_market_ws(
@@ -824,6 +933,7 @@ fn redact_http(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn parses_fak_unfilled() {
@@ -832,5 +942,95 @@ mod tests {
             SubmitResult::NoMatch { .. } => {}
             other => panic!("expected no match, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stores_tick_size_from_book_payload() {
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        apply_ws_message(
+            &mut books,
+            &json!({
+                "event_type": "book",
+                "asset_id": "t1",
+                "timestamp": "100",
+                "tick_size": "0.001",
+                "bids": [{"price": "0.45", "size": "10"}],
+                "asks": [{"price": "0.46", "size": "8"}]
+            }),
+            now,
+        );
+        assert_eq!(books.get(POLYMARKET, "t1").unwrap().tick_size, Some(Decimal::from_str("0.001").unwrap()));
+        apply_ws_message(
+            &mut books,
+            &json!({
+                "event_type": "tick_size_change",
+                "asset_id": "t1",
+                "old_tick_size": "0.001",
+                "new_tick_size": "0.01",
+                "timestamp": "101"
+            }),
+            now,
+        );
+        assert_eq!(books.get(POLYMARKET, "t1").unwrap().tick_size, Some(Decimal::from_str("0.01").unwrap()));
+    }
+
+    #[test]
+    fn leaves_tick_size_empty_when_book_omits_field() {
+        let mut books = BookStore::default();
+        apply_ws_message(
+            &mut books,
+            &json!({
+                "event_type": "book",
+                "asset_id": "t1",
+                "timestamp": "100",
+                "bids": [{"price": "0.40", "size": "10"}],
+                "asks": [{"price": "0.41", "size": "8"}]
+            }),
+            Instant::now(),
+        );
+        assert_eq!(books.get(POLYMARKET, "t1").unwrap().tick_size, None);
+    }
+
+    #[test]
+    fn applies_rest_books_and_skips_older_snapshot() {
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        books.replace_snapshot(
+            POLYMARKET,
+            "t1",
+            vec![],
+            vec![Level {
+                price: Decimal::from_str("0.40").unwrap(),
+                size: Decimal::from_str("10").unwrap(),
+            }],
+            200,
+            now,
+        );
+        let (applied, skipped_old) = apply_rest_books(
+            &mut books,
+            &[
+                json!({
+                    "asset_id": "t1",
+                    "timestamp": "100",
+                    "tick_size": "0.001",
+                    "bids": [],
+                    "asks": [{"price": "0.99", "size": "1"}]
+                }),
+                json!({
+                    "asset_id": "t2",
+                    "timestamp": "150",
+                    "tick_size": "0.01",
+                    "bids": [{"price": "0.45", "size": "10"}],
+                    "asks": [{"price": "0.46", "size": "8"}]
+                }),
+            ],
+            now,
+        );
+        assert_eq!(applied, vec!["t2".to_string()]);
+        assert_eq!(skipped_old, 1);
+        assert_eq!(books.get(POLYMARKET, "t1").unwrap().asks[0].price, Decimal::from_str("0.40").unwrap());
+        assert_eq!(books.get(POLYMARKET, "t2").unwrap().tick_size, Some(Decimal::from_str("0.01").unwrap()));
+        assert_eq!(books.get(POLYMARKET, "t2").unwrap().asks[0].price, Decimal::from_str("0.46").unwrap());
     }
 }

@@ -1,4 +1,3 @@
-use crate::config::POLYMARKET;
 use crate::domain::TopicKey;
 use crate::error::Result;
 use crate::hedge::Positions;
@@ -282,42 +281,6 @@ impl Store {
         Ok(())
     }
 
-    pub async fn fee_ema(&self, platform: &str, token_id: &str) -> Result<Option<Decimal>> {
-        let value: Option<Decimal> = sqlx::query_scalar(
-            "SELECT ema_bps FROM fee_estimates WHERE platform = $1 AND token_id = $2",
-        )
-        .bind(platform)
-        .bind(token_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(value)
-    }
-
-    pub async fn update_fee_ema(
-        &self,
-        platform: &str,
-        token_id: &str,
-        sample_bps: Decimal,
-        alpha: Decimal,
-    ) -> Result<Decimal> {
-        let current = self.fee_ema(platform, token_id).await?;
-        let next = crate::calc::next_fee_ema(current, sample_bps, alpha);
-        sqlx::query(
-            "INSERT INTO fee_estimates (platform, token_id, ema_bps, samples, updated_at)
-             VALUES ($1,$2,$3,1,NOW())
-             ON CONFLICT (platform, token_id)
-             DO UPDATE SET ema_bps = EXCLUDED.ema_bps,
-                           samples = fee_estimates.samples + 1,
-                           updated_at = NOW()",
-        )
-        .bind(platform)
-        .bind(token_id)
-        .bind(next)
-        .execute(&self.pool)
-        .await?;
-        Ok(next)
-    }
-
     pub async fn positions_for_order(&self, order_id: i64) -> Result<Positions> {
         let rows: Vec<(String, String, String, Option<Decimal>)> = sqlx::query_as(
             "SELECT platform, label, side, actual_shares
@@ -374,14 +337,6 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
-    }
-
-    pub async fn polymarket_prior_bps(&self, token_id: &str, fallback: Decimal) -> Result<Decimal> {
-        Ok(self
-            .fee_ema(POLYMARKET, token_id)
-            .await?
-            .or(self.fee_ema(POLYMARKET, "").await?)
-            .unwrap_or(fallback))
     }
 }
 

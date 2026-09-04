@@ -140,6 +140,26 @@ DEPLOY_HOST=arb DEPLOY_PATH=/var/www/arb_market/dist SERVICE_USER=market-arb ./s
 
 `restart` 先发 SIGTERM，进程退出后再拉起新二进制。
 
+## 查看日志
+
+【服务器】进程 stdout 进 systemd journal，没有 `/var/www/arb_market/*.log`。`-u market-arb` 按 **unit 名** 过滤（`market-arb.service`），不是按 Linux 用户。别的服务即使也跑在 `market-arb` 用户下，也不会出现在这条命令里。
+
+```bash
+sudo journalctl -u market-arb           # 默认用 less 打开；/ 搜索，n 下一个
+sudo journalctl -u market-arb -f        # 实时跟踪
+sudo journalctl -u market-arb -n 200    # 最近 200 行
+sudo journalctl -u market-arb --since today --until "18:00"
+sudo journalctl -u market-arb -g "submit failed"
+sudo journalctl -u market-arb -p err    # 只看 error 及以上
+```
+
+磁盘上的 journal 是二进制（`/var/log/journal/<machine-id>/system.journal`），不要用 `less` 直接打开。要当文本文件翻：
+
+```bash
+sudo journalctl -u market-arb --since today --no-pager > /tmp/market-arb.log
+less /tmp/market-arb.log
+```
+
 ## 相关文件
 
 | 路径                              | 说明                                                |

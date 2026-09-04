@@ -3,6 +3,7 @@ use crate::error::{Error, Result};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer};
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use uuid::Uuid;
 
 pub const OUTCOME_ASSET_BASE: u64 = 100_000_000;
@@ -59,9 +60,9 @@ pub struct PlatformOption {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FeeSchedule {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_decimal")]
     pub rate: Option<Decimal>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_decimal")]
     pub exponent: Option<Decimal>,
 }
 
@@ -99,6 +100,9 @@ pub struct TokenRef {
     pub asset_id: Option<u64>,
     pub side_index: Option<u8>,
     pub neg_risk: Option<bool>,
+    pub fees_enabled: Option<bool>,
+    /// Catalog `feeSchedule.rate` (e.g. 0.07 crypto, 0.04 finance). Not bps.
+    pub fee_rate: Option<Decimal>,
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +130,16 @@ impl Topic {
         let mut labels: Vec<_> = set.into_iter().collect();
         labels.sort();
         labels
+    }
+
+    /// Polymarket taker `feeRate` from this market's catalog schedule.
+    /// `fees_enabled == false` yields `Some(0)`; missing schedule yields `None`.
+    pub fn polymarket_fee_rate(&self) -> Option<Decimal> {
+        let pm = self.tokens.iter().find(|t| t.platform == POLYMARKET)?;
+        if pm.fees_enabled == Some(false) {
+            return Some(Decimal::ZERO);
+        }
+        pm.fee_rate
     }
 }
 
@@ -251,6 +265,8 @@ fn build_topic(
                     parse_side_coin(&spec.token_id).map(|(_, side)| side)
                 }),
                 neg_risk: spec.neg_risk.or(po.neg_risk),
+                fees_enabled: po.fees_enabled,
+                fee_rate: po.fee_schedule.as_ref().and_then(|s| s.rate),
             });
         }
         label_sets.push(labels);
@@ -294,6 +310,26 @@ where
         Some(serde_json::Value::Number(n)) => Ok(Some(n.to_string())),
         Some(other) => Err(serde::de::Error::custom(format!(
             "expected string or number, got {other}"
+        ))),
+    }
+}
+
+fn de_opt_decimal<'de, D>(deserializer: D) -> std::result::Result<Option<Decimal>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) if s.is_empty() => Ok(None),
+        Some(serde_json::Value::String(s)) => Decimal::from_str(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        Some(serde_json::Value::Number(n)) => Decimal::from_str(&n.to_string())
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected decimal, got {other}"
         ))),
     }
 }

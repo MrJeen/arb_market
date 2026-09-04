@@ -8,7 +8,8 @@ use std::str::FromStr;
 
 #[derive(Debug, Clone)]
 pub struct FeeContext {
-    pub polymarket_fee_bps: Decimal,
+    /// Polymarket `feeSchedule.rate` (0.07 crypto, not 700 bps).
+    pub polymarket_fee_rate: Decimal,
     pub outcome_taker_rate: Decimal,
     pub extra_cost_multiplier: Decimal,
 }
@@ -132,6 +133,7 @@ pub fn plan_arbitrage(
         &out_comp.asks,
         fees,
         limits,
+        pm_yes_or_a.tick_size?,
     )
 }
 
@@ -142,6 +144,7 @@ fn search_pair(
     out_asks: &[Level],
     fees: &FeeContext,
     limits: &ArbLimits,
+    pm_tick: Decimal,
 ) -> Option<ArbPlan> {
     let mut pm_asks = pm_asks.to_vec();
     let mut out_asks = out_asks.to_vec();
@@ -168,7 +171,7 @@ fn search_pair(
         if unclipped_cost > limits.cost_limit * Decimal::from(3) {
             if let Some(net) = fill_to_budget(&acc, remain, unit_cost, pm_px, out_px, max_net, fees, limits)
             {
-                return acc.plus(net, pm_px, out_px).to_plan(pm_token, out_token, fees, limits);
+                return acc.plus(net, pm_px, out_px).to_plan(pm_token, out_token, fees, limits, pm_tick);
             }
         }
 
@@ -177,7 +180,7 @@ fn search_pair(
         {
             let trial = acc.plus(net, pm_px, out_px);
             if trial.passes_all(fees, limits) {
-                return trial.to_plan(pm_token, out_token, fees, limits);
+                return trial.to_plan(pm_token, out_token, fees, limits, pm_tick);
             }
         }
 
@@ -191,7 +194,7 @@ fn search_pair(
             break;
         }
         if acc.passes_all(fees, limits) {
-            return acc.to_plan(pm_token, out_token, fees, limits);
+            return acc.to_plan(pm_token, out_token, fees, limits, pm_tick);
         }
         if ended {
             break;
@@ -401,6 +404,7 @@ impl Acc {
         out_token: &TokenRef,
         fees: &FeeContext,
         limits: &ArbLimits,
+        pm_tick: Decimal,
     ) -> Option<ArbPlan> {
         if !self.passes_all(fees, limits) {
             return None;
@@ -413,7 +417,7 @@ impl Acc {
                 label: pm_token.label.clone(),
                 shares: self.pm_shares,
                 avg_price: m.pm_avg,
-                cap_price: align_polymarket_price(self.pm_cap),
+                cap_price: align_polymarket_price(self.pm_cap, pm_tick),
                 cost: self.pm_cost,
                 fee: m.pm_fee,
             },
@@ -492,12 +496,12 @@ pub fn best_plan(
 }
 
 pub fn estimate_polymarket_fee(shares: Decimal, price: Decimal, fees: &FeeContext) -> Decimal {
-    if fees.polymarket_fee_bps.is_zero() {
+    if fees.polymarket_fee_rate.is_zero() {
         return Decimal::ZERO;
     }
-    let bps = fees.polymarket_fee_bps / Decimal::from(10_000);
     let one_minus = Decimal::ONE - price;
-    shares * price * one_minus * bps * fees.extra_cost_multiplier
+    // Official: fee = C × feeRate × p × (1 - p)
+    shares * fees.polymarket_fee_rate * price * one_minus * fees.extra_cost_multiplier
 }
 
 pub fn estimate_outcome_fee(notional: Decimal, fees: &FeeContext) -> Decimal {
@@ -521,35 +525,45 @@ pub fn floor_shares(value: Decimal) -> Decimal {
     value.trunc()
 }
 
-pub fn align_polymarket_price(price: Decimal) -> Decimal {
-    align_polymarket_tick(price, true)
+pub fn align_polymarket_price(price: Decimal, tick: Decimal) -> Decimal {
+    align_polymarket_tick(price, tick, true)
 }
 
-pub fn align_polymarket_sell_price(price: Decimal) -> Decimal {
-    align_polymarket_tick(price, false)
+pub fn align_polymarket_sell_price(price: Decimal, tick: Decimal) -> Decimal {
+    align_polymarket_tick(price, tick, false)
 }
 
-fn align_polymarket_tick(price: Decimal, buy: bool) -> Decimal {
-    let tick = Decimal::from_str("0.01").unwrap();
+fn align_polymarket_tick(price: Decimal, tick: Decimal, buy: bool) -> Decimal {
+    let tick = if tick > Decimal::ZERO {
+        tick
+    } else {
+        Decimal::from_str("0.01").unwrap()
+    };
     let rounded = if buy {
         (price / tick).ceil() * tick
     } else {
         (price / tick).floor() * tick
     };
-    let max = Decimal::from_str("0.99").unwrap();
-    let min = Decimal::from_str("0.01").unwrap();
+    let min = tick;
+    let max = (Decimal::ONE - tick).max(min);
     rounded.clamp(min, max)
 }
 
-pub fn align_hedge_price(platform: &str, buy: bool, price: Decimal) -> Decimal {
+pub fn align_hedge_price(
+    platform: &str,
+    buy: bool,
+    price: Decimal,
+    pm_tick: Option<Decimal>,
+) -> Option<Decimal> {
     if platform == POLYMARKET {
-        if buy {
-            align_polymarket_price(price)
+        let tick = pm_tick?;
+        Some(if buy {
+            align_polymarket_price(price, tick)
         } else {
-            align_polymarket_sell_price(price)
-        }
+            align_polymarket_sell_price(price, tick)
+        })
     } else {
-        align_outcome_price(price)
+        Some(align_outcome_price(price))
     }
 }
 
@@ -574,13 +588,6 @@ pub fn round_sigfigs(value: Decimal, sig: u32) -> Decimal {
     Decimal::from_str(&format!("{rounded}")).unwrap_or(value)
 }
 
-pub fn next_fee_ema(old: Option<Decimal>, sample_bps: Decimal, alpha: Decimal) -> Decimal {
-    match old {
-        Some(old) => alpha * sample_bps + (Decimal::ONE - alpha) * old,
-        None => sample_bps,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -603,6 +610,8 @@ mod tests {
             asset_id: None,
             side_index: None,
             neg_risk: None,
+            fees_enabled: None,
+            fee_rate: None,
         }
     }
 
@@ -623,7 +632,7 @@ mod tests {
 
     fn fees_zero() -> FeeContext {
         FeeContext {
-            polymarket_fee_bps: Decimal::ZERO,
+            polymarket_fee_rate: Decimal::ZERO,
             outcome_taker_rate: Decimal::ZERO,
             extra_cost_multiplier: d("1.3"),
         }
@@ -658,6 +667,9 @@ mod tests {
             1,
             now,
         );
+        if platform == POLYMARKET {
+            books.set_tick_size(platform, token_id, d("0.01"));
+        }
     }
 
     fn plan_with(books: &BookStore, now: Instant, limits: &ArbLimits) -> ArbPlan {
@@ -803,10 +815,54 @@ mod tests {
     }
 
     #[test]
-    fn fee_ema_updates() {
-        let next = next_fee_ema(None, d("100"), d("0.3"));
-        assert_eq!(next, d("100"));
-        let next = next_fee_ema(Some(d("100")), d("0"), d("0.5"));
-        assert_eq!(next, d("50"));
+    fn polymarket_fee_uses_catalog_rate() {
+        let fees = FeeContext {
+            polymarket_fee_rate: d("0.07"),
+            outcome_taker_rate: Decimal::ZERO,
+            extra_cost_multiplier: Decimal::ONE,
+        };
+        // Official crypto table: 100 shares @ $0.50 → $1.75
+        assert_eq!(estimate_polymarket_fee(d("100"), d("0.50"), &fees), d("1.75"));
+        let conservative = FeeContext {
+            extra_cost_multiplier: d("1.3"),
+            ..fees.clone()
+        };
+        assert_eq!(
+            estimate_polymarket_fee(d("100"), d("0.50"), &conservative),
+            d("2.275")
+        );
+    }
+
+    #[test]
+    fn skips_when_pm_tick_size_missing() {
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        books.replace_snapshot(
+            POLYMARKET,
+            "pm-yes",
+            vec![],
+            vec![Level {
+                price: d("0.40"),
+                size: d("50"),
+            }],
+            1,
+            now,
+        );
+        snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+        let plan = best_plan(
+            &sample_topic(),
+            &books,
+            &fees_zero(),
+            &limits("3", "100"),
+            now,
+            std::time::Duration::from_secs(5),
+        );
+        assert!(plan.is_none());
+    }
+
+    #[test]
+    fn aligns_buy_to_provided_tick() {
+        assert_eq!(align_polymarket_price(d("0.451"), d("0.001")), d("0.451"));
+        assert_eq!(align_polymarket_price(d("0.451"), d("0.01")), d("0.46"));
     }
 }
