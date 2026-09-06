@@ -514,7 +514,7 @@ mod tests {
             OUTCOME,
             "#10",
             vec![Level {
-                price: d("0.50"),
+                price: d("0.20"),
                 size: d("10"),
             }],
             vec![],

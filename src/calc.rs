@@ -82,12 +82,9 @@ pub fn complementary_pairs(labels: &[String]) -> Vec<(String, String)> {
     ]
 }
 
-pub fn min_trade_cost(platform: &str) -> Decimal {
-    if platform == POLYMARKET {
-        Decimal::ONE
-    } else {
-        Decimal::from(10)
-    }
+pub fn min_trade_cost(_platform: &str) -> Decimal {
+    // Polymarket CLOB 与 Outcome/HIP-4 当前均为 1 USDC 名义下限。
+    Decimal::ONE
 }
 
 pub fn min_trade_amount(platform: &str) -> Decimal {
@@ -696,9 +693,9 @@ mod tests {
         snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
         snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
         let plan = plan_with(&books, now, &limits("3", "100"));
-        // Outcome $10 / 0.40 = 25 shares；利润 25 * 0.2 = 5，刚好过门槛而非吃满 50。
-        assert_eq!(plan.net_shares, d("25"));
-        assert_eq!(plan.profit, d("5"));
+        // min_profit=3、单位利润 0.2 → 15 shares，刚好过门槛而非吃满 50。
+        assert_eq!(plan.net_shares, d("15"));
+        assert_eq!(plan.profit, d("3"));
         assert_eq!(plan.pm.label, "yes");
         assert_eq!(plan.outcome.label, "no");
     }
@@ -757,7 +754,7 @@ mod tests {
         // yes+no 单位成本 0.80 ROI=0.25；no+yes 单位成本 0.50 ROI=1.00。
         assert_eq!(plan.pm.label, "no");
         assert_eq!(plan.outcome.label, "yes");
-        assert_eq!(plan.net_shares, d("34"));
+        assert_eq!(plan.net_shares, d("6"));
     }
 
     #[test]
@@ -765,7 +762,7 @@ mod tests {
         let mut books = BookStore::default();
         let now = Instant::now();
         snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "20")], now);
-        snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "20")], now);
+        snapshot(&mut books, OUTCOME, "#10", vec![("0.09", "10")], now);
         let plan = best_plan(
             &sample_topic(),
             &books,
@@ -774,7 +771,7 @@ mod tests {
             now,
             std::time::Duration::from_secs(5),
         );
-        // 20 * 0.40 = 8 < $10，整档吃完仍不够最小名义。
+        // Outcome 10 * 0.09 = 0.90 < $1，整档吃完仍不够最小名义。
         assert!(plan.is_none());
     }
 
@@ -792,7 +789,7 @@ mod tests {
         snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "40.9")], now);
         let plan = plan_with(&books, now, &limits("3", "100"));
         assert_eq!(plan.outcome.shares, floor_shares(plan.outcome.shares));
-        assert_eq!(plan.net_shares, d("25"));
+        assert_eq!(plan.net_shares, d("15"));
     }
 
     #[test]

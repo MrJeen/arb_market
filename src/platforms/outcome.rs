@@ -651,7 +651,7 @@ mod tests {
 
     #[test]
     fn parse_submit_min_notional_is_no_match() {
-        let body = exchange_ok(json!({"error": "Order must have minimum value of $10."}));
+        let body = exchange_ok(json!({"error": "Order must have minimum value of 1 USDC."}));
         assert!(matches!(
             parse_exchange_submit(&body, "0x1".into(), json!({}), "cloid"),
             SubmitResult::NoMatch { .. }
