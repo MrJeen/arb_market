@@ -56,6 +56,28 @@ impl OrderBook {
     pub fn is_fresh(&self, max_age: Duration, now: Instant) -> bool {
         !self.stale && now.duration_since(self.received_at) <= max_age
     }
+
+    pub fn best_bid(&self) -> Option<Decimal> {
+        best_bid_px(&self.bids)
+    }
+
+    pub fn best_ask(&self) -> Option<Decimal> {
+        best_ask_px(&self.asks)
+    }
+}
+
+pub fn best_bid_px(bids: &[Level]) -> Option<Decimal> {
+    bids.iter()
+        .filter(|level| level.price > Decimal::ZERO)
+        .map(|level| level.price)
+        .max()
+}
+
+pub fn best_ask_px(asks: &[Level]) -> Option<Decimal> {
+    asks.iter()
+        .filter(|level| level.price > Decimal::ZERO)
+        .map(|level| level.price)
+        .min()
 }
 
 #[derive(Debug, Default)]
@@ -77,7 +99,7 @@ impl BookStore {
         let key = TokenBookKey::new(platform, token_id);
         let prev_tick = self.books.get(&key).and_then(|book| book.tick_size);
         if let Some(existing) = self.books.get(&key) {
-            if exchange_ts_ms < existing.exchange_ts_ms {
+            if exchange_ts_ms <= existing.exchange_ts_ms {
                 return false;
             }
         }
@@ -112,11 +134,12 @@ impl BookStore {
         now: Instant,
     ) -> bool {
         let key = TokenBookKey::new(platform, token_id);
+        let existed = self.books.contains_key(&key);
         let book = self
             .books
             .entry(key.clone())
             .or_insert_with(|| OrderBook::empty(platform, token_id));
-        if exchange_ts_ms < book.exchange_ts_ms {
+        if existed && exchange_ts_ms <= book.exchange_ts_ms {
             return false;
         }
         let levels = if is_bid {
@@ -275,10 +298,25 @@ mod tests {
             100,
             now,
         ));
-        assert!(!store.replace_snapshot(POLYMARKET, "t1", vec![], vec![], 90, now,));
+        assert!(!store.replace_snapshot(POLYMARKET, "t1", vec![], vec![], 100, now));
+        assert!(!store.replace_snapshot(POLYMARKET, "t1", vec![], vec![], 90, now));
         let book = store.get(POLYMARKET, "t1").unwrap();
         assert_eq!(book.asks[0].price, d("0.5"));
         assert!(!book.stale);
+        assert!(store.replace_snapshot(
+            POLYMARKET,
+            "t1",
+            vec![],
+            vec![Level {
+                price: d("0.6"),
+                size: d("4"),
+            }],
+            101,
+            now,
+        ));
+        assert_eq!(store.get(POLYMARKET, "t1").unwrap().asks[0].price, d("0.6"));
+        assert!(!store.apply_level(POLYMARKET, "t1", false, d("0.6"), d("1"), 101, now));
+        assert!(store.apply_level(POLYMARKET, "t1", false, d("0.61"), d("1"), 102, now));
     }
 
     #[test]

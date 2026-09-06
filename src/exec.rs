@@ -1,4 +1,4 @@
-use crate::book::{BookStore, DirtyCoalescer, OrderBook};
+use crate::book::{best_ask_px, BookStore, DirtyCoalescer, OrderBook};
 use crate::calc::{
     below_venue_mins, best_plan, confirm_plan, inspect_calc, min_trade_amount, min_trade_cost,
     ArbLimits, ArbPlan, CalcMissSnapshot, FeeContext,
@@ -159,7 +159,7 @@ impl Engine {
             min_apr: self.cfg.arb_min_apr,
             days: crate::calc::days_until(topic.end_date),
         };
-        let plan = {
+        let (plan, pm_book_ts, out_book_ts, pm_ask, out_ask) = {
             let books = self.books.lock().await;
             let now = Instant::now();
             let plan = best_plan(&topic, &books, &fees, &limits, now, self.cfg.book_stale);
@@ -175,7 +175,20 @@ impl Engine {
                     pairs,
                 });
             }
-            plan
+            let (pm_book_ts, out_book_ts, pm_ask, out_ask) = plan
+                .as_ref()
+                .map(|p| {
+                    let pm = books.get(POLYMARKET, &p.pm.token_id);
+                    let out = books.get(OUTCOME, &p.outcome.token_id);
+                    (
+                        pm.map(|b| b.exchange_ts_ms).unwrap_or(0),
+                        out.map(|b| b.exchange_ts_ms).unwrap_or(0),
+                        pm.and_then(|b| b.best_ask()),
+                        out.and_then(|b| b.best_ask()),
+                    )
+                })
+                .unwrap_or((0, 0, None, None));
+            (plan, pm_book_ts, out_book_ts, pm_ask, out_ask)
         };
         self.stats.calc();
         let Some(plan) = plan else {
@@ -188,6 +201,10 @@ impl Engine {
             cost = %plan.total_cost,
             roi = %plan.roi,
             apr = %plan.apr,
+            pm_ts = pm_book_ts,
+            out_ts = out_book_ts,
+            pm_ask = %fmt_px(pm_ask),
+            out_ask = %fmt_px(out_ask),
             "arb opportunity"
         );
         if !self.cfg.enable_buy {
@@ -489,26 +506,40 @@ impl Engine {
                 return Ok(None);
             }
         };
-        // REST 盘口写回内存：exchange_ts 更旧则丢弃。两边都拉到就写，skew 失败也写，避免下一轮再吃 WS 旧盘。
-        let (pm_applied, out_applied) = {
+        let pm_ask = best_ask_px(&pm_asks);
+        let out_ask = best_ask_px(&out_asks);
+        // REST 盘口写回内存：exchange_ts 更旧或相同则丢弃。两边都拉到就写，skew 失败也写。
+        let (pm_prev_ts, out_prev_ts, pm_prev_ask, out_prev_ask, pm_applied, out_applied) = {
             let mut books = self.books.lock().await;
+            let pm_prev = books.get(POLYMARKET, &plan.pm.token_id);
+            let out_prev = books.get(OUTCOME, &plan.outcome.token_id);
+            let pm_prev_ts = pm_prev.map(|b| b.exchange_ts_ms).unwrap_or(0);
+            let out_prev_ts = out_prev.map(|b| b.exchange_ts_ms).unwrap_or(0);
+            let pm_prev_ask = pm_prev.and_then(|b| b.best_ask());
+            let out_prev_ask = out_prev.and_then(|b| b.best_ask());
+            let pm_applied = books.replace_snapshot(
+                POLYMARKET,
+                &plan.pm.token_id,
+                pm_bids.clone(),
+                pm_asks.clone(),
+                pm_ts,
+                pm_at,
+            );
+            let out_applied = books.replace_snapshot(
+                OUTCOME,
+                &plan.outcome.token_id,
+                out_bids.clone(),
+                out_asks.clone(),
+                out_ts,
+                out_at,
+            );
             (
-                books.replace_snapshot(
-                    POLYMARKET,
-                    &plan.pm.token_id,
-                    pm_bids.clone(),
-                    pm_asks.clone(),
-                    pm_ts,
-                    pm_at,
-                ),
-                books.replace_snapshot(
-                    OUTCOME,
-                    &plan.outcome.token_id,
-                    out_bids.clone(),
-                    out_asks.clone(),
-                    out_ts,
-                    out_at,
-                ),
+                pm_prev_ts,
+                out_prev_ts,
+                pm_prev_ask,
+                out_prev_ask,
+                pm_applied,
+                out_applied,
             )
         };
         if !book_recv_skew_ok(pm_at, out_at, HTTP_BOOK_SKEW_MAX) {
@@ -519,6 +550,14 @@ impl Engine {
                 skew_ms = skew.as_millis() as u64,
                 pm_elapsed_ms = pm_elapsed.as_millis() as u64,
                 out_elapsed_ms = out_elapsed.as_millis() as u64,
+                pm_ts,
+                out_ts,
+                pm_prev_ts,
+                out_prev_ts,
+                pm_ask = %fmt_px(pm_ask),
+                out_ask = %fmt_px(out_ask),
+                pm_prev_ask = %fmt_px(pm_prev_ask),
+                out_prev_ask = %fmt_px(out_prev_ask),
                 pm_applied,
                 out_applied,
                 "http book receive skew exceeded 1s"
@@ -533,6 +572,14 @@ impl Engine {
             skew_ms = skew.as_millis() as u64,
             pm_elapsed_ms = pm_elapsed.as_millis() as u64,
             out_elapsed_ms = out_elapsed.as_millis() as u64,
+            pm_ts,
+            out_ts,
+            pm_prev_ts,
+            out_prev_ts,
+            pm_ask = %fmt_px(pm_ask),
+            out_ask = %fmt_px(out_ask),
+            pm_prev_ask = %fmt_px(pm_prev_ask),
+            out_prev_ask = %fmt_px(out_prev_ask),
             pm_applied,
             out_applied,
             "http books received"
@@ -573,6 +620,10 @@ impl Engine {
                     cost = %confirmed.total_cost,
                     roi = %confirmed.roi,
                     apr = %confirmed.apr,
+                    pm_ts,
+                    out_ts,
+                    pm_ask = %fmt_px(pm_ask),
+                    out_ask = %fmt_px(out_ask),
                     "http arb confirmed"
                 );
                 Ok(Some(confirmed))
@@ -580,6 +631,16 @@ impl Engine {
             None => {
                 tracing::info!(
                     topic = %topic.key.as_str(),
+                    pm_ts,
+                    out_ts,
+                    pm_prev_ts,
+                    out_prev_ts,
+                    pm_ask = %fmt_px(pm_ask),
+                    out_ask = %fmt_px(out_ask),
+                    pm_prev_ask = %fmt_px(pm_prev_ask),
+                    out_prev_ask = %fmt_px(out_prev_ask),
+                    pm_applied,
+                    out_applied,
                     "http recalc no longer arb"
                 );
                 self.stats.no_longer();
@@ -1113,6 +1174,12 @@ impl Engine {
 }
 
 const HTTP_BOOK_SKEW_MAX: Duration = Duration::from_secs(1);
+
+fn fmt_px(price: Option<Decimal>) -> String {
+    price
+        .map(|px| px.normalize().to_string())
+        .unwrap_or_else(|| "-".into())
+}
 
 pub fn book_recv_skew(a: Instant, b: Instant) -> Duration {
     a.saturating_duration_since(b)
