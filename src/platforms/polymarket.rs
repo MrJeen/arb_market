@@ -13,7 +13,7 @@ use alloy_primitives::{Address, B256};
 use alloy_signer_local::PrivateKeySigner;
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::prelude::ToPrimitive;
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,7 +22,8 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 const FAK_UNFILLED: &str = "no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.";
-/// CLOB FAK 市价单精度：maker 最多 2 位小数，taker 最多 5 位小数。向下截断，避免超付。
+/// CLOB FAK 市价单精度：maker 最多 2 位小数，taker 最多 5 位小数。
+/// 买单 USDC 向上取到分，避免隐含限价低于盘口；卖单金额仍向下截断。
 const MARKET_MAKER_DECIMALS: u32 = 2;
 const MARKET_TAKER_DECIMALS: u32 = 5;
 
@@ -1016,7 +1017,8 @@ fn market_order_base_units(
     let (maker, taker) = match side {
         OrderSide::Buy => {
             let shares = size.trunc_with_scale(MARKET_TAKER_DECIMALS);
-            let usdc = (shares * price).trunc_with_scale(MARKET_MAKER_DECIMALS);
+            let usdc = (shares * price)
+                .round_dp_with_strategy(MARKET_MAKER_DECIMALS, RoundingStrategy::ToPositiveInfinity);
             (usdc, shares)
         }
         OrderSide::Sell => {
@@ -1250,9 +1252,9 @@ mod tests {
     }
 
     #[test]
-    fn market_buy_floors_maker_usdc_to_2_decimals() {
+    fn market_buy_ceils_maker_usdc_to_2_decimals() {
         let (maker, taker) = market_order_base_units(OrderSide::Buy, d("7"), d("0.333")).unwrap();
-        assert_eq!(maker, 2_330_000);
+        assert_eq!(maker, 2_340_000);
         assert_eq!(taker, 7_000_000);
     }
 
@@ -1261,7 +1263,7 @@ mod tests {
         let (maker, taker) =
             market_order_base_units(OrderSide::Buy, d("1.234567"), d("0.50")).unwrap();
         assert_eq!(taker, 1_234_560);
-        assert_eq!(maker, 610_000);
+        assert_eq!(maker, 620_000);
     }
 
     #[test]
@@ -1280,8 +1282,8 @@ mod tests {
     }
 
     #[test]
-    fn market_buy_rejects_when_usdc_floors_to_zero() {
-        let err = market_order_base_units(OrderSide::Buy, d("5"), d("0.001")).unwrap_err();
+    fn market_buy_rejects_when_shares_trunc_to_zero() {
+        let err = market_order_base_units(OrderSide::Buy, d("0.000001"), d("0.50")).unwrap_err();
         assert!(err.to_string().contains("round to zero"));
     }
 }
