@@ -9,6 +9,7 @@ pub mod hedge;
 pub mod notify;
 pub mod platforms;
 pub mod signing;
+pub mod stats;
 pub mod store;
 
 use crate::book::{BookStore, DirtyCoalescer};
@@ -17,10 +18,13 @@ use crate::domain::TopicKey;
 use crate::exec::Engine;
 use crate::platforms::outcome::{self, OutcomeVenue};
 use crate::platforms::polymarket::{self, PolymarketVenue};
+use crate::stats::MinuteStats;
 use crate::store::{connect_common, Store};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
+use tokio::time::MissedTickBehavior;
 
 pub async fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -57,6 +61,7 @@ pub async fn run() -> anyhow::Result<()> {
         pm_sub_tx,
         out_sub_tx,
         notify,
+        stats: Arc::new(MinuteStats::new()),
     });
     engine.refresh_discovery().await?;
 
@@ -85,6 +90,7 @@ pub async fn run() -> anyhow::Result<()> {
             let engine_topic = engine_calc.clone();
             tokio::spawn(async move {
                 if let Err(err) = engine_topic.handle_topic(topic).await {
+                    engine_topic.stats.exec_err();
                     tracing::error!(
                         topic = %topic.as_str(),
                         error = %err,
@@ -92,6 +98,17 @@ pub async fn run() -> anyhow::Result<()> {
                     );
                 }
             });
+        }
+    });
+
+    let engine_stats = engine.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            engine_stats.stats.log_and_reset();
         }
     });
 

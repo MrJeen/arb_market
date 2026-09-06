@@ -443,9 +443,10 @@ impl Store {
     }
 
     pub async fn sum_actual_profit(&self) -> Result<Decimal> {
-        let profit: Option<Decimal> = sqlx::query_scalar("SELECT SUM(actual_profit) FROM arb_orders")
-            .fetch_one(&self.pool)
-            .await?;
+        let profit: Option<Decimal> =
+            sqlx::query_scalar("SELECT SUM(actual_profit) FROM arb_orders")
+                .fetch_one(&self.pool)
+                .await?;
         Ok(profit.unwrap_or(Decimal::ZERO))
     }
 

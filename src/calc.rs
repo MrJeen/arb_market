@@ -479,6 +479,62 @@ pub fn best_plan(
     best
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CalcSkipCounts {
+    pub missing_book: u64,
+    pub stale_book: u64,
+    pub unit_cost: u64,
+    pub unprofitable: u64,
+}
+
+/// 按互补 pair 分类 `best_plan` 未成对的原因，不改变 `best_plan` 本身。
+pub fn classify_calc_skips(
+    topic: &Topic,
+    books: &crate::book::BookStore,
+    fees: &FeeContext,
+    limits: &ArbLimits,
+    now: std::time::Instant,
+    stale: std::time::Duration,
+) -> CalcSkipCounts {
+    let mut counts = CalcSkipCounts::default();
+    for (pm_label, out_label) in complementary_pairs(&topic.labels()) {
+        let Some(pm_token) = topic.token(POLYMARKET, &pm_label) else {
+            counts.missing_book += 1;
+            continue;
+        };
+        let Some(out_token) = topic.token(OUTCOME, &out_label) else {
+            counts.missing_book += 1;
+            continue;
+        };
+        let Some(pm_book) = books.get(POLYMARKET, &pm_token.token_id) else {
+            counts.missing_book += 1;
+            continue;
+        };
+        let Some(out_book) = books.get(OUTCOME, &out_token.token_id) else {
+            counts.missing_book += 1;
+            continue;
+        };
+        if !pm_book.is_fresh(stale, now) || !out_book.is_fresh(stale, now) {
+            counts.stale_book += 1;
+            continue;
+        }
+        if plan_arbitrage(topic, pm_book, out_book, pm_token, out_token, fees, limits).is_some() {
+            continue;
+        }
+        let Some((pm_px, _, out_px, _)) = peek_first(&pm_book.asks, &out_book.asks) else {
+            counts.unprofitable += 1;
+            continue;
+        };
+        let unit = all_in_unit_cost(pm_px, out_px, fees);
+        if unit >= Decimal::ONE || unit <= Decimal::ZERO {
+            counts.unit_cost += 1;
+        } else {
+            counts.unprofitable += 1;
+        }
+    }
+    counts
+}
+
 pub fn estimate_polymarket_fee(shares: Decimal, price: Decimal, fees: &FeeContext) -> Decimal {
     if fees.polymarket_fee_rate.is_zero() {
         return Decimal::ZERO;

@@ -1,7 +1,7 @@
 use crate::book::{BookStore, DirtyCoalescer, OrderBook};
 use crate::calc::{
-    below_venue_mins, best_plan, confirm_plan, min_trade_amount, min_trade_cost, ArbLimits, ArbPlan,
-    FeeContext,
+    below_venue_mins, best_plan, classify_calc_skips, confirm_plan, min_trade_amount,
+    min_trade_cost, ArbLimits, ArbPlan, FeeContext,
 };
 use crate::config::{Config, OUTCOME, POLYMARKET};
 use crate::discovery::load_active_topics;
@@ -14,6 +14,7 @@ use crate::platforms::polymarket::PolymarketVenue;
 use crate::platforms::{
     ioc_fill, pm_fak_fill, MarketOrderRequest, OrderPoll, OrderSide, SubmitResult, TradeFill,
 };
+use crate::stats::MinuteStats;
 use crate::store::Store;
 use rust_decimal::Decimal;
 use serde_json::json;
@@ -35,6 +36,7 @@ pub struct Engine {
     pub pm_sub_tx: mpsc::Sender<Vec<String>>,
     pub out_sub_tx: mpsc::Sender<Vec<String>>,
     pub notify: Option<NatsNotifier>,
+    pub stats: Arc<MinuteStats>,
 }
 
 impl Engine {
@@ -65,11 +67,13 @@ impl Engine {
     }
 
     pub async fn handle_topic(&self, topic_key: TopicKey) -> Result<()> {
+        self.stats.wakeup();
         let maybe_again = {
             let mut dirty = self.dirty.lock().await;
             dirty.mark(topic_key)
         };
         if maybe_again.is_none() {
+            self.stats.coalesced();
             return Ok(());
         }
         let result = self.evaluate_topic(topic_key).await;
@@ -87,6 +91,7 @@ impl Engine {
                 limit = self.cfg.max_active_orders,
                 "max orders reached"
             );
+            self.stats.max_orders();
             return Ok(true);
         }
         if self.cfg.max_realized_loss > Decimal::ZERO {
@@ -98,6 +103,7 @@ impl Engine {
                     limit = %self.cfg.max_realized_loss,
                     "max realized loss reached"
                 );
+                self.stats.max_loss();
                 return Ok(true);
             }
         }
@@ -121,9 +127,11 @@ impl Engine {
             topics.get(&topic_key).cloned()
         };
         let Some(topic) = topic else {
+            self.stats.no_topic();
             return Ok(());
         };
         if self.store.has_active_topic(topic_key).await? {
+            self.stats.active_topic();
             return Ok(());
         }
         if self
@@ -133,6 +141,7 @@ impl Engine {
             > 0
         {
             tracing::error!("stale unknown legs present; skip new arb");
+            self.stats.stale_unknown();
             return Ok(());
         }
         if self.block_new_arb(&topic_key.as_str()).await? {
@@ -148,18 +157,21 @@ impl Engine {
         };
         let plan = {
             let books = self.books.lock().await;
-            best_plan(
-                &topic,
-                &books,
-                &fees,
-                &limits,
-                Instant::now(),
-                self.cfg.book_stale,
-            )
+            let now = Instant::now();
+            let plan = best_plan(&topic, &books, &fees, &limits, now, self.cfg.book_stale);
+            let skips =
+                classify_calc_skips(&topic, &books, &fees, &limits, now, self.cfg.book_stale);
+            self.stats.add_missing_book(skips.missing_book);
+            self.stats.add_stale_book(skips.stale_book);
+            self.stats.add_unit_cost(skips.unit_cost);
+            self.stats.add_unprofitable(skips.unprofitable);
+            plan
         };
+        self.stats.calc();
         let Some(plan) = plan else {
             return Ok(());
         };
+        self.stats.found();
         tracing::info!(
             topic = %topic.key.as_str(),
             profit = %plan.profit,
@@ -169,6 +181,7 @@ impl Engine {
             "arb opportunity"
         );
         if !self.cfg.enable_buy {
+            self.stats.buy_disabled();
             return Ok(());
         }
         self.execute_plan(&topic, plan).await
@@ -177,7 +190,8 @@ impl Engine {
     async fn execute_plan(&self, topic: &Topic, plan: ArbPlan) -> Result<()> {
         let pm_need = plan.pm.cost + plan.pm.fee;
         let out_need = plan.outcome.cost + plan.outcome.fee;
-        let (pm_bal, out_bal) = tokio::join!(self.select_funder(pm_need), self.outcome.user_state());
+        let (pm_bal, out_bal) =
+            tokio::join!(self.select_funder(pm_need), self.outcome.user_state());
         let (funder, pm_balance) = match pm_bal {
             Ok(pair) => pair,
             Err(err) => {
@@ -186,6 +200,7 @@ impl Engine {
                     error = %err,
                     "polymarket balance check skipped arb"
                 );
+                self.stats.pm_bal();
                 return Ok(());
             }
         };
@@ -198,6 +213,7 @@ impl Engine {
                     required = %out_need,
                     "outcome buy skipped, usdc insufficient"
                 );
+                self.stats.out_bal();
                 return Ok(());
             }
             Err(err) => {
@@ -206,6 +222,7 @@ impl Engine {
                     error = %err,
                     "outcome usdc balance unavailable"
                 );
+                self.stats.out_bal();
                 return Ok(());
             }
         };
@@ -229,6 +246,7 @@ impl Engine {
                 %pm_balance,
                 "http plan exceeds polymarket balance"
             );
+            self.stats.exceed_bal();
             return Ok(());
         }
         if out_need > out_balance {
@@ -238,6 +256,7 @@ impl Engine {
                 %out_balance,
                 "http plan exceeds outcome balance"
             );
+            self.stats.exceed_bal();
             return Ok(());
         }
         if self.block_new_arb(&topic.key.as_str()).await? {
@@ -267,10 +286,12 @@ impl Engine {
                 if db.code().as_deref() == Some("23505") =>
             {
                 tracing::info!(topic = %topic.key.as_str(), "active topic already claimed");
+                self.stats.claimed();
                 return Ok(());
             }
             Err(err) => return Err(err),
         };
+        self.stats.orders();
         self.store.mark_order_status(order_id, "actived").await?;
         let pm_token = topic.token(POLYMARKET, &plan.pm.label);
         let out_token = topic.token(OUTCOME, &plan.outcome.label);
@@ -337,9 +358,15 @@ impl Engine {
         );
         if let Err(err) = &pm_res {
             tracing::error!(error = %err, "polymarket submit failed");
+            self.stats.pm_fail();
+        } else {
+            self.stats.pm_ok();
         }
         if let Err(err) = &out_res {
             tracing::error!(error = %err, "outcome submit failed");
+            self.stats.out_fail();
+        } else {
+            self.stats.out_ok();
         }
         self.notify_place(order_id, topic, &funder, &plan, pm_res, out_res);
         Ok(())
@@ -426,6 +453,7 @@ impl Engine {
                     error = %err,
                     "polymarket rest book failed"
                 );
+                self.stats.http_fail();
                 return Ok(None);
             }
         };
@@ -447,6 +475,7 @@ impl Engine {
                     error = %err,
                     "outcome rest book failed"
                 );
+                self.stats.http_fail();
                 return Ok(None);
             }
         };
@@ -460,6 +489,7 @@ impl Engine {
                 out_elapsed_ms = out_elapsed.as_millis() as u64,
                 "http book receive skew exceeded 1s"
             );
+            self.stats.skew();
             return Ok(None);
         }
         tracing::info!(
@@ -516,6 +546,7 @@ impl Engine {
                     topic = %topic.key.as_str(),
                     "http recalc no longer arb"
                 );
+                self.stats.no_longer();
                 Ok(None)
             }
         }
