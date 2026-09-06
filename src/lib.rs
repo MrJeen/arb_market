@@ -82,9 +82,16 @@ pub async fn run() -> anyhow::Result<()> {
     let engine_calc = engine.clone();
     tokio::spawn(async move {
         while let Some(topic) = calc_rx.recv().await {
-            if let Err(err) = engine_calc.handle_topic(topic).await {
-                tracing::error!(error = %err, "calc/exec failed");
-            }
+            let engine_topic = engine_calc.clone();
+            tokio::spawn(async move {
+                if let Err(err) = engine_topic.handle_topic(topic).await {
+                    tracing::error!(
+                        topic = %topic.as_str(),
+                        error = %err,
+                        "calc/exec failed"
+                    );
+                }
+            });
         }
     });
 

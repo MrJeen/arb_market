@@ -192,23 +192,13 @@ fn search_pair(
             break;
         }
 
-        let unclipped_cost = unit_cost * max_net;
-        // 第一档规模超过预算 3 倍时按剩余额度买满，避免最小 shares 二分把仓位截得过小。
-        if unclipped_cost > limits.cost_limit * Decimal::from(3) {
-            if let Some(net) = fill_to_budget(
-                &acc, remain, unit_cost, pm_px, out_px, max_net, fees, limits,
-            ) {
-                return acc
-                    .plus(net, pm_px, out_px)
-                    .to_plan(pm_token, out_token, fees, limits, pm_tick);
-            }
-        }
-
-        if let Some(net) = find_min_passing(&acc, max_net, pm_px, out_px, fees, limits) {
-            let trial = acc.plus(net, pm_px, out_px);
-            if trial.passes_all(fees, limits) {
-                return trial.to_plan(pm_token, out_token, fees, limits, pm_tick);
-            }
+        // 门槛只判断能否做；同价档内能过线就买 min(剩余预算, 档深)。
+        if let Some(net) = fill_to_budget(
+            &acc, remain, unit_cost, pm_px, out_px, max_net, fees, limits,
+        ) {
+            return acc
+                .plus(net, pm_px, out_px)
+                .to_plan(pm_token, out_token, fees, limits, pm_tick);
         }
 
         let (take, ended) = clip_to_remain(max_net, unit_cost, remain);
@@ -325,7 +315,8 @@ fn fill_to_budget(
             return Some(net);
         }
         let metrics = trial.metrics(fees, limits);
-        if metrics.total_cost <= Decimal::ZERO {
+        // 利润/APR/场地下限在更小仓位上只会更差，只有超预算才缩仓。
+        if metrics.total_cost <= limits.cost_limit {
             return None;
         }
         let acc_cost = acc.metrics(fees, limits).total_cost;
@@ -336,44 +327,6 @@ fn fill_to_budget(
         net = floor_shares((net * remain / candidate_cost).min(max_net));
     }
     None
-}
-
-fn find_min_passing(
-    acc: &Acc,
-    max_net: Decimal,
-    pm_px: Decimal,
-    out_px: Decimal,
-    fees: &FeeContext,
-    limits: &ArbLimits,
-) -> Option<Decimal> {
-    let max_trial = acc.plus(max_net, pm_px, out_px);
-    if !max_trial.passes_profit_and_mins(fees, limits) {
-        return None;
-    }
-    let mut low = Decimal::ONE;
-    let mut high = max_net;
-    let mut best = None;
-    for _ in 0..32 {
-        if low > high {
-            break;
-        }
-        let mid = floor_shares((low + high) / Decimal::from(2)).max(Decimal::ONE);
-        if mid > high {
-            break;
-        }
-        let trial = acc.plus(mid, pm_px, out_px);
-        if trial.passes_profit_and_mins(fees, limits) {
-            best = Some(mid);
-            high = mid - Decimal::ONE;
-        } else {
-            low = mid + Decimal::ONE;
-        }
-    }
-    best.filter(|net| acc.plus(*net, pm_px, out_px).passes_all(fees, limits))
-        .or_else(|| {
-            let trial = acc.plus(max_net, pm_px, out_px);
-            trial.passes_all(fees, limits).then_some(max_net)
-        })
 }
 
 impl Acc {
@@ -728,15 +681,16 @@ mod tests {
     }
 
     #[test]
-    fn takes_min_shares_when_first_level_is_shallow() {
+    fn fills_available_depth_when_first_level_passes() {
         let mut books = BookStore::default();
         let now = Instant::now();
         snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
         snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
         let plan = plan_with(&books, now, &limits("3", "100"));
-        // min_profit=3、单位利润 0.2 → 15 shares，刚好过门槛而非吃满 50。
-        assert_eq!(plan.net_shares, d("15"));
-        assert_eq!(plan.profit, d("3"));
+        // 过门槛后买满档深：50 股、成本 40，而不是刚过线的 15 股。
+        assert_eq!(plan.net_shares, d("50"));
+        assert_eq!(plan.total_cost, d("40"));
+        assert_eq!(plan.profit, d("10"));
         assert_eq!(plan.pm.label, "yes");
         assert_eq!(plan.outcome.label, "no");
     }
@@ -778,9 +732,10 @@ mod tests {
             now,
         );
         let plan = plan_with(&books, now, &limits("3", "100"));
-        // 单位利润 0.10；min_profit=3 需要 30 shares。第一档 10 不够，吃掉后再从第二档补 20。
-        assert_eq!(plan.net_shares, d("30"));
-        assert_eq!(plan.profit, d("3"));
+        // 单位利润 0.10；第一档 10 不够门槛，吃掉后再把第二档 30 买满 → 40 股。
+        assert_eq!(plan.net_shares, d("40"));
+        assert_eq!(plan.total_cost, d("36"));
+        assert_eq!(plan.profit, d("4"));
     }
 
     #[test]
@@ -792,10 +747,11 @@ mod tests {
         snapshot(&mut books, POLYMARKET, "pm-no", vec![("0.20", "50")], now);
         snapshot(&mut books, OUTCOME, "#11", vec![("0.30", "50")], now);
         let plan = plan_with(&books, now, &limits("3", "100"));
-        // yes+no 单位成本 0.80 ROI=0.25；no+yes 单位成本 0.50 ROI=1.00。
+        // yes+no 单位成本 0.80 ROI=0.25；no+yes 单位成本 0.50 ROI=1.00。两边都买满 50。
         assert_eq!(plan.pm.label, "no");
         assert_eq!(plan.outcome.label, "yes");
-        assert_eq!(plan.net_shares, d("6"));
+        assert_eq!(plan.net_shares, d("50"));
+        assert_eq!(plan.total_cost, d("25"));
     }
 
     #[test]
@@ -830,7 +786,7 @@ mod tests {
         snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "40.9")], now);
         let plan = plan_with(&books, now, &limits("3", "100"));
         assert_eq!(plan.outcome.shares, floor_shares(plan.outcome.shares));
-        assert_eq!(plan.net_shares, d("15"));
+        assert_eq!(plan.net_shares, d("40"));
     }
 
     #[test]

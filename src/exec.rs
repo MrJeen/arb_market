@@ -220,6 +220,14 @@ impl Engine {
             );
             return Ok(());
         }
+        if self.store.count_active_orders().await? >= self.cfg.max_active_orders as i64 {
+            tracing::warn!(
+                topic = %topic.key.as_str(),
+                limit = self.cfg.max_active_orders,
+                "max active orders reached after confirm"
+            );
+            return Ok(());
+        }
 
         let fills = json!([
             {"platform": POLYMARKET, "token": plan.pm.token_id, "label": plan.pm.label, "shares": plan.pm.shares, "price": plan.pm.cap_price},
