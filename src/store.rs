@@ -463,6 +463,21 @@ impl Store {
         Ok(count)
     }
 
+    /// 本笔套利下单时用的 Polymarket funder，对冲不得换号。
+    pub async fn order_pm_funder(&self, order_id: i64) -> Result<Option<String>> {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT funder_address FROM legs
+             WHERE order_id = $1 AND platform = $2 AND funder_address IS NOT NULL
+             ORDER BY CASE WHEN intent = 'arb_buy' THEN 0 ELSE 1 END, id ASC
+             LIMIT 1",
+        )
+        .bind(order_id)
+        .bind(POLYMARKET)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|item| item.0))
+    }
+
     pub async fn buy_funder_for_token(
         &self,
         order_id: i64,

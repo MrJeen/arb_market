@@ -742,6 +742,35 @@ impl Engine {
         }
     }
 
+    async fn hedge_pm_funder(
+        &self,
+        order_id: i64,
+        token_id: &str,
+        side: OrderSide,
+    ) -> Result<String> {
+        let token_buy = if side == OrderSide::Sell {
+            self.store
+                .buy_funder_for_token(order_id, POLYMARKET, token_id)
+                .await?
+        } else {
+            None
+        };
+        let order_funder = self.store.order_pm_funder(order_id).await?;
+        resolve_hedge_pm_funder(side == OrderSide::Sell, token_buy, order_funder)
+    }
+
+    async fn require_pm_usdc(&self, funder: &str, required: Decimal) -> Result<()> {
+        match self.pm.balance(funder).await {
+            Ok(bal) if bal >= required => Ok(()),
+            Ok(bal) => Err(Error::msg(format!(
+                "polymarket buy skipped, usdc {bal} < {required}"
+            ))),
+            Err(err) => Err(Error::msg(format!(
+                "polymarket buy skipped, usdc balance unavailable: {err}"
+            ))),
+        }
+    }
+
     async fn require_pm_token(&self, funder: &str, token_id: &str, shares: Decimal) -> Result<()> {
         match self.pm.token_balance(funder, token_id).await {
             Ok(bal) if bal >= shares => Ok(()),
@@ -958,10 +987,19 @@ impl Engine {
                 tracing::info!(order_id = order.id, "hedge skipped, ENABLE_BUY=false");
                 continue;
             }
+            let order_funder = self.store.order_pm_funder(order.id).await?;
             let mut balances = HashMap::new();
-            if let Some(funder) = self.pm.next_funder().await {
-                if let Ok(bal) = self.pm.balance(&funder).await {
-                    balances.insert(POLYMARKET.to_string(), bal);
+            if let Some(funder) = order_funder.as_deref() {
+                match self.pm.balance(funder).await {
+                    Ok(bal) => {
+                        balances.insert(POLYMARKET.to_string(), bal);
+                    }
+                    Err(err) => tracing::warn!(
+                        order_id = order.id,
+                        funder,
+                        error = %err,
+                        "hedge polymarket balance unavailable"
+                    ),
                 }
             }
             if let Ok(bal) = self.outcome.user_state().await {
@@ -1037,47 +1075,21 @@ impl Engine {
             )));
         }
         if action.platform == POLYMARKET {
+            let funder = self.hedge_pm_funder(order_id, &action.token_id, side).await?;
+            tracing::info!(
+                order_id,
+                funder = %funder,
+                side = side.as_str(),
+                token = %action.token_id,
+                "hedge pinned to original polymarket funder"
+            );
             if side == OrderSide::Sell {
-                let funder = self
-                    .store
-                    .buy_funder_for_token(order_id, POLYMARKET, &action.token_id)
-                    .await?
-                    .or(self.pm.next_funder().await)
-                    .ok_or_else(|| Error::msg("no polymarket funder for sell"))?;
                 self.require_pm_token(&funder, &action.token_id, action.shares)
                     .await?;
-                let req = MarketOrderRequest {
-                    token_id: action.token_id.clone(),
-                    shares: action.shares,
-                    cap_price: action.cap_price,
-                    side,
-                    neg_risk: None,
-                    tick_size: self.ensure_pm_tick(&action.token_id).await,
-                    asset_id: None,
-                    funder_address: Some(funder.clone()),
-                };
-                let leg_id = self
-                    .store
-                    .insert_leg(
-                        order_id,
-                        POLYMARKET,
-                        &action.token_id,
-                        &action.label,
-                        side.as_str(),
-                        "rebalance",
-                        Some(&funder),
-                        Some(&funder),
-                        self.polymarket_service(&funder),
-                        action.cap_price,
-                        action.shares,
-                        Decimal::ZERO,
-                        None,
-                    )
+            } else {
+                self.require_pm_usdc(&funder, action.shares * action.cap_price)
                     .await?;
-                self.submit_pm(leg_id, &funder, &req).await?;
-                return Ok(());
             }
-            let (funder, _) = self.select_funder(action.cap_price * action.shares).await?;
             let req = MarketOrderRequest {
                 token_id: action.token_id.clone(),
                 shares: action.shares,
@@ -1590,6 +1602,19 @@ pub async fn mark_orders_complete(store: &Store) -> Result<()> {
     Ok(())
 }
 
+fn resolve_hedge_pm_funder(
+    sell: bool,
+    token_buy_funder: Option<String>,
+    order_funder: Option<String>,
+) -> Result<String> {
+    if sell {
+        if let Some(funder) = token_buy_funder {
+            return Ok(funder);
+        }
+    }
+    order_funder.ok_or_else(|| Error::msg("hedge requires original polymarket funder"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1731,5 +1756,39 @@ mod tests {
         let b = a + Duration::from_secs(1) + Duration::from_millis(1);
         assert!(!book_recv_skew_ok(a, b, HTTP_BOOK_SKEW_MAX));
         assert!(!book_recv_skew_ok(b, a, HTTP_BOOK_SKEW_MAX));
+    }
+
+    #[test]
+    fn hedge_buy_uses_order_funder_not_token_buy() {
+        let funder = resolve_hedge_pm_funder(
+            false,
+            Some("0xtoken".into()),
+            Some("0xorder".into()),
+        )
+        .unwrap();
+        assert_eq!(funder, "0xorder");
+    }
+
+    #[test]
+    fn hedge_sell_prefers_token_buy_funder() {
+        let funder = resolve_hedge_pm_funder(
+            true,
+            Some("0xtoken".into()),
+            Some("0xorder".into()),
+        )
+        .unwrap();
+        assert_eq!(funder, "0xtoken");
+    }
+
+    #[test]
+    fn hedge_sell_falls_back_to_order_funder() {
+        let funder = resolve_hedge_pm_funder(true, None, Some("0xorder".into())).unwrap();
+        assert_eq!(funder, "0xorder");
+    }
+
+    #[test]
+    fn hedge_rejects_without_original_funder() {
+        assert!(resolve_hedge_pm_funder(false, Some("0xtoken".into()), None).is_err());
+        assert!(resolve_hedge_pm_funder(true, None, None).is_err());
     }
 }
