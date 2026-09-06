@@ -1,7 +1,7 @@
-use crate::book::{best_ask_px, BookStore, DirtyCoalescer, OrderBook};
+use crate::book::{BookStore, DirtyCoalescer, OrderBook};
 use crate::calc::{
-    below_venue_mins, best_plan, confirm_plan, inspect_calc, min_trade_amount, min_trade_cost,
-    ArbLimits, ArbPlan, CalcMissSnapshot, FeeContext,
+    below_venue_mins, best_plan, confirm_plan, diagnose_books, first_usable_ask, inspect_calc,
+    min_trade_amount, min_trade_cost, ArbLimits, ArbPlan, CalcMissSnapshot, FeeContext,
 };
 use crate::config::{Config, OUTCOME, POLYMARKET};
 use crate::discovery::load_active_topics;
@@ -159,7 +159,7 @@ impl Engine {
             min_apr: self.cfg.arb_min_apr,
             days: crate::calc::days_until(topic.end_date),
         };
-        let (plan, pm_book_ts, out_book_ts, pm_ask, out_ask) = {
+        let (plan, pm_book_ts, out_book_ts, pm_ask, pm_sz, out_ask, out_sz) = {
             let books = self.books.lock().await;
             let now = Instant::now();
             let plan = best_plan(&topic, &books, &fees, &limits, now, self.cfg.book_stale);
@@ -175,20 +175,30 @@ impl Engine {
                     pairs,
                 });
             }
-            let (pm_book_ts, out_book_ts, pm_ask, out_ask) = plan
+            let (pm_book_ts, out_book_ts, pm_ask, pm_sz, out_ask, out_sz) = plan
                 .as_ref()
                 .map(|p| {
                     let pm = books.get(POLYMARKET, &p.pm.token_id);
                     let out = books.get(OUTCOME, &p.outcome.token_id);
+                    let (pm_ask, pm_sz) = pm
+                        .and_then(|b| first_usable_ask(&b.asks, false))
+                        .map(|(px, sz)| (Some(px), Some(sz)))
+                        .unwrap_or((None, None));
+                    let (out_ask, out_sz) = out
+                        .and_then(|b| first_usable_ask(&b.asks, true))
+                        .map(|(px, sz)| (Some(px), Some(sz)))
+                        .unwrap_or((None, None));
                     (
                         pm.map(|b| b.exchange_ts_ms).unwrap_or(0),
                         out.map(|b| b.exchange_ts_ms).unwrap_or(0),
-                        pm.and_then(|b| b.best_ask()),
-                        out.and_then(|b| b.best_ask()),
+                        pm_ask,
+                        pm_sz,
+                        out_ask,
+                        out_sz,
                     )
                 })
-                .unwrap_or((0, 0, None, None));
-            (plan, pm_book_ts, out_book_ts, pm_ask, out_ask)
+                .unwrap_or((0, 0, None, None, None, None));
+            (plan, pm_book_ts, out_book_ts, pm_ask, pm_sz, out_ask, out_sz)
         };
         self.stats.calc();
         let Some(plan) = plan else {
@@ -204,7 +214,9 @@ impl Engine {
             pm_ts = pm_book_ts,
             out_ts = out_book_ts,
             pm_ask = %fmt_px(pm_ask),
+            pm_sz = %fmt_px(pm_sz),
             out_ask = %fmt_px(out_ask),
+            out_sz = %fmt_px(out_sz),
             "arb opportunity"
         );
         if !self.cfg.enable_buy {
@@ -506,17 +518,36 @@ impl Engine {
                 return Ok(None);
             }
         };
-        let pm_ask = best_ask_px(&pm_asks);
-        let out_ask = best_ask_px(&out_asks);
+        let (pm_ask, pm_sz) = first_usable_ask(&pm_asks, false)
+            .map(|(px, sz)| (Some(px), Some(sz)))
+            .unwrap_or((None, None));
+        let (out_ask, out_sz) = first_usable_ask(&out_asks, true)
+            .map(|(px, sz)| (Some(px), Some(sz)))
+            .unwrap_or((None, None));
         // REST 盘口写回内存：exchange_ts 更旧或相同则丢弃。两边都拉到就写，skew 失败也写。
-        let (pm_prev_ts, out_prev_ts, pm_prev_ask, out_prev_ask, pm_applied, out_applied) = {
+        let (
+            pm_prev_ts,
+            out_prev_ts,
+            pm_prev_ask,
+            pm_prev_sz,
+            out_prev_ask,
+            out_prev_sz,
+            pm_applied,
+            out_applied,
+        ) = {
             let mut books = self.books.lock().await;
             let pm_prev = books.get(POLYMARKET, &plan.pm.token_id);
             let out_prev = books.get(OUTCOME, &plan.outcome.token_id);
             let pm_prev_ts = pm_prev.map(|b| b.exchange_ts_ms).unwrap_or(0);
             let out_prev_ts = out_prev.map(|b| b.exchange_ts_ms).unwrap_or(0);
-            let pm_prev_ask = pm_prev.and_then(|b| b.best_ask());
-            let out_prev_ask = out_prev.and_then(|b| b.best_ask());
+            let (pm_prev_ask, pm_prev_sz) = pm_prev
+                .and_then(|b| first_usable_ask(&b.asks, false))
+                .map(|(px, sz)| (Some(px), Some(sz)))
+                .unwrap_or((None, None));
+            let (out_prev_ask, out_prev_sz) = out_prev
+                .and_then(|b| first_usable_ask(&b.asks, true))
+                .map(|(px, sz)| (Some(px), Some(sz)))
+                .unwrap_or((None, None));
             let pm_applied = books.replace_snapshot(
                 POLYMARKET,
                 &plan.pm.token_id,
@@ -537,7 +568,9 @@ impl Engine {
                 pm_prev_ts,
                 out_prev_ts,
                 pm_prev_ask,
+                pm_prev_sz,
                 out_prev_ask,
+                out_prev_sz,
                 pm_applied,
                 out_applied,
             )
@@ -555,9 +588,13 @@ impl Engine {
                 pm_prev_ts,
                 out_prev_ts,
                 pm_ask = %fmt_px(pm_ask),
+                pm_sz = %fmt_px(pm_sz),
                 out_ask = %fmt_px(out_ask),
+                out_sz = %fmt_px(out_sz),
                 pm_prev_ask = %fmt_px(pm_prev_ask),
+                pm_prev_sz = %fmt_px(pm_prev_sz),
                 out_prev_ask = %fmt_px(out_prev_ask),
+                out_prev_sz = %fmt_px(out_prev_sz),
                 pm_applied,
                 out_applied,
                 "http book receive skew exceeded 1s"
@@ -577,9 +614,13 @@ impl Engine {
             pm_prev_ts,
             out_prev_ts,
             pm_ask = %fmt_px(pm_ask),
+            pm_sz = %fmt_px(pm_sz),
             out_ask = %fmt_px(out_ask),
+            out_sz = %fmt_px(out_sz),
             pm_prev_ask = %fmt_px(pm_prev_ask),
+            pm_prev_sz = %fmt_px(pm_prev_sz),
             out_prev_ask = %fmt_px(out_prev_ask),
+            out_prev_sz = %fmt_px(out_prev_sz),
             pm_applied,
             out_applied,
             "http books received"
@@ -623,12 +664,23 @@ impl Engine {
                     pm_ts,
                     out_ts,
                     pm_ask = %fmt_px(pm_ask),
+                    pm_sz = %fmt_px(pm_sz),
                     out_ask = %fmt_px(out_ask),
+                    out_sz = %fmt_px(out_sz),
                     "http arb confirmed"
                 );
                 Ok(Some(confirmed))
             }
             None => {
+                let miss = diagnose_books(
+                    topic,
+                    &pm_book,
+                    &out_book,
+                    &fees,
+                    &limits,
+                    &plan.pm.label,
+                    &plan.outcome.label,
+                );
                 tracing::info!(
                     topic = %topic.key.as_str(),
                     pm_ts,
@@ -636,9 +688,15 @@ impl Engine {
                     pm_prev_ts,
                     out_prev_ts,
                     pm_ask = %fmt_px(pm_ask),
+                    pm_sz = %fmt_px(pm_sz),
                     out_ask = %fmt_px(out_ask),
+                    out_sz = %fmt_px(out_sz),
                     pm_prev_ask = %fmt_px(pm_prev_ask),
+                    pm_prev_sz = %fmt_px(pm_prev_sz),
                     out_prev_ask = %fmt_px(out_prev_ask),
+                    out_prev_sz = %fmt_px(out_prev_sz),
+                    unit_cost = %fmt_px(miss.unit_cost),
+                    reason = miss.reason,
                     pm_applied,
                     out_applied,
                     "http recalc no longer arb"

@@ -41,6 +41,8 @@ pub struct Config {
     pub polymarket_clob_url: String,
     pub polymarket_ws_url: String,
     pub polymarket_funders: Vec<PolymarketFunderConfig>,
+    /// L2 认证落盘有效期；0 表示不按时间过期。
+    pub polymarket_auth_ttl: Duration,
     pub hyperliquid_info_url: String,
     pub hyperliquid_exchange_url: String,
     pub hyperliquid_ws_url: String,
@@ -99,6 +101,7 @@ impl Config {
                 "wss://ws-subscriptions-clob.polymarket.com/ws/market",
             ),
             polymarket_funders: funders,
+            polymarket_auth_ttl: Duration::from_secs(env_u64("POLYMARKET_AUTH_TTL_SECS", 86400)),
             hyperliquid_info_url: env_or(
                 "HYPERLIQUID_INFO_URL",
                 "https://api.hyperliquid.xyz/info",

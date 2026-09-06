@@ -4,6 +4,8 @@
 polymarket_funders.json
 polymarket_funder_cursor
 polymarket_funder_cursor.tmp
+polymarket_api_creds.json
+polymarket_api_creds.json.tmp
 *.log
 .DS_Store
 /reviews

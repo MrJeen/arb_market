@@ -174,6 +174,8 @@ fn search_pair(
 ) -> Option<ArbPlan> {
     let mut pm_asks = pm_asks.to_vec();
     let mut out_asks = out_asks.to_vec();
+    pm_asks.sort_by(|a, b| a.price.cmp(&b.price));
+    out_asks.sort_by(|a, b| a.price.cmp(&b.price));
     let mut acc = Acc::default();
     let mut remain = limits.cost_limit;
 
@@ -220,6 +222,23 @@ fn search_pair(
         consume_qty(&mut out_asks, take, true);
     }
     None
+}
+
+/// 与 `search_pair` 相同的首档：先按卖价升序，再丢掉数量不可用的档。
+pub fn first_usable_ask(asks: &[Level], floor_out: bool) -> Option<(Decimal, Decimal)> {
+    let mut asks = asks.to_vec();
+    asks.sort_by(|a, b| a.price.cmp(&b.price));
+    drop_unusable(&mut asks, floor_out);
+    let level = asks.first()?;
+    let size = if floor_out {
+        floor_shares(level.size)
+    } else {
+        level.size
+    };
+    if level.price <= Decimal::ZERO || size <= Decimal::ZERO {
+        return None;
+    }
+    Some((level.price, size))
 }
 
 fn peek_first(
@@ -604,12 +623,60 @@ fn diagnose_pair(
         sample.reason = "stale_book";
         return sample;
     }
-    if let Some((pm_px, pm_sz, out_px, out_sz)) = peek_first(&pm_book.asks, &out_book.asks) {
-        sample.pm_ask = Some(pm_px);
-        sample.pm_sz = Some(pm_sz);
-        sample.out_ask = Some(out_px);
-        sample.out_sz = Some(out_sz);
-        sample.unit_cost = Some(all_in_unit_cost(pm_px, out_px, fees));
+    diagnose_loaded(
+        topic, pm_book, out_book, pm_token, out_token, fees, limits, sample,
+    )
+}
+
+/// 按与 `plan_arbitrage` 相同的输入诊断一对盘口，不检查新鲜度。
+pub fn diagnose_books(
+    topic: &Topic,
+    pm_book: &OrderBook,
+    out_book: &OrderBook,
+    fees: &FeeContext,
+    limits: &ArbLimits,
+    pm_label: &str,
+    out_label: &str,
+) -> CalcPairSample {
+    let sample = CalcPairSample {
+        pm_label: pm_label.to_string(),
+        out_label: out_label.to_string(),
+        pm_ask: None,
+        pm_sz: None,
+        out_ask: None,
+        out_sz: None,
+        unit_cost: None,
+        reason: "missing_book",
+    };
+    let Some(pm_token) = topic.token(POLYMARKET, pm_label) else {
+        return sample;
+    };
+    let Some(out_token) = topic.token(OUTCOME, out_label) else {
+        return sample;
+    };
+    diagnose_loaded(
+        topic, pm_book, out_book, pm_token, out_token, fees, limits, sample,
+    )
+}
+
+fn diagnose_loaded(
+    topic: &Topic,
+    pm_book: &OrderBook,
+    out_book: &OrderBook,
+    pm_token: &TokenRef,
+    out_token: &TokenRef,
+    fees: &FeeContext,
+    limits: &ArbLimits,
+    mut sample: CalcPairSample,
+) -> CalcPairSample {
+    if let Some((pm_px, pm_sz)) = first_usable_ask(&pm_book.asks, false) {
+        if let Some((out_px, out_sz)) = first_usable_ask(&out_book.asks, true) {
+            sample.pm_ask = Some(pm_px);
+            sample.pm_sz = Some(pm_sz);
+            sample.out_ask = Some(out_px);
+            sample.out_sz = Some(out_sz);
+            sample.unit_cost = Some(all_in_unit_cost(pm_px, out_px, fees));
+        }
     }
     if plan_arbitrage(topic, pm_book, out_book, pm_token, out_token, fees, limits).is_some() {
         sample.reason = "ok";
@@ -1172,5 +1239,115 @@ mod tests {
         assert_eq!(confirmed.pm.token_id, first.pm.token_id);
         assert_eq!(confirmed.outcome.token_id, first.outcome.token_id);
         assert_ne!(confirmed.pm.cap_price, first.pm.cap_price);
+    }
+
+    #[test]
+    fn first_usable_ask_skips_zero_and_picks_cheapest() {
+        let asks = vec![
+            Level {
+                price: d("0.90"),
+                size: d("10"),
+            },
+            Level {
+                price: d("0.40"),
+                size: d("0"),
+            },
+            Level {
+                price: d("0.44"),
+                size: d("8"),
+            },
+        ];
+        assert_eq!(first_usable_ask(&asks, false), Some((d("0.44"), d("8"))));
+        assert_eq!(
+            first_usable_ask(
+                &[Level {
+                    price: d("0.40"),
+                    size: d("0.9"),
+                }],
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            first_usable_ask(
+                &[Level {
+                    price: d("0.40"),
+                    size: d("1.9"),
+                }],
+                true
+            ),
+            Some((d("0.40"), d("1")))
+        );
+    }
+
+    #[test]
+    fn confirm_plan_reads_cheapest_ask_when_unsorted() {
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+        snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+        let first = plan_with(&books, now, &limits("3", "100"));
+        let pm = OrderBook {
+            platform: POLYMARKET.to_string(),
+            token_id: "pm-yes".into(),
+            bids: vec![],
+            asks: vec![
+                Level {
+                    price: d("0.90"),
+                    size: d("50"),
+                },
+                Level {
+                    price: d("0.42"),
+                    size: d("40"),
+                },
+            ],
+            exchange_ts_ms: 1,
+            received_at: now,
+            stale: false,
+            tick_size: Some(d("0.01")),
+        };
+        let out = OrderBook {
+            platform: OUTCOME.to_string(),
+            token_id: "#10".into(),
+            bids: vec![],
+            asks: vec![Level {
+                price: d("0.42"),
+                size: d("40"),
+            }],
+            exchange_ts_ms: 1,
+            received_at: now,
+            stale: false,
+            tick_size: None,
+        };
+        let confirmed = confirm_plan(
+            &sample_topic(),
+            &first,
+            &pm,
+            &out,
+            &fees_zero(),
+            &limits("3", "100"),
+        )
+        .expect("cheap ask still arb");
+        assert_eq!(confirmed.pm.avg_price, d("0.42"));
+    }
+
+    #[test]
+    fn diagnose_books_reports_venue_min_when_http_size_thin() {
+        let now = Instant::now();
+        let mut http = BookStore::default();
+        snapshot(&mut http, POLYMARKET, "pm-yes", vec![("0.40", "2")], now);
+        snapshot(&mut http, OUTCOME, "#10", vec![("0.40", "2")], now);
+        let sample = diagnose_books(
+            &sample_topic(),
+            http.get(POLYMARKET, "pm-yes").unwrap(),
+            http.get(OUTCOME, "#10").unwrap(),
+            &fees_zero(),
+            &limits("0.1", "100"),
+            "yes",
+            "no",
+        );
+        assert_eq!(sample.reason, "venue_min");
+        assert_eq!(sample.pm_ask, Some(d("0.40")));
+        assert_eq!(sample.pm_sz, Some(d("2")));
     }
 }

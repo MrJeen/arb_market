@@ -14,6 +14,7 @@ use alloy_signer_local::PrivateKeySigner;
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, RoundingStrategy};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
@@ -24,6 +25,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 const FUNDER_CURSOR_FILE: &str = "polymarket_funder_cursor";
+const API_CREDS_FILE: &str = "polymarket_api_creds.json";
 const FAK_UNFILLED: &str = "no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.";
 /// CLOB FAK 市价单精度：maker 最多 2 位小数，taker 最多 5 位小数。
 /// 买单 USDC 向上取到分，避免隐含限价低于盘口；卖单金额仍向下截断。
@@ -39,6 +41,15 @@ pub struct PolymarketAccount {
     api_key: String,
     api_secret: String,
     api_passphrase: String,
+    created_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredApiCreds {
+    api_key: String,
+    secret: String,
+    passphrase: String,
+    created_at: u64,
 }
 
 #[derive(Clone)]
@@ -49,6 +60,8 @@ pub struct PolymarketVenue {
     authed: Arc<Mutex<HashMap<String, PolymarketAccount>>>,
     init_lock: Arc<Mutex<()>>,
     cursor_path: PathBuf,
+    creds_path: PathBuf,
+    auth_ttl: Duration,
     tick_cache: Arc<Mutex<HashMap<String, Decimal>>>,
     neg_risk_cache: Arc<Mutex<HashMap<String, bool>>>,
     rr: Arc<Mutex<usize>>,
@@ -69,22 +82,20 @@ impl PolymarketVenue {
             authed: Arc::new(Mutex::new(HashMap::new())),
             init_lock: Arc::new(Mutex::new(())),
             cursor_path,
+            creds_path: PathBuf::from(API_CREDS_FILE),
+            auth_ttl: cfg.polymarket_auth_ttl,
             tick_cache: Arc::new(Mutex::new(HashMap::new())),
             neg_risk_cache: Arc::new(Mutex::new(HashMap::new())),
             rr: Arc::new(Mutex::new(rr)),
         };
         if let Some(first) = venue.funders.get(rr).cloned() {
-            let account = init_account(&venue.http, &venue.base, &first).await?;
-            venue
-                .authed
-                .lock()
-                .await
-                .insert(first.funder_address.to_ascii_lowercase(), account);
+            venue.ensure_account(&first.funder_address).await?;
             tracing::info!(
                 funder = %first.funder_address,
                 idx = rr,
                 total = venue.funders.len(),
-                "polymarket first account authenticated"
+                ttl_secs = venue.auth_ttl.as_secs(),
+                "polymarket first account ready"
             );
         }
         Ok(venue)
@@ -100,12 +111,18 @@ impl PolymarketVenue {
 
     async fn ensure_account(&self, funder: &str) -> Result<PolymarketAccount> {
         let key = funder.to_ascii_lowercase();
+        let now = unix_secs();
         if let Some(account) = self.authed.lock().await.get(&key) {
-            return Ok(account.clone());
+            if creds_fresh(account.created_at, self.auth_ttl, now) {
+                return Ok(account.clone());
+            }
         }
         let _gate = self.init_lock.lock().await;
+        let now = unix_secs();
         if let Some(account) = self.authed.lock().await.get(&key) {
-            return Ok(account.clone());
+            if creds_fresh(account.created_at, self.auth_ttl, now) {
+                return Ok(account.clone());
+            }
         }
         let cfg = self
             .funders
@@ -113,8 +130,36 @@ impl PolymarketVenue {
             .find(|item| item.funder_address.eq_ignore_ascii_case(funder))
             .cloned()
             .ok_or_else(|| Error::msg("unknown polymarket funder"))?;
+        if let Some(stored) = load_fresh_api_cred(&self.creds_path, &key, self.auth_ttl, now) {
+            match account_from_creds(&cfg, &stored) {
+                Ok(account) => {
+                    tracing::info!(
+                        funder = %cfg.funder_address,
+                        age_secs = now.saturating_sub(stored.created_at),
+                        "polymarket account loaded"
+                    );
+                    self.authed.lock().await.insert(key, account.clone());
+                    return Ok(account);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        funder = %cfg.funder_address,
+                        error = %err,
+                        "polymarket stored creds unusable"
+                    );
+                }
+            }
+        }
         tracing::info!(funder = %cfg.funder_address, "polymarket account authenticating");
         let account = init_account(&self.http, &self.base, &cfg).await?;
+        if let Err(err) = save_api_cred(&self.creds_path, &key, &StoredApiCreds {
+            api_key: account.api_key.clone(),
+            secret: account.api_secret.clone(),
+            passphrase: account.api_passphrase.clone(),
+            created_at: account.created_at,
+        }) {
+            tracing::warn!(error = %err, "polymarket api creds persist failed");
+        }
         self.authed.lock().await.insert(key, account.clone());
         Ok(account)
     }
@@ -552,7 +597,61 @@ async fn init_account(
         api_key,
         api_secret,
         api_passphrase,
+        created_at: unix_secs(),
     })
+}
+
+fn account_from_creds(cfg: &PolymarketFunderConfig, creds: &StoredApiCreds) -> Result<PolymarketAccount> {
+    let signer: PrivateKeySigner = cfg
+        .wallet_private_key
+        .parse()
+        .map_err(|e| Error::msg(format!("invalid polymarket key: {e}")))?;
+    Ok(PolymarketAccount {
+        funder: cfg.funder_address.clone(),
+        service: cfg.service.clone(),
+        signature_type: if cfg.is_wallet_v2 { 3 } else { 2 },
+        signer,
+        api_key: creds.api_key.clone(),
+        api_secret: creds.secret.clone(),
+        api_passphrase: creds.passphrase.clone(),
+        created_at: creds.created_at,
+    })
+}
+
+fn creds_fresh(created_at: u64, ttl: Duration, now: u64) -> bool {
+    ttl.is_zero() || now.saturating_sub(created_at) < ttl.as_secs()
+}
+
+fn load_api_creds(path: &Path) -> HashMap<String, StoredApiCreds> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn load_fresh_api_cred(
+    path: &Path,
+    funder: &str,
+    ttl: Duration,
+    now: u64,
+) -> Option<StoredApiCreds> {
+    let creds = load_api_creds(path).remove(&funder.to_ascii_lowercase())?;
+    creds_fresh(creds.created_at, ttl, now).then_some(creds)
+}
+
+fn save_api_cred(path: &Path, funder: &str, creds: &StoredApiCreds) -> std::io::Result<()> {
+    let mut all = load_api_creds(path);
+    all.insert(funder.to_ascii_lowercase(), creds.clone());
+    let tmp = path.with_extension("json.tmp");
+    let data = serde_json::to_vec_pretty(&all)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    fs::write(&tmp, data)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+    }
+    fs::rename(&tmp, path)
 }
 
 async fn send_auth(
@@ -1375,5 +1474,30 @@ mod tests {
         assert_eq!(load_funder_rr(&funders, &path), 0);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("cursor.tmp"));
+    }
+
+    #[test]
+    fn api_creds_roundtrip_and_ttl() {
+        let path = std::env::temp_dir().join(format!(
+            "pm-api-creds-{}-{}.json",
+            std::process::id(),
+            "ttl"
+        ));
+        let _ = fs::remove_file(&path);
+        let creds = StoredApiCreds {
+            api_key: "k".into(),
+            secret: "s".into(),
+            passphrase: "p".into(),
+            created_at: 1_000,
+        };
+        save_api_cred(&path, "0xAbC", &creds).unwrap();
+        assert!(creds_fresh(1_000, Duration::from_secs(100), 1_050));
+        assert!(!creds_fresh(1_000, Duration::from_secs(100), 1_100));
+        assert!(creds_fresh(1_000, Duration::ZERO, 9_999));
+        let loaded = load_fresh_api_cred(&path, "0xabc", Duration::from_secs(100), 1_050).unwrap();
+        assert_eq!(loaded.api_key, "k");
+        assert!(load_fresh_api_cred(&path, "0xabc", Duration::from_secs(100), 1_100).is_none());
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("json.tmp"));
     }
 }
