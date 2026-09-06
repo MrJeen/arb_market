@@ -6,12 +6,14 @@ use std::collections::HashSet;
 use uuid::Uuid;
 
 pub async fn load_active_topics(pool: &PgPool, enabled: &HashSet<String>) -> Result<Vec<Topic>> {
+    let path = unified_options_platforms_path(enabled);
     let rows: Vec<(Uuid, String, Option<DateTime<Utc>>, serde_json::Value)> = sqlx::query_as(
         "SELECT id, title, end_date, unified_options
          FROM events
          WHERE status = 'active'
-           AND unified_options IS NOT NULL",
+           AND jsonb_path_exists(unified_options, $1::jsonpath)",
     )
+    .bind(&path)
     .fetch_all(pool)
     .await?;
     let mut topics = Vec::new();
@@ -32,6 +34,26 @@ pub async fn load_active_topics(pool: &PgPool, enabled: &HashSet<String>) -> Res
         topics.extend(tradable_topics(&event, enabled));
     }
     Ok(topics)
+}
+
+/// 同一 unified option 上同时出现所有 enabled 平台。平台名来自配置，不写死。
+fn unified_options_platforms_path(enabled: &HashSet<String>) -> String {
+    if enabled.is_empty() {
+        return "$[*] ? (false)".to_string();
+    }
+    let mut preds: Vec<String> = enabled
+        .iter()
+        .map(|platform| {
+            let escaped = escape_jsonpath_string(platform);
+            format!(r#"exists(@."platformOptions"[*]."platform" ? (@ == "{escaped}"))"#)
+        })
+        .collect();
+    preds.sort();
+    format!("$[*] ? ({})", preds.join(" && "))
+}
+
+fn escape_jsonpath_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[cfg(test)]
@@ -160,5 +182,23 @@ mod tests {
         let enabled = HashSet::from([POLYMARKET.to_string(), OUTCOME.to_string()]);
         let topics = tradable_topics(&event, &enabled);
         assert_eq!(topics[0].polymarket_fee_rate().unwrap().to_string(), "0");
+    }
+
+    #[test]
+    fn jsonpath_requires_all_enabled_platforms_on_one_option() {
+        let both = HashSet::from([POLYMARKET.to_string(), OUTCOME.to_string()]);
+        let path = unified_options_platforms_path(&both);
+        assert!(path.contains(r#"@ == "outcome""#));
+        assert!(path.contains(r#"@ == "polymarket""#));
+        assert!(path.contains(" && "));
+        let only_pm = HashSet::from([POLYMARKET.to_string()]);
+        assert_eq!(
+            unified_options_platforms_path(&only_pm),
+            r#"$[*] ? (exists(@."platformOptions"[*]."platform" ? (@ == "polymarket")))"#
+        );
+        assert_eq!(
+            unified_options_platforms_path(&HashSet::new()),
+            "$[*] ? (false)"
+        );
     }
 }
