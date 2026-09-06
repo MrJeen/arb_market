@@ -4,7 +4,7 @@ use super::{
 };
 use crate::book::{BookStore, Level};
 use crate::config::{Config, OUTCOME};
-use crate::domain::TopicKey;
+use crate::domain::{parse_side_coin, side_asset_id, TopicKey};
 use crate::error::{Error, Result};
 use crate::signing::hyperliquid::{action_hash, order_action, sign_l1_action};
 use alloy_signer_local::PrivateKeySigner;
@@ -561,7 +561,7 @@ fn parse_coin_balance(value: &Value, want: &str) -> Decimal {
         .unwrap_or_default();
     for item in balances {
         let coin = item.get("coin").and_then(|v| v.as_str()).unwrap_or("");
-        if coin.eq_ignore_ascii_case(want) {
+        if coin_aliases_match(coin, want) {
             return item
                 .get("total")
                 .or_else(|| item.get("hold"))
@@ -570,6 +570,19 @@ fn parse_coin_balance(value: &Value, want: &str) -> Decimal {
         }
     }
     Decimal::ZERO
+}
+
+fn coin_aliases_match(got: &str, want: &str) -> bool {
+    if got.eq_ignore_ascii_case(want) {
+        return true;
+    }
+    let Some((want_id, want_side)) = parse_side_coin(want) else {
+        return false;
+    };
+    if parse_side_coin(got) == Some((want_id, want_side)) {
+        return true;
+    }
+    got == side_asset_id(want_id, want_side).to_string()
 }
 
 #[cfg(test)]
@@ -623,10 +636,17 @@ mod tests {
     fn parse_coin_balance_reads_named_token() {
         let raw = json!({"balances": [
             {"coin": "USDC", "total": "10"},
-            {"coin": "#5160", "total": "7"}
+            {"coin": "+5160", "total": "7"}
         ]});
         assert_eq!(parse_coin_balance(&raw, "#5160").to_string(), "7");
+        assert_eq!(parse_coin_balance(&raw, "+5160").to_string(), "7");
         assert_eq!(parse_usdc_balance(&raw).to_string(), "10");
+    }
+
+    #[test]
+    fn parse_coin_balance_matches_asset_id() {
+        let raw = json!({"balances": [{"coin": "100012110", "total": "119"}]});
+        assert_eq!(parse_coin_balance(&raw, "#12110").to_string(), "119");
     }
 
     fn exchange_ok(status_item: Value) -> Value {

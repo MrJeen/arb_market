@@ -160,6 +160,29 @@ async fn run_job(
             );
             return Ok(());
         }
+        if job.side == OrderSide::Buy {
+            let need = args.shares * args.price;
+            match venue.balance(&funder).await {
+                Ok(bal) if bal >= need => {}
+                Ok(bal) => {
+                    println!("SKIP {POLYMARKET} BUY usdc {bal} < {need}");
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            }
+        } else {
+            match venue.token_balance(&funder, &job.token_id).await {
+                Ok(bal) if bal >= args.shares => {}
+                Ok(bal) => {
+                    println!(
+                        "SKIP {POLYMARKET} SELL token={} balance {bal} < {}",
+                        job.token_id, args.shares
+                    );
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            }
+        }
         let result = venue.market_order(&funder, &req).await?;
         print_result(POLYMARKET, job, &result);
         return Ok(());
@@ -184,6 +207,29 @@ async fn run_job(
             req.asset_id
         );
         return Ok(());
+    }
+    if job.side == OrderSide::Buy {
+        let need = args.shares * args.price;
+        match venue.user_state().await {
+            Ok(bal) if bal >= need => {}
+            Ok(bal) => {
+                println!("SKIP {OUTCOME} BUY usdc {bal} < {need}");
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        }
+    } else {
+        match venue.token_balance(&job.token_id).await {
+            Ok(bal) if bal >= args.shares => {}
+            Ok(bal) => {
+                println!(
+                    "SKIP {OUTCOME} SELL token={} balance {bal} < {}",
+                    job.token_id, args.shares
+                );
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        }
     }
     let result = venue.market_order(&req).await?;
     print_result(OUTCOME, job, &result);

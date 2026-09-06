@@ -154,8 +154,9 @@ impl Engine {
     }
 
     async fn execute_plan(&self, topic: &Topic, plan: ArbPlan) -> Result<()> {
-        let required = plan.pm.cost + plan.pm.fee;
-        let funder = self.select_funder(required).await?;
+        let funder = self.select_funder(plan.pm.cost + plan.pm.fee).await?;
+        self.require_outcome_usdc(plan.outcome.cost + plan.outcome.fee)
+            .await?;
         let fills = json!([
             {"platform": POLYMARKET, "token": plan.pm.token_id, "label": plan.pm.label, "shares": plan.pm.shares, "price": plan.pm.cap_price},
             {"platform": OUTCOME, "token": plan.outcome.token_id, "label": plan.outcome.label, "shares": plan.outcome.shares, "price": plan.outcome.cap_price}
@@ -325,6 +326,42 @@ impl Engine {
                 .ok_or_else(|| Error::msg("unable to rotate polymarket funder"))?;
         }
         Err(Error::msg("no polymarket funder with sufficient balance"))
+    }
+
+    async fn require_outcome_usdc(&self, required: Decimal) -> Result<()> {
+        match self.outcome.user_state().await {
+            Ok(bal) if bal >= required => Ok(()),
+            Ok(bal) => Err(Error::msg(format!(
+                "outcome buy skipped, usdc {bal} < {required}"
+            ))),
+            Err(err) => Err(Error::msg(format!(
+                "outcome buy skipped, usdc balance unavailable: {err}"
+            ))),
+        }
+    }
+
+    async fn require_pm_token(&self, funder: &str, token_id: &str, shares: Decimal) -> Result<()> {
+        match self.pm.token_balance(funder, token_id).await {
+            Ok(bal) if bal >= shares => Ok(()),
+            Ok(bal) => Err(Error::msg(format!(
+                "polymarket sell skipped, token balance {bal} < {shares}"
+            ))),
+            Err(err) => Err(Error::msg(format!(
+                "polymarket sell skipped, token balance unavailable: {err}"
+            ))),
+        }
+    }
+
+    async fn require_outcome_token(&self, token_id: &str, shares: Decimal) -> Result<()> {
+        match self.outcome.token_balance(token_id).await {
+            Ok(bal) if bal >= shares => Ok(()),
+            Ok(bal) => Err(Error::msg(format!(
+                "outcome sell skipped, token balance {bal} < {shares}"
+            ))),
+            Err(err) => Err(Error::msg(format!(
+                "outcome sell skipped, token balance unavailable: {err}"
+            ))),
+        }
     }
 
     async fn submit_pm(
@@ -605,20 +642,8 @@ impl Engine {
                     .await?
                     .or(self.pm.next_funder().await)
                     .ok_or_else(|| Error::msg("no polymarket funder for sell"))?;
-                match self.pm.token_balance(&funder, &action.token_id).await {
-                    Ok(bal) if bal >= action.shares => {}
-                    Ok(bal) => {
-                        return Err(Error::msg(format!(
-                            "polymarket sell skipped, token balance {bal} < {}",
-                            action.shares
-                        )));
-                    }
-                    Err(err) => {
-                        return Err(Error::msg(format!(
-                            "polymarket sell skipped, token balance unavailable: {err}"
-                        )));
-                    }
-                }
+                self.require_pm_token(&funder, &action.token_id, action.shares)
+                    .await?;
                 let req = MarketOrderRequest {
                     token_id: action.token_id.clone(),
                     shares: action.shares,
@@ -683,20 +708,11 @@ impl Engine {
             Ok(())
         } else {
             if side == OrderSide::Sell {
-                match self.outcome.token_balance(&action.token_id).await {
-                    Ok(bal) if bal >= action.shares => {}
-                    Ok(bal) => {
-                        return Err(Error::msg(format!(
-                            "outcome sell skipped, token balance {bal} < {}",
-                            action.shares
-                        )));
-                    }
-                    Err(err) => {
-                        return Err(Error::msg(format!(
-                            "outcome sell skipped, token balance unavailable: {err}"
-                        )));
-                    }
-                }
+                self.require_outcome_token(&action.token_id, action.shares)
+                    .await?;
+            } else {
+                self.require_outcome_usdc(action.shares * action.cap_price)
+                    .await?;
             }
             let req = MarketOrderRequest {
                 token_id: action.token_id.clone(),

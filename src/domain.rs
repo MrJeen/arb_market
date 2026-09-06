@@ -147,12 +147,17 @@ pub fn side_coin(outcome_id: u64, side_index: u8) -> String {
     format!("#{outcome_id}{side_index}")
 }
 
+/// `spotClearinghouseState` 里 outcome 余额用 `+`，下单/盘口用 `#`。
+pub fn side_balance_coin(outcome_id: u64, side_index: u8) -> String {
+    format!("+{outcome_id}{side_index}")
+}
+
 pub fn side_asset_id(outcome_id: u64, side_index: u8) -> u64 {
     OUTCOME_ASSET_BASE + outcome_id * 10 + u64::from(side_index)
 }
 
 pub fn parse_side_coin(coin: &str) -> Option<(u64, u8)> {
-    let rest = coin.strip_prefix('#')?;
+    let rest = coin.strip_prefix('#').or_else(|| coin.strip_prefix('+'))?;
     if rest.is_empty() {
         return None;
     }
@@ -344,7 +349,9 @@ mod tests {
         assert_eq!(side_coin(516, 1), "#5161");
         assert_eq!(side_coin(9, 0), "#90");
         assert_eq!(side_asset_id(516, 0), 100_005_160);
+        assert_eq!(side_balance_coin(516, 0), "+5160");
         assert_eq!(parse_side_coin("#5160"), Some((516, 0)));
+        assert_eq!(parse_side_coin("+12110"), Some((1211, 0)));
         assert_eq!(parse_side_coin("#90"), Some((9, 0)));
         assert_eq!(parse_side_coin("#5162"), None);
     }
