@@ -1,10 +1,21 @@
+use crate::calc::CalcMissSnapshot;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 macro_rules! minute_stats {
     ($($name:ident),+ $(,)?) => {
-        #[derive(Default)]
         pub struct MinuteStats {
             $($name: AtomicU64,)+
+            last_miss: Mutex<Option<CalcMissSnapshot>>,
+        }
+
+        impl Default for MinuteStats {
+            fn default() -> Self {
+                Self {
+                    $($name: AtomicU64::new(0),)+
+                    last_miss: Mutex::new(None),
+                }
+            }
         }
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -35,6 +46,16 @@ macro_rules! minute_stats {
                     $( $name = s.$name, )+
                     "minute stats"
                 );
+                let miss = self
+                    .last_miss
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .take();
+                if s.found == 0 {
+                    if let Some(miss) = miss {
+                        miss.log();
+                    }
+                }
             }
         }
     };
@@ -94,6 +115,10 @@ impl MinuteStats {
             self.unprofitable.fetch_add(n, Ordering::Relaxed);
         }
     }
+
+    pub fn record_calc_miss(&self, snapshot: CalcMissSnapshot) {
+        *self.last_miss.lock().unwrap_or_else(|err| err.into_inner()) = Some(snapshot);
+    }
 }
 
 #[cfg(test)]
@@ -123,5 +148,16 @@ mod tests {
         let stats = MinuteStats::new();
         stats.add_stale_book(0);
         assert_eq!(stats.snapshot_and_reset().stale_book, 0);
+    }
+
+    #[test]
+    fn records_and_clears_calc_miss() {
+        let stats = MinuteStats::new();
+        stats.record_calc_miss(crate::calc::CalcMissSnapshot {
+            topic: "t".into(),
+            pairs: Vec::new(),
+        });
+        stats.log_and_reset();
+        stats.log_and_reset();
     }
 }

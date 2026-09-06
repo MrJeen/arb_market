@@ -487,52 +487,176 @@ pub struct CalcSkipCounts {
     pub unprofitable: u64,
 }
 
-/// 按互补 pair 分类 `best_plan` 未成对的原因，不改变 `best_plan` 本身。
-pub fn classify_calc_skips(
+#[derive(Debug, Clone)]
+pub struct CalcPairSample {
+    pub pm_label: String,
+    pub out_label: String,
+    pub pm_ask: Option<Decimal>,
+    pub pm_sz: Option<Decimal>,
+    pub out_ask: Option<Decimal>,
+    pub out_sz: Option<Decimal>,
+    pub unit_cost: Option<Decimal>,
+    pub reason: &'static str,
+}
+
+impl CalcPairSample {
+    pub fn compact(&self) -> String {
+        format!(
+            "{}/{} pm={}x{} out={}x{} unit={} reason={}",
+            self.pm_label,
+            self.out_label,
+            fmt_dec(self.pm_ask),
+            fmt_dec(self.pm_sz),
+            fmt_dec(self.out_ask),
+            fmt_dec(self.out_sz),
+            fmt_dec(self.unit_cost),
+            self.reason
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CalcMissSnapshot {
+    pub topic: String,
+    pub pairs: Vec<CalcPairSample>,
+}
+
+impl CalcMissSnapshot {
+    pub fn log(&self) {
+        let pairs = self
+            .pairs
+            .iter()
+            .map(CalcPairSample::compact)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        tracing::info!(topic = %self.topic, pairs = %pairs, "calc miss sample");
+    }
+}
+
+fn fmt_dec(value: Option<Decimal>) -> String {
+    value
+        .map(|v| v.normalize().to_string())
+        .unwrap_or_else(|| "-".into())
+}
+
+/// 按互补 pair 分类未成对原因，并带上首档价格，供分钟样本日志使用。
+pub fn inspect_calc(
     topic: &Topic,
     books: &crate::book::BookStore,
     fees: &FeeContext,
     limits: &ArbLimits,
     now: std::time::Instant,
     stale: std::time::Duration,
-) -> CalcSkipCounts {
+) -> (CalcSkipCounts, Vec<CalcPairSample>) {
     let mut counts = CalcSkipCounts::default();
+    let mut pairs = Vec::new();
     for (pm_label, out_label) in complementary_pairs(&topic.labels()) {
-        let Some(pm_token) = topic.token(POLYMARKET, &pm_label) else {
-            counts.missing_book += 1;
-            continue;
-        };
-        let Some(out_token) = topic.token(OUTCOME, &out_label) else {
-            counts.missing_book += 1;
-            continue;
-        };
-        let Some(pm_book) = books.get(POLYMARKET, &pm_token.token_id) else {
-            counts.missing_book += 1;
-            continue;
-        };
-        let Some(out_book) = books.get(OUTCOME, &out_token.token_id) else {
-            counts.missing_book += 1;
-            continue;
-        };
-        if !pm_book.is_fresh(stale, now) || !out_book.is_fresh(stale, now) {
-            counts.stale_book += 1;
+        let sample = diagnose_pair(
+            topic, books, fees, limits, now, stale, &pm_label, &out_label,
+        );
+        if sample.reason == "ok" {
             continue;
         }
-        if plan_arbitrage(topic, pm_book, out_book, pm_token, out_token, fees, limits).is_some() {
-            continue;
+        match sample.reason {
+            "missing_book" => counts.missing_book += 1,
+            "stale_book" => counts.stale_book += 1,
+            "unit_cost_ge_1" => counts.unit_cost += 1,
+            _ => counts.unprofitable += 1,
         }
-        let Some((pm_px, _, out_px, _)) = peek_first(&pm_book.asks, &out_book.asks) else {
-            counts.unprofitable += 1;
-            continue;
-        };
-        let unit = all_in_unit_cost(pm_px, out_px, fees);
-        if unit >= Decimal::ONE || unit <= Decimal::ZERO {
-            counts.unit_cost += 1;
-        } else {
-            counts.unprofitable += 1;
-        }
+        pairs.push(sample);
     }
-    counts
+    (counts, pairs)
+}
+
+fn diagnose_pair(
+    topic: &Topic,
+    books: &crate::book::BookStore,
+    fees: &FeeContext,
+    limits: &ArbLimits,
+    now: std::time::Instant,
+    stale: std::time::Duration,
+    pm_label: &str,
+    out_label: &str,
+) -> CalcPairSample {
+    let mut sample = CalcPairSample {
+        pm_label: pm_label.to_string(),
+        out_label: out_label.to_string(),
+        pm_ask: None,
+        pm_sz: None,
+        out_ask: None,
+        out_sz: None,
+        unit_cost: None,
+        reason: "missing_book",
+    };
+    let Some(pm_token) = topic.token(POLYMARKET, pm_label) else {
+        return sample;
+    };
+    let Some(out_token) = topic.token(OUTCOME, out_label) else {
+        return sample;
+    };
+    let Some(pm_book) = books.get(POLYMARKET, &pm_token.token_id) else {
+        return sample;
+    };
+    let Some(out_book) = books.get(OUTCOME, &out_token.token_id) else {
+        return sample;
+    };
+    if !pm_book.is_fresh(stale, now) || !out_book.is_fresh(stale, now) {
+        sample.reason = "stale_book";
+        return sample;
+    }
+    if let Some((pm_px, pm_sz, out_px, out_sz)) = peek_first(&pm_book.asks, &out_book.asks) {
+        sample.pm_ask = Some(pm_px);
+        sample.pm_sz = Some(pm_sz);
+        sample.out_ask = Some(out_px);
+        sample.out_sz = Some(out_sz);
+        sample.unit_cost = Some(all_in_unit_cost(pm_px, out_px, fees));
+    }
+    if plan_arbitrage(topic, pm_book, out_book, pm_token, out_token, fees, limits).is_some() {
+        sample.reason = "ok";
+        return sample;
+    }
+    if pm_book.tick_size.is_none() {
+        sample.reason = "no_tick";
+        return sample;
+    }
+    let Some(unit) = sample.unit_cost else {
+        sample.reason = "empty_ask";
+        return sample;
+    };
+    if unit >= Decimal::ONE || unit <= Decimal::ZERO {
+        sample.reason = "unit_cost_ge_1";
+        return sample;
+    }
+    let pm_px = sample.pm_ask.unwrap_or_default();
+    let out_px = sample.out_ask.unwrap_or_default();
+    let max_net = floor_shares(
+        sample
+            .pm_sz
+            .unwrap_or_default()
+            .min(sample.out_sz.unwrap_or_default()),
+    );
+    let need = min_shares_for_venue(pm_px, out_px);
+    if need * unit > limits.cost_limit {
+        sample.reason = "cost_limit";
+        return sample;
+    }
+    if max_net < need {
+        sample.reason = "venue_min";
+        return sample;
+    }
+    sample.reason = "unprofitable";
+    sample
+}
+
+fn min_shares_for_venue(pm_px: Decimal, out_px: Decimal) -> Decimal {
+    let mut need = Decimal::from(5);
+    if pm_px > Decimal::ZERO {
+        need = need.max((Decimal::ONE / pm_px).ceil());
+    }
+    if out_px > Decimal::ZERO {
+        need = need.max((Decimal::ONE / out_px).ceil());
+    }
+    need
 }
 
 pub fn estimate_polymarket_fee(shares: Decimal, price: Decimal, fees: &FeeContext) -> Decimal {
@@ -734,6 +858,68 @@ mod tests {
         assert!(below_venue_mins(OUTCOME, false, d("1"), d("0.5")));
         assert!(!below_venue_mins(OUTCOME, true, d("2"), d("1")));
         assert!(!below_venue_mins(OUTCOME, false, d("1"), d("1")));
+    }
+
+    fn inspect_reasons(books: &BookStore, now: Instant, limits: &ArbLimits) -> Vec<&'static str> {
+        inspect_calc(
+            &sample_topic(),
+            books,
+            &fees_zero(),
+            limits,
+            now,
+            std::time::Duration::from_secs(5),
+        )
+        .1
+        .into_iter()
+        .map(|p| p.reason)
+        .collect()
+    }
+
+    #[test]
+    fn inspect_reports_unit_cost_and_venue_min() {
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.60", "50")], now);
+        snapshot(&mut books, OUTCOME, "#10", vec![("0.50", "50")], now);
+        snapshot(&mut books, POLYMARKET, "pm-no", vec![("0.40", "3")], now);
+        snapshot(&mut books, OUTCOME, "#11", vec![("0.40", "3")], now);
+        let reasons = inspect_reasons(&books, now, &limits("-1", "10"));
+        assert!(reasons.contains(&"unit_cost_ge_1"));
+        assert!(reasons.contains(&"venue_min"));
+    }
+
+    #[test]
+    fn inspect_reports_no_tick() {
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        books.replace_snapshot(
+            POLYMARKET,
+            "pm-yes",
+            vec![],
+            vec![Level {
+                price: d("0.40"),
+                size: d("50"),
+            }],
+            1,
+            now,
+        );
+        snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+        snapshot(&mut books, POLYMARKET, "pm-no", vec![("0.60", "50")], now);
+        snapshot(&mut books, OUTCOME, "#11", vec![("0.50", "50")], now);
+        let reasons = inspect_reasons(&books, now, &limits("-1", "10"));
+        assert!(reasons.contains(&"no_tick"));
+    }
+
+    #[test]
+    fn inspect_reports_cost_limit() {
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+        snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+        snapshot(&mut books, POLYMARKET, "pm-no", vec![("0.60", "50")], now);
+        snapshot(&mut books, OUTCOME, "#11", vec![("0.50", "50")], now);
+        let reasons = inspect_reasons(&books, now, &limits("-1", "2"));
+        assert!(reasons.contains(&"cost_limit"));
     }
 
     #[test]

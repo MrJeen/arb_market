@@ -1,7 +1,7 @@
 use crate::book::{BookStore, DirtyCoalescer, OrderBook};
 use crate::calc::{
-    below_venue_mins, best_plan, classify_calc_skips, confirm_plan, min_trade_amount,
-    min_trade_cost, ArbLimits, ArbPlan, FeeContext,
+    below_venue_mins, best_plan, confirm_plan, inspect_calc, min_trade_amount, min_trade_cost,
+    ArbLimits, ArbPlan, CalcMissSnapshot, FeeContext,
 };
 use crate::config::{Config, OUTCOME, POLYMARKET};
 use crate::discovery::load_active_topics;
@@ -159,12 +159,18 @@ impl Engine {
             let books = self.books.lock().await;
             let now = Instant::now();
             let plan = best_plan(&topic, &books, &fees, &limits, now, self.cfg.book_stale);
-            let skips =
-                classify_calc_skips(&topic, &books, &fees, &limits, now, self.cfg.book_stale);
+            let (skips, pairs) =
+                inspect_calc(&topic, &books, &fees, &limits, now, self.cfg.book_stale);
             self.stats.add_missing_book(skips.missing_book);
             self.stats.add_stale_book(skips.stale_book);
             self.stats.add_unit_cost(skips.unit_cost);
             self.stats.add_unprofitable(skips.unprofitable);
+            if plan.is_none() && !pairs.is_empty() {
+                self.stats.record_calc_miss(CalcMissSnapshot {
+                    topic: topic.key.as_str(),
+                    pairs,
+                });
+            }
             plan
         };
         self.stats.calc();
