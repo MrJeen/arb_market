@@ -60,6 +60,7 @@ pub fn order_action(
     price: &str,
     size: &str,
     cloid: Option<&str>,
+    builder: Option<(&str, u32)>,
 ) -> Value {
     let mut order = serde_json::Map::new();
     order.insert("a".into(), json!(asset));
@@ -71,11 +72,14 @@ pub fn order_action(
     if let Some(c) = cloid {
         order.insert("c".into(), json!(c));
     }
-    json!({
-        "type": "order",
-        "orders": [Value::Object(order)],
-        "grouping": "na"
-    })
+    let mut action = serde_json::Map::new();
+    action.insert("type".into(), json!("order"));
+    action.insert("orders".into(), json!([Value::Object(order)]));
+    action.insert("grouping".into(), json!("na"));
+    if let Some((addr, fee)) = builder {
+        action.insert("builder".into(), json!({"b": addr, "f": fee}));
+    }
+    Value::Object(action)
 }
 
 fn encode_value(value: &Value, buf: &mut Vec<u8>) -> anyhow::Result<()> {
@@ -116,7 +120,7 @@ mod tests {
 
     #[test]
     fn action_hash_is_deterministic() {
-        let action = order_action(100_005_160, true, "0.55", "10", Some("0x1234"));
+        let action = order_action(100_005_160, true, "0.55", "10", Some("0x1234"), None);
         let a = action_hash(&action, None, 1, None).unwrap();
         let b = action_hash(&action, None, 1, None).unwrap();
         assert_eq!(a, b);
@@ -127,10 +131,30 @@ mod tests {
     #[test]
     fn signs_l1_action() {
         let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x11)).unwrap();
-        let action = order_action(100_005_160, true, "0.55", "10", None);
+        let action = order_action(100_005_160, true, "0.55", "10", None, None);
         let (r, s, v) = sign_l1_action(&signer, &action, 1, true).unwrap();
         assert!(r.starts_with("0x"));
         assert!(s.starts_with("0x"));
         assert!(v == 27 || v == 28);
+    }
+
+    #[test]
+    fn order_action_includes_outcome_builder() {
+        let action = order_action(
+            100_005_160,
+            true,
+            "0.55",
+            "10",
+            None,
+            Some(("0xab5dbc057628bc18523c4cdfc0e1e2ebdbecb704", 0)),
+        );
+        assert_eq!(
+            action["builder"]["b"],
+            json!("0xab5dbc057628bc18523c4cdfc0e1e2ebdbecb704")
+        );
+        assert_eq!(action["builder"]["f"], json!(0));
+        assert!(order_action(1, true, "0.5", "1", None, None)
+            .get("builder")
+            .is_none());
     }
 }

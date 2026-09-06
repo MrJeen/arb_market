@@ -10,6 +10,9 @@ use std::time::Duration;
 
 pub const POLYMARKET: &str = "polymarket";
 pub const OUTCOME: &str = "outcome";
+/// Outcome 官方 builder；写入每笔 Hyperliquid order，供官网归因统计。
+/// https://docs.outcome.xyz/builder-codes
+pub const DEFAULT_OUTCOME_BUILDER: &str = "0xab5dbc057628bc18523c4cdfc0e1e2ebdbecb704";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -42,6 +45,10 @@ pub struct Config {
     pub hyperliquid_mainnet: bool,
     pub outcome_agent_private_key: Option<String>,
     pub outcome_account_address: Option<String>,
+    /// 每笔 Outcome 单的 builder 地址；`None` 表示不带归因字段。
+    pub outcome_builder_address: Option<String>,
+    /// Builder fee，单位是十分之一基点；Outcome 文档当前为 0。
+    pub outcome_builder_fee: u32,
     pub nats_url: Option<String>,
     pub nats_token: Option<String>,
     pub nats_subject: String,
@@ -101,6 +108,8 @@ impl Config {
             hyperliquid_mainnet: env_bool("HYPERLIQUID_MAINNET", true),
             outcome_agent_private_key: env_opt("OUTCOME_AGENT_PRIVATE_KEY"),
             outcome_account_address: env_opt("OUTCOME_ACCOUNT_ADDRESS"),
+            outcome_builder_address: parse_outcome_builder()?,
+            outcome_builder_fee: env_u64("OUTCOME_BUILDER_FEE", 0) as u32,
             nats_url: env_opt("NATS_URL"),
             nats_token: env_opt("NATS_TOKEN"),
             nats_subject: env_or("NATS_TG_SUBJECT", "tg.notification"),
@@ -243,6 +252,24 @@ fn parse_funder_value(funder: &str, value: &serde_json::Value) -> Option<Polymar
     })
 }
 
+fn parse_outcome_builder() -> Result<Option<String>> {
+    match env_opt("OUTCOME_BUILDER_ADDRESS") {
+        Some(raw) if matches!(raw.to_ascii_lowercase().as_str(), "none" | "-" | "off") => Ok(None),
+        Some(raw) => Ok(Some(normalize_builder_address(&raw)?)),
+        None => Ok(Some(DEFAULT_OUTCOME_BUILDER.to_string())),
+    }
+}
+
+fn normalize_builder_address(raw: &str) -> Result<String> {
+    let hex = raw.strip_prefix("0x").unwrap_or(raw);
+    if hex.len() != 40 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(Error::Config(format!(
+            "invalid OUTCOME_BUILDER_ADDRESS {raw}"
+        )));
+    }
+    Ok(format!("0x{}", hex.to_ascii_lowercase()))
+}
+
 fn env_required(key: &str) -> Result<String> {
     env_opt(key).ok_or_else(|| Error::Config(format!("missing {key}")))
 }
@@ -307,6 +334,15 @@ mod tests {
         assert_eq!(funders.len(), 1);
         assert_eq!(funders[0].funder_address, "0xAbc");
         assert!(funders[0].is_wallet_v2);
+    }
+
+    #[test]
+    fn normalizes_builder_address() {
+        assert_eq!(
+            normalize_builder_address("0xAB5DBC057628BC18523C4CDFC0E1E2EBDBECB704").unwrap(),
+            "0xab5dbc057628bc18523c4cdfc0e1e2ebdbecb704"
+        );
+        assert!(normalize_builder_address("not-an-address").is_err());
     }
 
     #[test]

@@ -25,6 +25,7 @@ pub struct OutcomeVenue {
     mainnet: bool,
     signer: Option<PrivateKeySigner>,
     account: Option<String>,
+    builder: Option<(String, u32)>,
     nonce: Arc<StdMutex<u64>>,
 }
 
@@ -47,6 +48,10 @@ impl OutcomeVenue {
             mainnet: cfg.hyperliquid_mainnet,
             signer,
             account: cfg.outcome_account_address.clone(),
+            builder: cfg
+                .outcome_builder_address
+                .clone()
+                .map(|addr| (addr, cfg.outcome_builder_fee)),
             nonce: Arc::new(StdMutex::new(0)),
         })
     }
@@ -107,12 +112,17 @@ impl OutcomeVenue {
         let price = crate::calc::align_outcome_price(req.cap_price);
         let cloid = random_cloid();
         let is_buy = req.side == OrderSide::Buy;
+        let builder = self
+            .builder
+            .as_ref()
+            .map(|(addr, fee)| (addr.as_str(), *fee));
         let action = order_action(
             asset,
             is_buy,
             &price.to_string(),
             &shares.trunc().to_string(),
             Some(&cloid),
+            builder,
         );
         let nonce = self.next_nonce();
         let (r, s, v) = sign_l1_action(signer, &action, nonce, self.mainnet).map_err(Error::msg)?;
