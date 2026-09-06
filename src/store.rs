@@ -173,10 +173,10 @@ impl Store {
                     updated_at = NOW()
              WHERE id = $1",
         )
-            .bind(leg_id)
-            .bind(client_id)
-            .execute(&mut *tx)
-            .await?;
+        .bind(leg_id)
+        .bind(client_id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }

@@ -1009,16 +1009,14 @@ async fn handle_ws_text(
     }
 }
 
-fn market_order_base_units(
-    side: OrderSide,
-    size: Decimal,
-    price: Decimal,
-) -> Result<(u128, u128)> {
+fn market_order_base_units(side: OrderSide, size: Decimal, price: Decimal) -> Result<(u128, u128)> {
     let (maker, taker) = match side {
         OrderSide::Buy => {
             let shares = size.trunc_with_scale(MARKET_TAKER_DECIMALS);
-            let usdc = (shares * price)
-                .round_dp_with_strategy(MARKET_MAKER_DECIMALS, RoundingStrategy::ToPositiveInfinity);
+            let usdc = (shares * price).round_dp_with_strategy(
+                MARKET_MAKER_DECIMALS,
+                RoundingStrategy::ToPositiveInfinity,
+            );
             (usdc, shares)
         }
         OrderSide::Sell => {

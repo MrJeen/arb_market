@@ -28,6 +28,33 @@ cargo run --release
 
 `ENABLE_BUY=false` 时只计算、不下新套利单，也不提交自动对冲。配置项见 `.env.example`。
 
+## 本地下单测试
+
+【本机】只测 Polymarket / Outcome 买卖下单接口：走现有签名和提交路径，不连 Postgres、不订盘口、不轮询成交。默认只签名不发单；加 `--confirm`（或 `PLACE_TEST_CONFIRM=1`）才打到主网。
+
+```bash
+# 先 dry-run 看签名是否正常
+cargo run --bin place-test -- --platform polymarket --side buy \
+  --token <pm_token_id> --shares 5 --price 0.40
+
+# 真实提交
+cargo run --bin place-test -- --platform polymarket --side sell \
+  --token <pm_token_id> --shares 5 --price 0.40 --confirm
+
+cargo run --bin place-test -- --platform outcome --side buy \
+  --token '#5160' --shares 5 --price 0.40 --confirm
+
+cargo run --bin place-test -- --platform outcome --side sell \
+  --token '#5160' --shares 5 --price 0.40 --confirm
+
+# 两平台各买各卖（4 笔）
+cargo run --bin place-test -- --all \
+  --pm-token <pm_token_id> --out-token '#5160' \
+  --shares 5 --price 0.40 --confirm
+```
+
+`--side` 省略时默认买卖都测。读 `.env` 与 `polymarket_funders.json`。`ACK` / `NO_MATCH` 都说明下单链路通；`FAILED` 或签名错误才是接口异常。
+
 ## 本机交叉编译
 
 【本机】macOS 编 Linux x86_64：
