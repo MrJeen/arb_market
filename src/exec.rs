@@ -489,6 +489,28 @@ impl Engine {
                 return Ok(None);
             }
         };
+        // REST 盘口写回内存：exchange_ts 更旧则丢弃。两边都拉到就写，skew 失败也写，避免下一轮再吃 WS 旧盘。
+        let (pm_applied, out_applied) = {
+            let mut books = self.books.lock().await;
+            (
+                books.replace_snapshot(
+                    POLYMARKET,
+                    &plan.pm.token_id,
+                    pm_bids.clone(),
+                    pm_asks.clone(),
+                    pm_ts,
+                    pm_at,
+                ),
+                books.replace_snapshot(
+                    OUTCOME,
+                    &plan.outcome.token_id,
+                    out_bids.clone(),
+                    out_asks.clone(),
+                    out_ts,
+                    out_at,
+                ),
+            )
+        };
         if !book_recv_skew_ok(pm_at, out_at, HTTP_BOOK_SKEW_MAX) {
             tracing::warn!(
                 topic = %topic.key.as_str(),
@@ -497,6 +519,8 @@ impl Engine {
                 skew_ms = skew.as_millis() as u64,
                 pm_elapsed_ms = pm_elapsed.as_millis() as u64,
                 out_elapsed_ms = out_elapsed.as_millis() as u64,
+                pm_applied,
+                out_applied,
                 "http book receive skew exceeded 1s"
             );
             self.stats.skew();
@@ -509,6 +533,8 @@ impl Engine {
             skew_ms = skew.as_millis() as u64,
             pm_elapsed_ms = pm_elapsed.as_millis() as u64,
             out_elapsed_ms = out_elapsed.as_millis() as u64,
+            pm_applied,
+            out_applied,
             "http books received"
         );
         let pm_tick = self.ensure_pm_tick(&plan.pm.token_id).await;
