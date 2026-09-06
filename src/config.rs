@@ -353,4 +353,21 @@ mod tests {
         assert_eq!(funders[0].funder_address, "0xDef");
         let _ = std::fs::remove_file(path);
     }
+
+    #[test]
+    fn funder_object_keeps_json_key_order() {
+        let raw = r#"{
+            "0xaaa":{"walletPrivateKey":"0x1"},
+            "0xbbb":{"walletPrivateKey":"0x2"},
+            "0xccc":{"walletPrivateKey":"0x3"}
+        }"#;
+        let funders = parse_funders(raw.into()).unwrap();
+        assert_eq!(
+            funders
+                .iter()
+                .map(|f| f.funder_address.as_str())
+                .collect::<Vec<_>>(),
+            ["0xaaa", "0xbbb", "0xccc"]
+        );
+    }
 }

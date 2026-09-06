@@ -2,6 +2,8 @@
 /dist
 .env
 polymarket_funders.json
+polymarket_funder_cursor
+polymarket_funder_cursor.tmp
 *.log
 .DS_Store
 /reviews

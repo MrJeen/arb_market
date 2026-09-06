@@ -238,9 +238,9 @@ async fn run_job(
 
 async fn resolve_pm_funder(venue: &PolymarketVenue, requested: Option<&str>) -> Result<String> {
     if let Some(funder) = requested {
-        venue
-            .account(funder)
-            .ok_or_else(|| Error::msg(format!("unknown polymarket funder {funder}")))?;
+        if !venue.has_funder(funder) {
+            return Err(Error::msg(format!("unknown polymarket funder {funder}")));
+        }
         return Ok(funder.to_string());
     }
     venue

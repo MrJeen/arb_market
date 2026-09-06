@@ -16,11 +16,14 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
+const FUNDER_CURSOR_FILE: &str = "polymarket_funder_cursor";
 const FAK_UNFILLED: &str = "no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.";
 /// CLOB FAK 市价单精度：maker 最多 2 位小数，taker 最多 5 位小数。
 /// 买单 USDC 向上取到分，避免隐含限价低于盘口；卖单金额仍向下截断。
@@ -42,7 +45,10 @@ pub struct PolymarketAccount {
 pub struct PolymarketVenue {
     http: reqwest::Client,
     base: String,
-    accounts: Vec<PolymarketAccount>,
+    funders: Vec<PolymarketFunderConfig>,
+    authed: Arc<Mutex<HashMap<String, PolymarketAccount>>>,
+    init_lock: Arc<Mutex<()>>,
+    cursor_path: PathBuf,
     tick_cache: Arc<Mutex<HashMap<String, Decimal>>>,
     neg_risk_cache: Arc<Mutex<HashMap<String, bool>>>,
     rr: Arc<Mutex<usize>>,
@@ -53,59 +59,104 @@ impl PolymarketVenue {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()?;
-        let mut accounts = Vec::new();
-        for funder in &cfg.polymarket_funders {
-            accounts.push(init_account(&http, &cfg.polymarket_clob_url, funder).await?);
-        }
-        Ok(Self {
+        let funders = cfg.polymarket_funders.clone();
+        let cursor_path = PathBuf::from(FUNDER_CURSOR_FILE);
+        let rr = load_funder_rr(&funders, &cursor_path);
+        let venue = Self {
             http,
             base: cfg.polymarket_clob_url.trim_end_matches('/').to_string(),
-            accounts,
+            funders,
+            authed: Arc::new(Mutex::new(HashMap::new())),
+            init_lock: Arc::new(Mutex::new(())),
+            cursor_path,
             tick_cache: Arc::new(Mutex::new(HashMap::new())),
             neg_risk_cache: Arc::new(Mutex::new(HashMap::new())),
-            rr: Arc::new(Mutex::new(0)),
-        })
+            rr: Arc::new(Mutex::new(rr)),
+        };
+        if let Some(first) = venue.funders.get(rr).cloned() {
+            let account = init_account(&venue.http, &venue.base, &first).await?;
+            venue
+                .authed
+                .lock()
+                .await
+                .insert(first.funder_address.to_ascii_lowercase(), account);
+            tracing::info!(
+                funder = %first.funder_address,
+                idx = rr,
+                total = venue.funders.len(),
+                "polymarket first account authenticated"
+            );
+        }
+        Ok(venue)
     }
 
     pub fn account_count(&self) -> usize {
-        self.accounts.len()
+        self.funders.len()
     }
 
-    pub fn account(&self, funder: &str) -> Option<&PolymarketAccount> {
-        self.accounts
+    pub fn has_funder(&self, funder: &str) -> bool {
+        funder_index(&self.funders, funder).is_some()
+    }
+
+    async fn ensure_account(&self, funder: &str) -> Result<PolymarketAccount> {
+        let key = funder.to_ascii_lowercase();
+        if let Some(account) = self.authed.lock().await.get(&key) {
+            return Ok(account.clone());
+        }
+        let _gate = self.init_lock.lock().await;
+        if let Some(account) = self.authed.lock().await.get(&key) {
+            return Ok(account.clone());
+        }
+        let cfg = self
+            .funders
             .iter()
-            .find(|a| a.funder.eq_ignore_ascii_case(funder))
+            .find(|item| item.funder_address.eq_ignore_ascii_case(funder))
+            .cloned()
+            .ok_or_else(|| Error::msg("unknown polymarket funder"))?;
+        tracing::info!(funder = %cfg.funder_address, "polymarket account authenticating");
+        let account = init_account(&self.http, &self.base, &cfg).await?;
+        self.authed.lock().await.insert(key, account.clone());
+        Ok(account)
+    }
+
+    async fn persist_rr(&self, rr: usize) {
+        if let Some(funder) = self.funders.get(rr) {
+            if let Err(err) = save_funder_rr(&self.cursor_path, &funder.funder_address) {
+                tracing::warn!(error = %err, "polymarket funder cursor persist failed");
+            }
+        }
     }
 
     pub async fn next_funder(&self) -> Option<String> {
-        if self.accounts.is_empty() {
+        if self.funders.is_empty() {
             return None;
         }
         let mut rr = self.rr.lock().await;
-        let idx = *rr % self.accounts.len();
-        *rr += 1;
-        Some(self.accounts[idx].funder.clone())
+        let n = self.funders.len();
+        let idx = *rr % n;
+        *rr = (*rr + 1) % n;
+        let next = self.funders[idx].funder_address.clone();
+        self.persist_rr(*rr).await;
+        Some(next)
     }
 
     pub async fn rotate_from(&self, current: &str) -> Option<String> {
-        if self.accounts.len() < 2 {
+        if self.funders.len() < 2 {
             return self.next_funder().await;
         }
-        let idx = self
-            .accounts
-            .iter()
-            .position(|a| a.funder.eq_ignore_ascii_case(current))?;
-        let next = (idx + 1) % self.accounts.len();
-        Some(self.accounts[next].funder.clone())
+        let idx = funder_index(&self.funders, current)?;
+        let next_idx = (idx + 1) % self.funders.len();
+        let mut rr = self.rr.lock().await;
+        *rr = (next_idx + 1) % self.funders.len();
+        self.persist_rr(*rr).await;
+        Some(self.funders[next_idx].funder_address.clone())
     }
 
     pub async fn balance(&self, funder: &str) -> Result<Decimal> {
-        let account = self
-            .account(funder)
-            .ok_or_else(|| Error::msg("unknown polymarket funder"))?;
+        let account = self.ensure_account(funder).await?;
         let value = self
             .l2_json(
-                account,
+                &account,
                 reqwest::Method::GET,
                 "/balance-allowance",
                 &[
@@ -128,12 +179,10 @@ impl PolymarketVenue {
     }
 
     pub async fn token_balance(&self, funder: &str, token_id: &str) -> Result<Decimal> {
-        let account = self
-            .account(funder)
-            .ok_or_else(|| Error::msg("unknown polymarket funder"))?;
+        let account = self.ensure_account(funder).await?;
         let value = self
             .l2_json(
-                account,
+                &account,
                 reqwest::Method::GET,
                 "/balance-allowance",
                 &[
@@ -282,10 +331,7 @@ impl PolymarketVenue {
         req: &MarketOrderRequest,
     ) -> Result<PreparedOrder> {
         require_positive(req.shares, req.cap_price)?;
-        let account = self
-            .account(funder)
-            .ok_or_else(|| Error::msg("unknown polymarket funder"))?
-            .clone();
+        let account = self.ensure_account(funder).await?;
         let tick = match req.tick_size {
             Some(v) => v,
             None => self.fetch_tick_size(&req.token_id).await?,
@@ -337,10 +383,7 @@ impl PolymarketVenue {
             .funder
             .as_deref()
             .ok_or_else(|| Error::msg("missing funder on prepared order"))?;
-        let account = self
-            .account(funder)
-            .ok_or_else(|| Error::msg("unknown polymarket funder"))?
-            .clone();
+        let account = self.ensure_account(funder).await?;
         let order_hash = prepared.order_hash.clone();
         let envelope = prepared.envelope.clone();
         match self
@@ -368,12 +411,10 @@ impl PolymarketVenue {
     }
 
     pub async fn poll_order(&self, funder: &str, order_id: &str) -> Result<OrderPoll> {
-        let account = self
-            .account(funder)
-            .ok_or_else(|| Error::msg("unknown polymarket funder"))?;
+        let account = self.ensure_account(funder).await?;
         let path = format!("/data/order/{order_id}");
         match self
-            .l2_json(account, reqwest::Method::GET, &path, &[], None)
+            .l2_json(&account, reqwest::Method::GET, &path, &[], None)
             .await
         {
             Ok(raw) => Ok(parse_order_poll(raw, order_id)),
@@ -391,12 +432,10 @@ impl PolymarketVenue {
     }
 
     pub async fn poll_trades(&self, funder: &str, token_id: &str) -> Result<Vec<TradeFill>> {
-        let account = self
-            .account(funder)
-            .ok_or_else(|| Error::msg("unknown polymarket funder"))?;
+        let account = self.ensure_account(funder).await?;
         let raw = self
             .l2_json(
-                account,
+                &account,
                 reqwest::Method::GET,
                 "/data/trades",
                 &[("asset_id", token_id)],
@@ -449,6 +488,29 @@ impl PolymarketVenue {
         }
         Ok(serde_json::from_str(&text).unwrap_or_else(|_| json!({"raw": text})))
     }
+}
+
+fn funder_index(funders: &[PolymarketFunderConfig], addr: &str) -> Option<usize> {
+    funders
+        .iter()
+        .position(|item| item.funder_address.eq_ignore_ascii_case(addr))
+}
+
+fn load_funder_rr(funders: &[PolymarketFunderConfig], path: &Path) -> usize {
+    let Ok(text) = fs::read_to_string(path) else {
+        return 0;
+    };
+    let addr = text.trim();
+    if addr.is_empty() {
+        return 0;
+    }
+    funder_index(funders, addr).unwrap_or(0)
+}
+
+fn save_funder_rr(path: &Path, funder: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("cursor.tmp");
+    fs::write(&tmp, funder)?;
+    fs::rename(&tmp, path)
 }
 
 async fn init_account(
@@ -1283,5 +1345,35 @@ mod tests {
     fn market_buy_rejects_when_shares_trunc_to_zero() {
         let err = market_order_base_units(OrderSide::Buy, d("0.000001"), d("0.50")).unwrap_err();
         assert!(err.to_string().contains("round to zero"));
+    }
+
+    fn dummy_funder(addr: &str) -> PolymarketFunderConfig {
+        PolymarketFunderConfig {
+            funder_address: addr.into(),
+            wallet_private_key: "0x".into(),
+            is_wallet_v2: false,
+            service: None,
+        }
+    }
+
+    #[test]
+    fn funder_cursor_resumes_saved_address() {
+        let path = std::env::temp_dir().join(format!(
+            "pm-funder-cursor-{}-{}",
+            std::process::id(),
+            "resume"
+        ));
+        let funders = vec![
+            dummy_funder("0xaaa"),
+            dummy_funder("0xbbb"),
+            dummy_funder("0xccc"),
+        ];
+        assert_eq!(load_funder_rr(&funders, &path), 0);
+        save_funder_rr(&path, "0xBBB").unwrap();
+        assert_eq!(load_funder_rr(&funders, &path), 1);
+        save_funder_rr(&path, "0xmissing").unwrap();
+        assert_eq!(load_funder_rr(&funders, &path), 0);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("cursor.tmp"));
     }
 }
