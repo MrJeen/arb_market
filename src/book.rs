@@ -237,10 +237,10 @@ impl DirtyCoalescer {
         }
     }
 
+    /// 结束本轮计算。若期间又有标记，返回 `Some` 且不占住 computing，调用方应重新 `mark` 再算。
     pub fn finish(&mut self, topic: TopicKey) -> Option<TopicKey> {
         self.computing.remove(&topic);
         if self.pending.remove(&topic) {
-            self.computing.insert(topic);
             Some(topic)
         } else {
             None
@@ -313,7 +313,21 @@ mod tests {
         assert!(dirty.mark(topic).is_some());
         assert!(dirty.mark(topic).is_none());
         assert!(dirty.finish(topic).is_some());
+        // finish 释放 computing，下一轮可以重新 mark 再算
+        assert!(dirty.mark(topic).is_some());
         assert!(dirty.finish(topic).is_none());
+    }
+
+    #[test]
+    fn finish_without_pending_releases_lease() {
+        let mut dirty = DirtyCoalescer::default();
+        let topic = TopicKey {
+            event_id: uuid::Uuid::nil(),
+            unified_index: 0,
+        };
+        assert!(dirty.mark(topic).is_some());
+        assert!(dirty.finish(topic).is_none());
+        assert!(dirty.mark(topic).is_some());
     }
 
     fn topic_key(index: i32) -> TopicKey {

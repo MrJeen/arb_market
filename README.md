@@ -174,15 +174,19 @@ DEPLOY_HOST=arb DEPLOY_PATH=/var/www/arb_market/dist SERVICE_USER=market-arb ./s
 sudo journalctl -u market-arb           # 默认用 less 打开；/ 搜索，n 下一个
 sudo journalctl -u market-arb -f        # 实时跟踪
 sudo journalctl -u market-arb -n 200    # 最近 200 行
-sudo journalctl -u market-arb --since today --until "18:00"
-sudo journalctl -u market-arb -g "submit failed"
+sudo journalctl -u market-arb --since today --until "18:00"  # 今天到 18:00
+sudo journalctl -u market-arb -g "submit failed"            # 按关键字过滤
 sudo journalctl -u market-arb -p err    # 只看 error 及以上
 ```
 
 磁盘上的 journal 是二进制（`/var/log/journal/<machine-id>/system.journal`），不要用 `less` 直接打开。要当文本文件翻：
 
 ```bash
+# 今天全量日志
 sudo journalctl -u market-arb --since today --no-pager > /tmp/market-arb.log
+# 从某次重启起的日志
+sudo journalctl -u market-arb --since "2026-09-06 17:36" --no-pager > /tmp/market-arb.log
+
 less /tmp/market-arb.log
 ```
 

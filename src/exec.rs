@@ -67,21 +67,25 @@ impl Engine {
     }
 
     pub async fn handle_topic(&self, topic_key: TopicKey) -> Result<()> {
-        self.stats.wakeup();
-        let maybe_again = {
-            let mut dirty = self.dirty.lock().await;
-            dirty.mark(topic_key)
-        };
-        if maybe_again.is_none() {
-            self.stats.coalesced();
-            return Ok(());
+        loop {
+            self.stats.wakeup();
+            let claimed = {
+                let mut dirty = self.dirty.lock().await;
+                dirty.mark(topic_key).is_some()
+            };
+            if !claimed {
+                self.stats.coalesced();
+                return Ok(());
+            }
+            let result = self.evaluate_topic(topic_key).await;
+            let again = {
+                let mut dirty = self.dirty.lock().await;
+                dirty.finish(topic_key).is_some()
+            };
+            if !again {
+                return result;
+            }
         }
-        let result = self.evaluate_topic(topic_key).await;
-        if let Some(again) = self.dirty.lock().await.finish(topic_key) {
-            let _ = again;
-            return Box::pin(self.handle_topic(topic_key)).await;
-        }
-        result
     }
 
     async fn block_new_arb(&self, topic: &str) -> Result<bool> {
