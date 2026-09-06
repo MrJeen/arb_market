@@ -1,6 +1,7 @@
-use crate::book::{BookStore, DirtyCoalescer};
+use crate::book::{BookStore, DirtyCoalescer, OrderBook};
 use crate::calc::{
-    below_venue_mins, best_plan, min_trade_amount, min_trade_cost, ArbLimits, ArbPlan, FeeContext,
+    below_venue_mins, best_plan, confirm_plan, min_trade_amount, min_trade_cost, ArbLimits, ArbPlan,
+    FeeContext,
 };
 use crate::config::{Config, OUTCOME, POLYMARKET};
 use crate::discovery::load_active_topics;
@@ -19,7 +20,7 @@ use serde_json::json;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 pub struct Engine {
@@ -154,9 +155,72 @@ impl Engine {
     }
 
     async fn execute_plan(&self, topic: &Topic, plan: ArbPlan) -> Result<()> {
-        let funder = self.select_funder(plan.pm.cost + plan.pm.fee).await?;
-        self.require_outcome_usdc(plan.outcome.cost + plan.outcome.fee)
-            .await?;
+        let pm_need = plan.pm.cost + plan.pm.fee;
+        let out_need = plan.outcome.cost + plan.outcome.fee;
+        let (pm_bal, out_bal) = tokio::join!(self.select_funder(pm_need), self.outcome.user_state());
+        let (funder, pm_balance) = match pm_bal {
+            Ok(pair) => pair,
+            Err(err) => {
+                tracing::warn!(
+                    topic = %topic.key.as_str(),
+                    error = %err,
+                    "polymarket balance check skipped arb"
+                );
+                return Ok(());
+            }
+        };
+        let out_balance = match out_bal {
+            Ok(bal) if bal >= out_need => bal,
+            Ok(bal) => {
+                tracing::info!(
+                    topic = %topic.key.as_str(),
+                    %bal,
+                    required = %out_need,
+                    "outcome buy skipped, usdc insufficient"
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                tracing::warn!(
+                    topic = %topic.key.as_str(),
+                    error = %err,
+                    "outcome usdc balance unavailable"
+                );
+                return Ok(());
+            }
+        };
+        tracing::info!(
+            topic = %topic.key.as_str(),
+            funder = %funder,
+            pm_balance = %pm_balance,
+            out_balance = %out_balance,
+            "balances confirmed"
+        );
+
+        let Some(plan) = self.confirm_http_plan(topic, &plan).await? else {
+            return Ok(());
+        };
+        let pm_need = plan.pm.cost + plan.pm.fee;
+        let out_need = plan.outcome.cost + plan.outcome.fee;
+        if pm_need > pm_balance {
+            tracing::info!(
+                topic = %topic.key.as_str(),
+                required = %pm_need,
+                %pm_balance,
+                "http plan exceeds polymarket balance"
+            );
+            return Ok(());
+        }
+        if out_need > out_balance {
+            tracing::info!(
+                topic = %topic.key.as_str(),
+                required = %out_need,
+                %out_balance,
+                "http plan exceeds outcome balance"
+            );
+            return Ok(());
+        }
+
         let fills = json!([
             {"platform": POLYMARKET, "token": plan.pm.token_id, "label": plan.pm.label, "shares": plan.pm.shares, "price": plan.pm.cap_price},
             {"platform": OUTCOME, "token": plan.outcome.token_id, "label": plan.outcome.label, "shares": plan.outcome.shares, "price": plan.outcome.cap_price}
@@ -305,7 +369,136 @@ impl Engine {
         notify::format_platform_label(POLYMARKET, self.polymarket_service(funder))
     }
 
-    async fn select_funder(&self, required: Decimal) -> Result<String> {
+    async fn confirm_http_plan(&self, topic: &Topic, plan: &ArbPlan) -> Result<Option<ArbPlan>> {
+        let (pm_res, out_res) = tokio::join!(
+            async {
+                let started = Instant::now();
+                let r = self.pm.rest_book(&plan.pm.token_id).await;
+                (r, Instant::now(), started.elapsed())
+            },
+            async {
+                let started = Instant::now();
+                let r = self.outcome.rest_book(&plan.outcome.token_id).await;
+                (r, Instant::now(), started.elapsed())
+            }
+        );
+        let (pm_snap, pm_at, pm_elapsed) = pm_res;
+        let (out_snap, out_at, out_elapsed) = out_res;
+        let skew = book_recv_skew(pm_at, out_at);
+        let (pm_bids, pm_asks, pm_ts) = match pm_snap {
+            Ok(snap) => {
+                tracing::info!(
+                    platform = POLYMARKET,
+                    token = %plan.pm.token_id,
+                    elapsed_ms = pm_elapsed.as_millis() as u64,
+                    "polymarket rest book fetched"
+                );
+                snap
+            }
+            Err(err) => {
+                tracing::warn!(
+                    platform = POLYMARKET,
+                    token = %plan.pm.token_id,
+                    elapsed_ms = pm_elapsed.as_millis() as u64,
+                    error = %err,
+                    "polymarket rest book failed"
+                );
+                return Ok(None);
+            }
+        };
+        let (out_bids, out_asks, out_ts) = match out_snap {
+            Ok(snap) => {
+                tracing::info!(
+                    platform = OUTCOME,
+                    token = %plan.outcome.token_id,
+                    elapsed_ms = out_elapsed.as_millis() as u64,
+                    "outcome rest book fetched"
+                );
+                snap
+            }
+            Err(err) => {
+                tracing::warn!(
+                    platform = OUTCOME,
+                    token = %plan.outcome.token_id,
+                    elapsed_ms = out_elapsed.as_millis() as u64,
+                    error = %err,
+                    "outcome rest book failed"
+                );
+                return Ok(None);
+            }
+        };
+        if !book_recv_skew_ok(pm_at, out_at, HTTP_BOOK_SKEW_MAX) {
+            tracing::warn!(
+                topic = %topic.key.as_str(),
+                pm_token = %plan.pm.token_id,
+                out_token = %plan.outcome.token_id,
+                skew_ms = skew.as_millis() as u64,
+                pm_elapsed_ms = pm_elapsed.as_millis() as u64,
+                out_elapsed_ms = out_elapsed.as_millis() as u64,
+                "http book receive skew exceeded 1s"
+            );
+            return Ok(None);
+        }
+        tracing::info!(
+            topic = %topic.key.as_str(),
+            pm_token = %plan.pm.token_id,
+            out_token = %plan.outcome.token_id,
+            skew_ms = skew.as_millis() as u64,
+            pm_elapsed_ms = pm_elapsed.as_millis() as u64,
+            out_elapsed_ms = out_elapsed.as_millis() as u64,
+            "http books received"
+        );
+        let pm_tick = self.ensure_pm_tick(&plan.pm.token_id).await;
+        let pm_book = OrderBook {
+            platform: POLYMARKET.to_string(),
+            token_id: plan.pm.token_id.clone(),
+            bids: pm_bids,
+            asks: pm_asks,
+            exchange_ts_ms: pm_ts,
+            received_at: pm_at,
+            stale: false,
+            tick_size: pm_tick,
+        };
+        let out_book = OrderBook {
+            platform: OUTCOME.to_string(),
+            token_id: plan.outcome.token_id.clone(),
+            bids: out_bids,
+            asks: out_asks,
+            exchange_ts_ms: out_ts,
+            received_at: out_at,
+            stale: false,
+            tick_size: None,
+        };
+        let fees = self.fee_context(topic);
+        let limits = ArbLimits {
+            cost_limit: self.cfg.arb_cost_limit,
+            min_profit: self.cfg.arb_min_profit,
+            min_apr: self.cfg.arb_min_apr,
+            days: crate::calc::days_until(topic.end_date),
+        };
+        match confirm_plan(topic, plan, &pm_book, &out_book, &fees, &limits) {
+            Some(confirmed) => {
+                tracing::info!(
+                    topic = %topic.key.as_str(),
+                    profit = %confirmed.profit,
+                    cost = %confirmed.total_cost,
+                    roi = %confirmed.roi,
+                    apr = %confirmed.apr,
+                    "http arb confirmed"
+                );
+                Ok(Some(confirmed))
+            }
+            None => {
+                tracing::info!(
+                    topic = %topic.key.as_str(),
+                    "http recalc no longer arb"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    async fn select_funder(&self, required: Decimal) -> Result<(String, Decimal)> {
         let mut current = self
             .pm
             .next_funder()
@@ -313,7 +506,7 @@ impl Engine {
             .ok_or_else(|| Error::msg("no polymarket funder configured"))?;
         for _ in 0..3 {
             match self.pm.balance(&current).await {
-                Ok(bal) if bal >= required => return Ok(current),
+                Ok(bal) if bal >= required => return Ok((current, bal)),
                 Ok(bal) => {
                     tracing::warn!(funder = %current, %bal, %required, "polymarket balance low")
                 }
@@ -675,7 +868,7 @@ impl Engine {
                 self.submit_pm(leg_id, &funder, &req).await?;
                 return Ok(());
             }
-            let funder = self.select_funder(action.cap_price * action.shares).await?;
+            let (funder, _) = self.select_funder(action.cap_price * action.shares).await?;
             let req = MarketOrderRequest {
                 token_id: action.token_id.clone(),
                 shares: action.shares,
@@ -827,6 +1020,17 @@ impl Engine {
             }
         }
     }
+}
+
+const HTTP_BOOK_SKEW_MAX: Duration = Duration::from_secs(1);
+
+pub fn book_recv_skew(a: Instant, b: Instant) -> Duration {
+    a.saturating_duration_since(b)
+        .max(b.saturating_duration_since(a))
+}
+
+pub fn book_recv_skew_ok(a: Instant, b: Instant, max: Duration) -> bool {
+    book_recv_skew(a, b) <= max
 }
 
 async fn persist_submit(
@@ -1296,5 +1500,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cap_only.1.to_string(), "0.60");
+    }
+
+    #[test]
+    fn book_recv_skew_allows_exact_one_second() {
+        let a = Instant::now();
+        let b = a + Duration::from_secs(1);
+        assert!(book_recv_skew_ok(a, b, HTTP_BOOK_SKEW_MAX));
+        assert!(book_recv_skew_ok(b, a, HTTP_BOOK_SKEW_MAX));
+    }
+
+    #[test]
+    fn book_recv_skew_rejects_over_one_second() {
+        let a = Instant::now();
+        let b = a + Duration::from_secs(1) + Duration::from_millis(1);
+        assert!(!book_recv_skew_ok(a, b, HTTP_BOOK_SKEW_MAX));
+        assert!(!book_recv_skew_ok(b, a, HTTP_BOOK_SKEW_MAX));
     }
 }

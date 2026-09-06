@@ -142,6 +142,27 @@ pub fn plan_arbitrage(
     )
 }
 
+/// 用 HTTP 盘口按原 `ArbPlan` 的同一对 token 再算一次，不换互补方向。
+pub fn confirm_plan(
+    topic: &Topic,
+    plan: &ArbPlan,
+    pm_book: &OrderBook,
+    out_book: &OrderBook,
+    fees: &FeeContext,
+    limits: &ArbLimits,
+) -> Option<ArbPlan> {
+    let pm_token = topic.token(POLYMARKET, &plan.pm.label)?;
+    let out_token = topic.token(OUTCOME, &plan.outcome.label)?;
+    if pm_token.token_id != plan.pm.token_id
+        || out_token.token_id != plan.outcome.token_id
+        || pm_book.token_id != plan.pm.token_id
+        || out_book.token_id != plan.outcome.token_id
+    {
+        return None;
+    }
+    plan_arbitrage(topic, pm_book, out_book, pm_token, out_token, fees, limits)
+}
+
 fn search_pair(
     pm_token: &TokenRef,
     out_token: &TokenRef,
@@ -906,5 +927,52 @@ mod tests {
             align_polymarket_sell_price(d("0.456"), d("0.01")),
             d("0.45")
         );
+    }
+
+    #[test]
+    fn confirm_plan_rejects_when_http_books_no_longer_arb() {
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+        snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+        let first = plan_with(&books, now, &limits("3", "100"));
+        let mut http = BookStore::default();
+        snapshot(&mut http, POLYMARKET, "pm-yes", vec![("0.55", "50")], now);
+        snapshot(&mut http, OUTCOME, "#10", vec![("0.55", "50")], now);
+        assert!(confirm_plan(
+            &sample_topic(),
+            &first,
+            http.get(POLYMARKET, "pm-yes").unwrap(),
+            http.get(OUTCOME, "#10").unwrap(),
+            &fees_zero(),
+            &limits("3", "100"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn confirm_plan_keeps_pair_when_http_still_arb() {
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+        snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+        let first = plan_with(&books, now, &limits("3", "100"));
+        let mut http = BookStore::default();
+        snapshot(&mut http, POLYMARKET, "pm-yes", vec![("0.42", "40")], now);
+        snapshot(&mut http, OUTCOME, "#10", vec![("0.42", "40")], now);
+        let confirmed = confirm_plan(
+            &sample_topic(),
+            &first,
+            http.get(POLYMARKET, "pm-yes").unwrap(),
+            http.get(OUTCOME, "#10").unwrap(),
+            &fees_zero(),
+            &limits("3", "100"),
+        )
+        .expect("still arb");
+        assert_eq!(confirmed.pm.label, first.pm.label);
+        assert_eq!(confirmed.outcome.label, first.outcome.label);
+        assert_eq!(confirmed.pm.token_id, first.pm.token_id);
+        assert_eq!(confirmed.outcome.token_id, first.outcome.token_id);
+        assert_ne!(confirmed.pm.cap_price, first.pm.cap_price);
     }
 }
