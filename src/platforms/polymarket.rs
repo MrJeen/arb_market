@@ -395,26 +395,7 @@ impl PolymarketVenue {
             neg_risk,
             &order_hash,
         );
-        let payload = json!({
-            "deferExec": false,
-            "order": {
-                "builder": format!("{:#x}", signed.builder),
-                "expiration": signed.expiration.to_string(),
-                "maker": format!("{:#x}", signed.maker),
-                "makerAmount": signed.maker_amount.to_string(),
-                "metadata": format!("{:#x}", signed.metadata),
-                "salt": signed.salt.to_string(),
-                "side": signed.side,
-                "signature": signed.signature,
-                "signatureType": signed.signature_type,
-                "signer": format!("{:#x}", signed.signer),
-                "takerAmount": signed.taker_amount.to_string(),
-                "timestamp": signed.timestamp.to_string(),
-                "tokenId": signed.token_id
-            },
-            "orderType": "FAK",
-            "owner": account.api_key
-        });
+        let payload = order_submit_payload(&signed, &account.api_key);
         Ok(PreparedOrder {
             order_hash,
             envelope,
@@ -716,6 +697,30 @@ fn build_unsigned_order(
         timestamp: unix_millis(),
         token_id: req.token_id.clone(),
         post_only: false,
+    })
+}
+
+/// CLOB V2 要求 `salt` 为 JSON number，其余金额/时间字段为十进制字符串。
+fn order_submit_payload(signed: &SignedOrder, owner: &str) -> Value {
+    json!({
+        "deferExec": false,
+        "order": {
+            "builder": format!("{:#x}", signed.builder),
+            "expiration": signed.expiration.to_string(),
+            "maker": format!("{:#x}", signed.maker),
+            "makerAmount": signed.maker_amount.to_string(),
+            "metadata": format!("{:#x}", signed.metadata),
+            "salt": signed.salt,
+            "side": signed.side,
+            "signature": signed.signature,
+            "signatureType": signed.signature_type,
+            "signer": format!("{:#x}", signed.signer),
+            "takerAmount": signed.taker_amount.to_string(),
+            "timestamp": signed.timestamp.to_string(),
+            "tokenId": signed.token_id
+        },
+        "orderType": "FAK",
+        "owner": owner
     })
 }
 
@@ -1232,6 +1237,38 @@ fn redact_http(text: &str) -> String {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn order_submit_payload_matches_clob_v2_wire_types() {
+        let signed = SignedOrder {
+            builder: B256::ZERO,
+            expiration: 0,
+            maker: Address::ZERO,
+            maker_amount: 132_0000,
+            metadata: B256::ZERO,
+            order_type: "FAK".into(),
+            salt: 479_249_096_354,
+            side: "BUY".into(),
+            signature: "0xabc".into(),
+            signature_type: 2,
+            signer: Address::ZERO,
+            taker_amount: 3_000_000,
+            timestamp: 1_780_000_000_000,
+            token_id: "1".into(),
+            post_only: false,
+        };
+        let payload = order_submit_payload(&signed, "api-key");
+        let order = payload.get("order").expect("order");
+        assert!(order.get("salt").unwrap().is_number());
+        assert_eq!(order.get("salt").unwrap().as_u64(), Some(479_249_096_354));
+        assert!(order.get("expiration").unwrap().is_string());
+        assert!(order.get("makerAmount").unwrap().is_string());
+        assert!(order.get("takerAmount").unwrap().is_string());
+        assert!(order.get("timestamp").unwrap().is_string());
+        assert!(order.get("signatureType").unwrap().is_number());
+        assert_eq!(order.get("side").and_then(|v| v.as_str()), Some("BUY"));
+        assert_eq!(order.get("signatureType").and_then(|v| v.as_u64()), Some(2));
+    }
 
     #[test]
     fn parses_fak_unfilled() {
