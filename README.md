@@ -33,16 +33,16 @@ cargo run --release
 【本机】只测 Polymarket / Outcome 买卖下单接口：走现有签名和提交路径，不连 Postgres、不订盘口、不轮询成交。默认只签名不发单；加 `--confirm`（或 `PLACE_TEST_CONFIRM=1`）才打到主网。
 
 ```bash
-# 先 dry-run 看签名是否正常
+# 先 dry-run 看签名是否正常（两平台都行，不加 --confirm 即 dry-run）
 cargo run --bin place-test -- --platform polymarket --side buy \
   --token <pm_token_id> --shares 5 --price 0.40
+
+cargo run --bin place-test -- --platform outcome --side buy \
+  --token '#5160' --shares 5 --price 0.40
 
 # 真实提交
 cargo run --bin place-test -- --platform polymarket --side sell \
   --token <pm_token_id> --shares 5 --price 0.40 --confirm
-
-cargo run --bin place-test -- --platform outcome --side buy \
-  --token '#5160' --shares 5 --price 0.40 --confirm
 
 cargo run --bin place-test -- --platform outcome --side sell \
   --token '#5160' --shares 5 --price 0.40 --confirm
