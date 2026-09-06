@@ -36,6 +36,8 @@ pub struct Config {
     pub pending_leg_timeout: Duration,
     pub unknown_leg_timeout: Duration,
     pub max_active_orders: usize,
+    /// 累计实际亏损达到该值后停止新套利；0 表示不启用。
+    pub max_realized_loss: Decimal,
     pub polymarket_clob_url: String,
     pub polymarket_ws_url: String,
     pub polymarket_funders: Vec<PolymarketFunderConfig>,
@@ -90,6 +92,7 @@ impl Config {
             pending_leg_timeout: Duration::from_secs(env_u64("PENDING_LEG_TIMEOUT_SECS", 300)),
             unknown_leg_timeout: Duration::from_secs(env_u64("UNKNOWN_LEG_TIMEOUT_SECS", 300)),
             max_active_orders: env_u64("MAX_ACTIVE_ORDERS", 20) as usize,
+            max_realized_loss: env_decimal("MAX_REALIZED_LOSS", "0")?,
             polymarket_clob_url: env_or("POLYMARKET_CLOB_URL", "https://clob.polymarket.com"),
             polymarket_ws_url: env_or(
                 "POLYMARKET_WS_URL",

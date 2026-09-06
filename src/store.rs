@@ -434,11 +434,19 @@ impl Store {
 
     pub async fn count_active_orders(&self) -> Result<i64> {
         let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM arb_orders WHERE status IN ('pending','actived')",
+            "SELECT COUNT(*) FROM arb_orders
+             WHERE status IN ('pending','actived','completed')",
         )
         .fetch_one(&self.pool)
         .await?;
         Ok(count)
+    }
+
+    pub async fn sum_actual_profit(&self) -> Result<Decimal> {
+        let profit: Option<Decimal> = sqlx::query_scalar("SELECT SUM(actual_profit) FROM arb_orders")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(profit.unwrap_or(Decimal::ZERO))
     }
 
     pub async fn count_stale_unknown_legs(&self, timeout: Duration) -> Result<i64> {

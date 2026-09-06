@@ -80,6 +80,30 @@ impl Engine {
         result
     }
 
+    async fn block_new_arb(&self, topic: &str) -> Result<bool> {
+        if self.store.count_active_orders().await? >= self.cfg.max_active_orders as i64 {
+            tracing::warn!(
+                topic,
+                limit = self.cfg.max_active_orders,
+                "max orders reached"
+            );
+            return Ok(true);
+        }
+        if self.cfg.max_realized_loss > Decimal::ZERO {
+            let pnl = self.store.sum_actual_profit().await?;
+            if pnl < Decimal::ZERO && -pnl >= self.cfg.max_realized_loss {
+                tracing::warn!(
+                    topic,
+                    loss = %(-pnl),
+                    limit = %self.cfg.max_realized_loss,
+                    "max realized loss reached"
+                );
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn fee_context(&self, topic: &Topic) -> FeeContext {
         let rate = topic
             .polymarket_fee_rate()
@@ -111,11 +135,7 @@ impl Engine {
             tracing::error!("stale unknown legs present; skip new arb");
             return Ok(());
         }
-        if self.store.count_active_orders().await? >= self.cfg.max_active_orders as i64 {
-            tracing::warn!(
-                limit = self.cfg.max_active_orders,
-                "max active orders reached"
-            );
+        if self.block_new_arb(&topic_key.as_str()).await? {
             return Ok(());
         }
         self.ensure_topic_pm_ticks(&topic).await;
@@ -220,12 +240,7 @@ impl Engine {
             );
             return Ok(());
         }
-        if self.store.count_active_orders().await? >= self.cfg.max_active_orders as i64 {
-            tracing::warn!(
-                topic = %topic.key.as_str(),
-                limit = self.cfg.max_active_orders,
-                "max active orders reached after confirm"
-            );
+        if self.block_new_arb(&topic.key.as_str()).await? {
             return Ok(());
         }
 
