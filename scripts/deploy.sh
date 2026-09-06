@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 本机交叉编译后 scp 到服务器并重启 systemd。
-# 默认 DEPLOY_HOST=arb，二进制装到 /var/www/arb_market/dist/market-arb
+# 本机交叉编译后 scp 为 market-arb.new，再远程 restart.sh 安装并重启。
+# 默认 DEPLOY_HOST=arb
 # 可选: DEPLOY_PATH  SERVICE_USER  SKIP_BUILD=1
 set -euo pipefail
 
@@ -9,9 +9,9 @@ cd "$ROOT"
 
 DEPLOY_HOST="${DEPLOY_HOST:-arb}"
 DEPLOY_PATH="${DEPLOY_PATH:-/var/www/arb_market/dist}"
-SERVICE_USER="${SERVICE_USER:-market-arb}"
 BIN_LOCAL="$ROOT/dist/market-arb"
-REMOTE_TMP="/tmp/market-arb.new"
+REMOTE_NEW="$DEPLOY_PATH/market-arb.new"
+REMOTE_RESTART="${DEPLOY_RESTART:-/var/www/arb_market/scripts/restart.sh}"
 
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
   "$ROOT/scripts/build-linux.sh"
@@ -21,5 +21,6 @@ if [[ ! -f "$BIN_LOCAL" ]]; then
   exit 1
 fi
 
-scp "$BIN_LOCAL" "$DEPLOY_HOST:$REMOTE_TMP"
-ssh -t "$DEPLOY_HOST" "sudo install -d -m 0755 '$DEPLOY_PATH' && sudo install -m 0755 -o '$SERVICE_USER' -g '$SERVICE_USER' '$REMOTE_TMP' '$DEPLOY_PATH/market-arb' && rm -f '$REMOTE_TMP' && sudo systemctl restart market-arb && sudo systemctl --no-pager --full status market-arb"
+ssh "$DEPLOY_HOST" "mkdir -p '$DEPLOY_PATH'"
+scp "$BIN_LOCAL" "$DEPLOY_HOST:$REMOTE_NEW"
+ssh -t "$DEPLOY_HOST" "sudo '$REMOTE_RESTART'"

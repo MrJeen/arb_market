@@ -88,7 +88,7 @@ git clone <仓库地址> /var/www/arb_market
 ```bash
 ./scripts/build-linux.sh
 ssh arb 'mkdir -p /var/www/arb_market/dist'
-scp dist/market-arb arb:/var/www/arb_market/dist/market-arb
+scp dist/market-arb arb:/var/www/arb_market/dist/market-arb.new
 ```
 
 【服务器】安装 systemd 并启动（先 `ssh arb`）：
@@ -98,7 +98,7 @@ cd /var/www/arb_market
 sudo ./scripts/install-systemd.sh
 sudo nano /var/www/arb_market/.env    # 填密钥；已 gitignore，不要提交
 sudo nano /var/www/arb_market/polymarket_funders.json
-sudo systemctl start market-arb
+sudo ./scripts/start.sh
 ```
 
 工作目录、`.env`、账户 JSON、二进制都在 `/var/www/arb_market`（二进制在 `dist/`，已 gitignore）。`git pull` 不会覆盖它们。
@@ -111,7 +111,7 @@ sudo systemctl start market-arb
 
 ```bash
 ./scripts/build-linux.sh
-scp dist/market-arb arb:/var/www/arb_market/dist/market-arb
+scp dist/market-arb arb:/var/www/arb_market/dist/market-arb.new
 ```
 
 【服务器】（先 `ssh arb`）
@@ -119,8 +119,7 @@ scp dist/market-arb arb:/var/www/arb_market/dist/market-arb
 ```bash
 cd /var/www/arb_market
 git pull
-sudo ./scripts/install-systemd.sh
-sudo systemctl restart market-arb
+sudo ./scripts/restart.sh
 ```
 
 只更新二进制、unit 没变时，不必在服务器 `git pull`。【本机】一条命令即可（会编译、scp、远程 restart）：
@@ -137,7 +136,7 @@ SKIP_BUILD=1 ./scripts/deploy.sh
 
 `SKIP_BUILD=1` 也是在本机执行，只是跳过编译。
 
-`deploy.sh`：本机交叉编译 → 本机 `scp` 到 `/tmp` → 远程安装到 `/var/www/arb_market/dist/market-arb` → 远程 `systemctl restart`。
+`deploy.sh`：本机交叉编译 → `scp` 为 `/var/www/arb_market/dist/market-arb.new` → 远程 `restart.sh` 停服务、装正式二进制、再启动。
 
 【本机】更新生产 `.env` 或账户 JSON 后必须重启：
 
@@ -155,17 +154,17 @@ DEPLOY_HOST=arb DEPLOY_PATH=/var/www/arb_market/dist SERVICE_USER=market-arb ./s
 
 ## 服务器命令
 
-先 `ssh arb` 登录后再执行。代码更新用 `restart`，不要只用 `start`（进程已在跑时 `start` 不会换成新二进制）。
+先 `ssh arb` 登录后再执行。换二进制用 `restart.sh`（会先停再拷 `market-arb.new`）；已在跑时不要只用 `start.sh`。
 
-| 动作 | 命令                                |
-| ---- | ----------------------------------- |
-| 启动 | `sudo systemctl start market-arb`   |
-| 重启 | `sudo systemctl restart market-arb` |
-| 停止 | `sudo systemctl stop market-arb`    |
-| 状态 | `sudo systemctl status market-arb`  |
-| 日志 | `sudo journalctl -u market-arb -f`  |
+| 动作 | 命令                               |
+| ---- | ---------------------------------- |
+| 启动 | `sudo ./scripts/start.sh`          |
+| 重启 | `sudo ./scripts/restart.sh`        |
+| 停止 | `sudo ./scripts/stop.sh`           |
+| 日志 | `sudo ./scripts/log.sh`            |
+| 状态 | `sudo systemctl status market-arb` |
 
-`restart` 先发 SIGTERM，进程退出后再拉起新二进制。
+`restart.sh` 先停进程，把 `dist/market-arb.new` 装到 `dist/market-arb`，再启动。没有 `.new` 时沿用已有正式二进制。
 
 ## 查看日志
 
@@ -189,11 +188,12 @@ less /tmp/market-arb.log
 
 ## 相关文件
 
-| 路径                              | 说明                                                |
-| --------------------------------- | --------------------------------------------------- |
-| `scripts/build-linux.sh`          | 【本机】交叉编译                                    |
-| `scripts/deploy.sh`               | 【本机】编译、scp、远程重启                         |
-| `scripts/install-systemd.sh`      | 【服务器】首次安装 systemd                          |
-| `deploy/market-arb.service`       | systemd unit                                        |
-| `.env.example`                    | 环境变量模板                                        |
-| `polymarket_funders.json.example` | Polymarket 多账户 JSON 模板（真实文件已 gitignore） |
+| 路径                                                     | 说明                                                   |
+| -------------------------------------------------------- | ------------------------------------------------------ |
+| `scripts/build-linux.sh`                                 | 【本机】交叉编译                                       |
+| `scripts/deploy.sh`                                      | 【本机】编译、scp 为 `market-arb.new`、远程 restart.sh |
+| `scripts/start.sh` / `restart.sh` / `stop.sh` / `log.sh` | 【服务器】启停与日志；启停时安装 `.new`                |
+| `scripts/install-systemd.sh`                             | 【服务器】首次安装 systemd                             |
+| `deploy/market-arb.service`                              | systemd unit                                           |
+| `.env.example`                                           | 环境变量模板                                           |
+| `polymarket_funders.json.example`                        | Polymarket 多账户 JSON 模板（真实文件已 gitignore）    |

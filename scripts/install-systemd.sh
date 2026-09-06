@@ -18,7 +18,7 @@ BIN_DST="$INSTALL_DIR/dist/market-arb"
 
 if [[ ! -f "$BIN_SRC" ]]; then
   echo "找不到二进制: $BIN_SRC" >&2
-  echo "先在开发机运行 scripts/build-linux.sh，再 scp 到 $INSTALL_DIR/dist/market-arb。" >&2
+  echo "先在开发机运行 scripts/build-linux.sh，再 scp 到 $INSTALL_DIR/dist/market-arb.new。" >&2
   exit 1
 fi
 if [[ ! -f "$UNIT_SRC" ]]; then
@@ -67,6 +67,5 @@ chmod 644 "$UNIT_DST"
 systemctl daemon-reload
 systemctl enable market-arb.service
 echo "已安装。编辑 $INSTALL_DIR/.env 后执行:"
-echo "  sudo systemctl start market-arb"
-echo "  sudo systemctl status market-arb"
-echo "  sudo journalctl -u market-arb -f"
+echo "  sudo $ROOT/scripts/start.sh"
+echo "  sudo $ROOT/scripts/log.sh"
