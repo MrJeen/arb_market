@@ -160,24 +160,11 @@ impl OutcomeVenue {
             .await
         {
             Ok(resp) => {
-                let status = resp.status();
+                let status = resp.status().as_u16();
                 let body: Value = resp.json().await.unwrap_or(json!({}));
-                if !status.is_success() {
-                    return Ok(SubmitResult::Unknown {
-                        order_id: None,
-                        order_hash: hash,
-                        envelope,
-                        message: body.to_string().chars().take(300).collect(),
-                    });
-                }
-                Ok(parse_exchange_submit(&body, hash, envelope, &cloid))
+                Ok(classify_http_submit(status, &body, hash, envelope, &cloid))
             }
-            Err(err) => Ok(SubmitResult::Unknown {
-                order_id: None,
-                order_hash: hash,
-                envelope,
-                message: err.to_string(),
-            }),
+            Err(err) => Ok(classify_submit_transport_error(err, hash, envelope)),
         }
     }
 
@@ -283,6 +270,37 @@ pub fn is_explicit_order_reject(message: &str) -> bool {
         || m.contains("minimum value")
         || m.contains("divisible by tick")
         || m.contains("tick size")
+}
+
+pub fn classify_http_submit(
+    status: u16,
+    body: &Value,
+    hash: String,
+    envelope: Value,
+    cloid: &str,
+) -> SubmitResult {
+    if status >= 400 {
+        return SubmitResult::Failed {
+            order_hash: hash,
+            envelope,
+            status,
+            message: body.to_string().chars().take(300).collect(),
+        };
+    }
+    parse_exchange_submit(body, hash, envelope, cloid)
+}
+
+pub fn classify_submit_transport_error(
+    err: impl std::fmt::Display,
+    hash: String,
+    envelope: Value,
+) -> SubmitResult {
+    SubmitResult::Unknown {
+        order_id: None,
+        order_hash: hash,
+        envelope,
+        message: err.to_string(),
+    }
 }
 
 pub fn parse_exchange_submit(
@@ -674,6 +692,40 @@ mod tests {
         assert!(matches!(
             parse_exchange_submit(&ok_empty, "0x1".into(), json!({}), "cloid"),
             SubmitResult::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn http_400_and_500_are_failed() {
+        let body = json!({"error": "unauthorized"});
+        match classify_http_submit(400, &body, "0x1".into(), json!({}), "cloid") {
+            SubmitResult::Failed { status, .. } => assert_eq!(status, 400),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        match classify_http_submit(500, &body, "0x1".into(), json!({}), "cloid") {
+            SubmitResult::Failed { status, .. } => assert_eq!(status, 500),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transport_error_is_unknown() {
+        match classify_submit_transport_error("connection timed out", "0x1".into(), json!({})) {
+            SubmitResult::Unknown { message, .. } => {
+                assert!(message.contains("timed out"));
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_200_ioc_error_stays_no_match() {
+        let body = exchange_ok(json!({
+            "error": "Order could not immediately match against any resting orders."
+        }));
+        assert!(matches!(
+            classify_http_submit(200, &body, "0x1".into(), json!({}), "cloid"),
+            SubmitResult::NoMatch { .. }
         ));
     }
 }

@@ -48,19 +48,6 @@ pub struct ClosedLegRef {
     pub platform: String,
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct UnsentEnvelopeRow {
-    pub id: i64,
-    pub order_id: i64,
-    pub platform: String,
-    pub side: String,
-    pub funder_address: Option<String>,
-    pub client_order_id: Option<String>,
-    pub req_price: Option<Decimal>,
-    pub order_hash: String,
-    pub payload: Value,
-}
-
 impl Store {
     pub async fn connect(uri: &str) -> Result<Self> {
         let pool = PgPoolOptions::new().max_connections(8).connect(uri).await?;
@@ -181,7 +168,11 @@ impl Store {
             .get("cloid")
             .and_then(|v| v.as_str())
             .unwrap_or(order_hash);
-        sqlx::query("UPDATE legs SET client_order_id = $2, updated_at = NOW() WHERE id = $1")
+        sqlx::query(
+            "UPDATE legs SET client_order_id = $2, submitted_at = COALESCE(submitted_at, NOW()),
+                    updated_at = NOW()
+             WHERE id = $1",
+        )
             .bind(leg_id)
             .bind(client_id)
             .execute(&mut *tx)
@@ -315,7 +306,7 @@ impl Store {
         let rows: Vec<(String, String, String, Option<Decimal>)> = sqlx::query_as(
             "SELECT platform, label, side, actual_shares
              FROM legs
-             WHERE order_id = $1 AND status IN ('matched','completed','cancelled')",
+             WHERE order_id = $1 AND status IN ('matched','completed','cancelled','failed')",
         )
         .bind(order_id)
         .fetch_all(&self.pool)
@@ -441,28 +432,6 @@ impl Store {
         Ok(result.rows_affected())
     }
 
-    pub async fn stale_unsent_pending_envelopes(
-        &self,
-        timeout: Duration,
-    ) -> Result<Vec<UnsentEnvelopeRow>> {
-        let secs = timeout.as_secs() as i64;
-        let rows = sqlx::query_as::<_, UnsentEnvelopeRow>(
-            "SELECT DISTINCT ON (l.id)
-                    l.id, l.order_id, l.platform, l.side, l.funder_address,
-                    l.client_order_id, l.req_price, e.order_hash, e.payload
-             FROM legs l
-             JOIN signed_envelopes e ON e.leg_id = l.id
-             WHERE l.status = 'pending'
-               AND l.submitted_at IS NULL
-               AND l.created_at < NOW() - make_interval(secs => $1)
-             ORDER BY l.id, e.id DESC",
-        )
-        .bind(secs)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
-    }
-
     pub async fn count_active_orders(&self) -> Result<i64> {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM arb_orders WHERE status IN ('pending','actived')",
@@ -543,21 +512,26 @@ pub fn compute_actuals(
 ) -> (Decimal, Decimal, Decimal) {
     let mut cost = Decimal::ZERO;
     let mut rev = Decimal::ZERO;
-    let mut buy_pm = Decimal::ZERO;
-    let mut buy_out = Decimal::ZERO;
+    let mut net_pm = Decimal::ZERO;
+    let mut net_out = Decimal::ZERO;
     for (side, platform, shares, price, fee) in rows {
         if side.eq_ignore_ascii_case("SELL") {
             rev += *shares * *price - *fee;
+            if platform == POLYMARKET {
+                net_pm -= *shares;
+            } else if platform == OUTCOME {
+                net_out -= *shares;
+            }
         } else {
             cost += *shares * *price + *fee;
             if platform == POLYMARKET {
-                buy_pm += *shares;
+                net_pm += *shares;
             } else if platform == OUTCOME {
-                buy_out += *shares;
+                net_out += *shares;
             }
         }
     }
-    let locked = buy_pm.min(buy_out);
+    let locked = net_pm.max(Decimal::ZERO).min(net_out.max(Decimal::ZERO));
     rev += locked;
     (cost, rev, rev - cost)
 }
@@ -586,5 +560,18 @@ mod tests {
         assert_eq!(cost.to_string(), "8.1");
         assert_eq!(rev.to_string(), "9.2");
         assert_eq!(profit.to_string(), "1.1");
+    }
+
+    #[test]
+    fn actuals_sell_reduces_locked_shares() {
+        let rows = vec![
+            ("BUY".into(), POLYMARKET.into(), d("100"), d("0.4"), d("0")),
+            ("BUY".into(), OUTCOME.into(), d("100"), d("0.5"), d("0")),
+            ("SELL".into(), POLYMARKET.into(), d("50"), d("0.4"), d("0")),
+        ];
+        let (cost, rev, profit) = compute_actuals(&rows);
+        assert_eq!(cost, d("90"));
+        assert_eq!(rev, d("70"));
+        assert_eq!(profit, d("-20"));
     }
 }

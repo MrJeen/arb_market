@@ -43,8 +43,9 @@ pub fn position_diffs(positions: &Positions, labels: &[String]) -> Option<(Decim
     if labels.len() != 2 {
         return None;
     }
-    let pm = positions.get(POLYMARKET)?;
-    let out = positions.get(OUTCOME)?;
+    let empty = HashMap::new();
+    let pm = positions.get(POLYMARKET).unwrap_or(&empty);
+    let out = positions.get(OUTCOME).unwrap_or(&empty);
     let l1 = &labels[0];
     let l2 = &labels[1];
     let diff1 = *pm.get(l1).unwrap_or(&Decimal::ZERO) - *out.get(l2).unwrap_or(&Decimal::ZERO);
@@ -52,7 +53,7 @@ pub fn position_diffs(positions: &Positions, labels: &[String]) -> Option<(Decim
     Some((diff1, diff2))
 }
 
-/// `None` 表示持仓不完整，不能当成已平衡。
+/// `None` 仅表示标签不是二元市场，不能计算差额。缺平台视为 0 持仓。
 pub fn needs_rebalance(positions: &Positions, labels: &[String], min_qty: Decimal) -> Option<bool> {
     let (d1, d2) = position_diffs(positions, labels)?;
     Some(d1.abs() > min_qty || d2.abs() > min_qty)
@@ -176,6 +177,18 @@ fn eval_sell(
     }
     let fee = estimate_taker_fee(platform, qty, depth.avg, fees);
     let revenue = depth.avg * qty - fee;
+    if platform == OUTCOME {
+        let trade_cost = depth.worst * qty;
+        if trade_cost < min_trade_cost(platform) || qty < min_trade_amount(platform) {
+            tracing::warn!(
+                platform,
+                %qty,
+                %trade_cost,
+                "outcome sell below min notional, skip"
+            );
+            return None;
+        }
+    }
     Some(Candidate {
         action: HedgeAction {
             platform: platform.into(),
@@ -494,14 +507,41 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_positions_are_not_balanced() {
-        let mut positions = Positions::new();
-        positions.insert(POLYMARKET.into(), HashMap::from([("yes".into(), d("10"))]));
-        assert!(needs_rebalance(&positions, &["no".into(), "yes".into()], d("1.5")).is_none());
+    fn skips_outcome_sell_below_min_notional() {
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        books.replace_snapshot(
+            OUTCOME,
+            "#10",
+            vec![Level {
+                price: d("0.50"),
+                size: d("10"),
+            }],
+            vec![],
+            1,
+            now,
+        );
+        let actions = plan(&books, &HashMap::new(), now, "6", "10");
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn missing_platform_counts_as_zero_and_both_zero_skips() {
+        let mut only_pm = Positions::new();
+        only_pm.insert(POLYMARKET.into(), HashMap::from([("yes".into(), d("10"))]));
+        assert_eq!(
+            needs_rebalance(&only_pm, &["yes".into(), "no".into()], d("1.5")),
+            Some(true)
+        );
+        assert_eq!(
+            needs_rebalance(&Positions::new(), &["yes".into(), "no".into()], d("1.5")),
+            Some(false)
+        );
+        assert!(needs_rebalance(&only_pm, &["yes".into()], d("1.5")).is_none());
         assert_eq!(
             needs_rebalance(
                 &imbalanced_positions("10", "10"),
-                &["no".into(), "yes".into()],
+                &["yes".into(), "no".into()],
                 d("1.5")
             ),
             Some(false)
@@ -509,10 +549,55 @@ mod tests {
         assert_eq!(
             needs_rebalance(
                 &imbalanced_positions("31", "6"),
-                &["no".into(), "yes".into()],
+                &["yes".into(), "no".into()],
                 d("1.5")
             ),
             Some(true)
         );
+    }
+
+    #[test]
+    fn plans_hedge_when_one_leg_failed_as_zero() {
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        books.replace_snapshot(
+            POLYMARKET,
+            "pm-yes",
+            vec![Level {
+                price: d("0.50"),
+                size: d("100"),
+            }],
+            vec![],
+            1,
+            now,
+        );
+        books.set_tick_size(POLYMARKET, "pm-yes", d("0.01"));
+        let mut failed_other = Positions::new();
+        failed_other.insert(
+            POLYMARKET.into(),
+            HashMap::from([("yes".into(), d("100")), ("no".into(), d("0"))]),
+        );
+        failed_other.insert(
+            OUTCOME.into(),
+            HashMap::from([("no".into(), d("0")), ("yes".into(), d("0"))]),
+        );
+        assert_eq!(
+            needs_rebalance(&failed_other, &["yes".into(), "no".into()], d("1.5")),
+            Some(true)
+        );
+        let actions = plan_hedge(
+            &topic(),
+            &failed_other,
+            &books,
+            &HashMap::new(),
+            &fees(),
+            d("1.5"),
+            now,
+            Duration::from_secs(5),
+        );
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].platform, POLYMARKET);
+        assert_eq!(actions[0].side, HedgeSide::Sell);
+        assert_eq!(actions[0].shares, floor_shares(d("100")));
     }
 }

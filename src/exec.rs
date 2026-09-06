@@ -9,8 +9,7 @@ use crate::notify::{self, NatsNotifier, PlaceNotice, PlaceResult};
 use crate::platforms::outcome::OutcomeVenue;
 use crate::platforms::polymarket::PolymarketVenue;
 use crate::platforms::{
-    ioc_fill, pm_fak_fill, MarketOrderRequest, OrderPoll, OrderSide, PreparedOrder, SubmitResult,
-    TradeFill,
+    ioc_fill, pm_fak_fill, MarketOrderRequest, OrderPoll, OrderSide, SubmitResult, TradeFill,
 };
 use crate::store::Store;
 use rust_decimal::Decimal;
@@ -376,31 +375,6 @@ impl Engine {
                 "pending legs with submit timestamp marked unknown"
             );
         }
-        let unsent = self
-            .store
-            .stale_unsent_pending_envelopes(self.cfg.pending_leg_timeout)
-            .await?;
-        for row in unsent {
-            if let Err(err) = self.replay_unsent_leg(&row).await {
-                tracing::error!(
-                    leg_id = row.id,
-                    error = %err,
-                    "unsent envelope replay failed"
-                );
-                let _ = self
-                    .store
-                    .update_leg_fill(
-                        row.id,
-                        "failed",
-                        None,
-                        Decimal::ZERO,
-                        Decimal::ZERO,
-                        Decimal::ZERO,
-                        &json!({"reason": "envelope_replay_failed", "error": err.to_string()}),
-                    )
-                    .await;
-            }
-        }
         let timed_out = self
             .store
             .cancel_stale_unknown_without_fills(self.cfg.unknown_leg_timeout)
@@ -509,31 +483,6 @@ impl Engine {
             }
             None => Ok(()),
         }
-    }
-
-    async fn replay_unsent_leg(&self, row: &crate::store::UnsentEnvelopeRow) -> Result<()> {
-        let envelope = json!({
-            "cloid": row.client_order_id,
-            "price": row.req_price.map(|p| p.to_string()),
-            "order_hash": row.order_hash,
-        });
-        let prepared = PreparedOrder {
-            order_hash: row.order_hash.clone(),
-            envelope,
-            payload: row.payload.clone(),
-            funder: row.funder_address.clone(),
-        };
-        let side = if row.side.eq_ignore_ascii_case("SELL") {
-            OrderSide::Sell
-        } else {
-            OrderSide::Buy
-        };
-        let result = if row.platform == POLYMARKET {
-            self.pm.post_prepared(&prepared).await?
-        } else {
-            self.outcome.post_prepared(prepared).await?
-        };
-        persist_submit(&self.store, row.id, &row.platform, side, &result).await
     }
 
     pub async fn hedge_once(&self) -> Result<()> {
@@ -895,6 +844,29 @@ async fn persist_submit(
                 )
                 .await?;
         }
+        SubmitResult::Failed {
+            envelope,
+            status,
+            message,
+            ..
+        } => {
+            store
+                .update_leg_fill(
+                    leg_id,
+                    "failed",
+                    None,
+                    Decimal::ZERO,
+                    Decimal::ZERO,
+                    Decimal::ZERO,
+                    &json!({
+                        "reason": "http_status",
+                        "status": status,
+                        "message": message,
+                        "envelope": envelope
+                    }),
+                )
+                .await?;
+        }
     }
     Ok(())
 }
@@ -930,6 +902,9 @@ fn place_result(
         Ok(SubmitResult::NoMatch { message, .. }) | Ok(SubmitResult::Unknown { message, .. }) => {
             Some(message)
         }
+        Ok(SubmitResult::Failed {
+            status, message, ..
+        }) => Some(format!("HTTP {status} {message}")),
         Err(err) => Some(format_place_error(&err)),
     };
     PlaceResult {

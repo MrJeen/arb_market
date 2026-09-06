@@ -61,6 +61,12 @@ pub enum SubmitResult {
         envelope: Value,
         message: String,
     },
+    Failed {
+        order_hash: String,
+        envelope: Value,
+        status: u16,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone)]

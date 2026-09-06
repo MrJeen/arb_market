@@ -353,28 +353,7 @@ impl PolymarketVenue {
             .await
         {
             Ok(body) => Ok(parse_submit(&body, order_hash, envelope)),
-            Err(Error::Http { status, message }) if status >= 400 && status < 500 => {
-                if message.contains("FAK") || message.contains("no orders found") {
-                    Ok(SubmitResult::NoMatch {
-                        order_hash,
-                        envelope,
-                        message,
-                    })
-                } else {
-                    Ok(SubmitResult::Unknown {
-                        order_id: None,
-                        order_hash,
-                        envelope,
-                        message,
-                    })
-                }
-            }
-            Err(err) => Ok(SubmitResult::Unknown {
-                order_id: None,
-                order_hash,
-                envelope,
-                message: err.to_string(),
-            }),
+            Err(err) => Ok(classify_submit_error(&err, order_hash, envelope)),
         }
     }
 
@@ -616,6 +595,23 @@ fn signed_envelope(
             "post_only": false
         }
     })
+}
+
+pub fn classify_submit_error(err: &Error, order_hash: String, envelope: Value) -> SubmitResult {
+    match err {
+        Error::Http { status, message } if *status >= 400 => SubmitResult::Failed {
+            order_hash,
+            envelope,
+            status: *status,
+            message: message.clone(),
+        },
+        _ => SubmitResult::Unknown {
+            order_id: None,
+            order_hash,
+            envelope,
+            message: err.to_string(),
+        },
+    }
 }
 
 pub fn parse_submit(body: &Value, order_hash: String, envelope: Value) -> SubmitResult {
@@ -1082,6 +1078,35 @@ mod tests {
         match parse_submit(&body, "0x1".into(), json!({})) {
             SubmitResult::NoMatch { .. } => {}
             other => panic!("expected no match, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_400_fak_and_503_are_failed() {
+        let fak = Error::Http {
+            status: 400,
+            message: FAK_UNFILLED.into(),
+        };
+        match classify_submit_error(&fak, "0x1".into(), json!({})) {
+            SubmitResult::Failed { status, .. } => assert_eq!(status, 400),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let five = Error::Http {
+            status: 503,
+            message: "bad gateway".into(),
+        };
+        match classify_submit_error(&five, "0x1".into(), json!({})) {
+            SubmitResult::Failed { status, .. } => assert_eq!(status, 503),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transport_error_is_unknown() {
+        let err = Error::msg("connection reset");
+        match classify_submit_error(&err, "0x1".into(), json!({})) {
+            SubmitResult::Unknown { message, .. } => assert!(message.contains("connection reset")),
+            other => panic!("expected Unknown, got {other:?}"),
         }
     }
 
