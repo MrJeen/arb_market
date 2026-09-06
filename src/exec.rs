@@ -1,10 +1,12 @@
 use crate::book::{BookStore, DirtyCoalescer};
-use crate::calc::{best_plan, ArbLimits, ArbPlan, FeeContext};
+use crate::calc::{
+    below_venue_mins, best_plan, min_trade_amount, min_trade_cost, ArbLimits, ArbPlan, FeeContext,
+};
 use crate::config::{Config, OUTCOME, POLYMARKET};
 use crate::discovery::load_active_topics;
 use crate::domain::{Topic, TopicKey};
 use crate::error::{Error, Result};
-use crate::hedge::{needs_rebalance, plan_hedge, HedgeSide};
+use crate::hedge::{leftover_untradeable, needs_rebalance, plan_hedge, HedgeSide};
 use crate::notify::{self, NatsNotifier, PlaceNotice, PlaceResult};
 use crate::platforms::outcome::OutcomeVenue;
 use crate::platforms::polymarket::PolymarketVenue;
@@ -542,6 +544,25 @@ impl Engine {
                 )
             };
             if actions.is_empty() {
+                let untradeable = {
+                    let books = self.books.lock().await;
+                    leftover_untradeable(
+                        &topic,
+                        &positions,
+                        &books,
+                        self.cfg.min_rebalance_qty,
+                        Instant::now(),
+                        self.cfg.book_stale,
+                    )
+                };
+                if untradeable {
+                    tracing::info!(
+                        order_id = order.id,
+                        "hedge leftover below venue min, mark rebalance complete"
+                    );
+                    self.store.mark_rebalance(order.id, "completed").await?;
+                    let _ = self.store.refresh_order_actuals(order.id).await;
+                }
                 continue;
             }
             self.store.mark_rebalance(order.id, "actived").await?;
@@ -559,6 +580,23 @@ impl Engine {
             HedgeSide::Buy => OrderSide::Buy,
             HedgeSide::Sell => OrderSide::Sell,
         };
+        let buy = side == OrderSide::Buy;
+        if below_venue_mins(
+            &action.platform,
+            buy,
+            action.shares,
+            action.shares * action.cap_price,
+        ) {
+            return Err(Error::msg(format!(
+                "{} {} skipped, {} shares @ {} below min {} shares / {} notional",
+                action.platform,
+                side.as_str(),
+                action.shares,
+                action.cap_price,
+                min_trade_amount(&action.platform, buy),
+                min_trade_cost(&action.platform, buy)
+            )));
+        }
         if action.platform == POLYMARKET {
             if side == OrderSide::Sell {
                 let funder = self

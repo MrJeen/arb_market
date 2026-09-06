@@ -14,6 +14,7 @@
 //!   --shares 5 --price 0.40 --confirm
 //! ```
 
+use market_arb::book::Level;
 use market_arb::config::{Config, OUTCOME, POLYMARKET};
 use market_arb::domain::{parse_side_coin, side_asset_id};
 use market_arb::error::{Error, Result};
@@ -139,6 +140,13 @@ async fn run_job(
     if job.platform == POLYMARKET {
         let venue = pm.ok_or_else(|| Error::msg("polymarket venue not connected"))?;
         let funder = resolve_pm_funder(venue, args.funder.as_deref()).await?;
+        print_venue_book(
+            venue.rest_book(&job.token_id).await,
+            POLYMARKET,
+            job,
+            args.shares,
+            args.price,
+        );
         print_pm_balances(venue, &funder, &job.token_id, job.side).await;
         if args.dry_run {
             let prepared = venue.prepare_market_order(&funder, &req).await?;
@@ -157,6 +165,13 @@ async fn run_job(
         return Ok(());
     }
     let venue = outcome.ok_or_else(|| Error::msg("outcome venue not connected"))?;
+    print_venue_book(
+        venue.rest_book(&job.token_id).await,
+        OUTCOME,
+        job,
+        args.shares,
+        args.price,
+    );
     print_outcome_balances(venue, &job.token_id, job.side).await;
     if args.dry_run {
         let prepared = venue.prepare_market_order(&req)?;
@@ -186,6 +201,111 @@ async fn resolve_pm_funder(venue: &PolymarketVenue, requested: Option<&str>) -> 
         .next_funder()
         .await
         .ok_or_else(|| Error::msg("no polymarket funder configured"))
+}
+
+fn print_venue_book(
+    fetched: Result<(Vec<Level>, Vec<Level>, i64)>,
+    platform: &str,
+    job: &Job,
+    shares: Decimal,
+    cap: Decimal,
+) {
+    match fetched {
+        Ok((bids, asks, ts)) => print_book(platform, job, shares, cap, &bids, &asks, ts),
+        Err(err) => tracing::warn!(
+            platform,
+            token = %job.token_id,
+            error = %err,
+            "order book fetch failed"
+        ),
+    }
+}
+
+fn print_book(
+    platform: &str,
+    job: &Job,
+    shares: Decimal,
+    cap: Decimal,
+    bids: &[Level],
+    asks: &[Level],
+    ts: i64,
+) {
+    const DEPTH: usize = 5;
+    println!(
+        "BOOK {} {} token={} ts={}",
+        platform,
+        job.side.as_str(),
+        job.token_id,
+        ts
+    );
+    print_levels("  ask", asks.iter().take(DEPTH));
+    print_levels("  bid", bids.iter().take(DEPTH));
+    if asks.is_empty() && bids.is_empty() {
+        println!("  empty book");
+        return;
+    }
+    let best_ask = asks.first().map(|l| l.price);
+    let best_bid = bids.first().map(|l| l.price);
+    let mid = match (best_bid, best_ask) {
+        (Some(b), Some(a)) => Some((b + a) / Decimal::from(2)),
+        (Some(b), None) => Some(b),
+        (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
+    println!(
+        "  best_bid={} best_ask={} mid={} cap={}",
+        fmt_opt(best_bid),
+        fmt_opt(best_ask),
+        fmt_opt(mid),
+        cap
+    );
+    match job.side {
+        OrderSide::Buy => {
+            if let Some(ask) = best_ask {
+                if cap >= ask {
+                    println!("  cap >= best_ask, IOC buy can lift");
+                } else {
+                    println!("  cap < best_ask, IOC buy will not lift the ask");
+                }
+            }
+        }
+        OrderSide::Sell => {
+            if let Some(bid) = best_bid {
+                if cap <= bid {
+                    println!("  cap <= best_bid, IOC sell can hit");
+                } else {
+                    println!("  cap > best_bid, IOC sell will not hit the bid");
+                }
+            }
+        }
+    }
+    let cap_ntl = shares * cap;
+    let mid_ntl = mid.map(|m| shares * m);
+    let touch = match job.side {
+        OrderSide::Buy => best_ask,
+        OrderSide::Sell => best_bid,
+    };
+    let touch_ntl = touch.map(|p| shares * p);
+    println!(
+        "  notional shares={shares} cap={cap_ntl} mid={} touch={}",
+        fmt_opt(mid_ntl),
+        fmt_opt(touch_ntl)
+    );
+}
+
+fn print_levels<'a>(label: &str, levels: impl Iterator<Item = &'a Level>) {
+    let rows: Vec<String> = levels
+        .map(|l| format!("{} x {}", l.price, l.size))
+        .collect();
+    if rows.is_empty() {
+        println!("{label}: (none)");
+    } else {
+        println!("{label}: {}", rows.join(" | "));
+    }
+}
+
+fn fmt_opt(value: Option<Decimal>) -> String {
+    value.map(|v| v.to_string()).unwrap_or_else(|| "-".into())
 }
 
 async fn print_pm_balances(venue: &PolymarketVenue, funder: &str, token_id: &str, side: OrderSide) {

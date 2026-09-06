@@ -1,7 +1,6 @@
 use crate::book::{BookStore, Level};
 use crate::calc::{
-    align_hedge_price, estimate_taker_fee, floor_shares, min_trade_amount, min_trade_cost,
-    FeeContext,
+    align_hedge_price, below_venue_mins, estimate_taker_fee, floor_shares, FeeContext,
 };
 use crate::config::{OUTCOME, POLYMARKET};
 use crate::domain::Topic;
@@ -160,6 +159,72 @@ fn hedge_one(
     Some(best.action)
 }
 
+/// 差额超过股数门槛，但按现价两边都低于交易所最小名义/股数，无法再下对冲单。
+/// 盘口缺失或过期时返回 false，避免把暂时看不到的深度误标完成。
+pub fn leftover_untradeable(
+    topic: &Topic,
+    positions: &Positions,
+    books: &BookStore,
+    min_qty: Decimal,
+    now: Instant,
+    stale: Duration,
+) -> bool {
+    let labels = topic.labels();
+    let Some((diff1, diff2)) = position_diffs(positions, &labels) else {
+        return false;
+    };
+    let mut any = false;
+    for (pm_label, out_label, diff) in [
+        (labels[0].as_str(), labels[1].as_str(), diff1),
+        (labels[1].as_str(), labels[0].as_str(), diff2),
+    ] {
+        if diff.abs() <= min_qty {
+            continue;
+        }
+        let qty = floor_shares(diff.abs());
+        if qty <= Decimal::ZERO {
+            continue;
+        }
+        any = true;
+        let Some(out_token) = topic.token(OUTCOME, out_label) else {
+            return false;
+        };
+        let Some(pm_token) = topic.token(POLYMARKET, pm_label) else {
+            return false;
+        };
+        let (excess_platform, excess_token, deficit_platform, deficit_token) =
+            if diff > Decimal::ZERO {
+                (POLYMARKET, pm_token, OUTCOME, out_token)
+            } else {
+                (OUTCOME, out_token, POLYMARKET, pm_token)
+            };
+        match (
+            side_below_venue_min(
+                excess_platform,
+                &excess_token.token_id,
+                false,
+                qty,
+                books,
+                now,
+                stale,
+            ),
+            side_below_venue_min(
+                deficit_platform,
+                &deficit_token.token_id,
+                true,
+                qty,
+                books,
+                now,
+                stale,
+            ),
+        ) {
+            (Some(true), Some(true)) => {}
+            _ => return false,
+        }
+    }
+    any
+}
+
 fn eval_sell(
     platform: &str,
     token_id: &str,
@@ -177,17 +242,15 @@ fn eval_sell(
     }
     let fee = estimate_taker_fee(platform, qty, depth.avg, fees);
     let revenue = depth.avg * qty - fee;
-    if platform == OUTCOME {
-        let trade_cost = depth.worst * qty;
-        if trade_cost < min_trade_cost(platform) || qty < min_trade_amount(platform) {
-            tracing::warn!(
-                platform,
-                %qty,
-                %trade_cost,
-                "outcome sell below min notional, skip"
-            );
-            return None;
-        }
+    let trade_cost = depth.worst * qty;
+    if below_venue_mins(platform, false, qty, trade_cost) {
+        tracing::warn!(
+            platform,
+            %qty,
+            %trade_cost,
+            "hedge sell below venue min, skip"
+        );
+        return None;
     }
     Some(Candidate {
         action: HedgeAction {
@@ -226,7 +289,7 @@ fn eval_buy(
     let fee = estimate_taker_fee(platform, qty, depth.avg, fees);
     let cost = depth.avg * qty + fee;
     let trade_cost = depth.worst * qty;
-    if trade_cost < min_trade_cost(platform) || qty < min_trade_amount(platform) {
+    if below_venue_mins(platform, true, qty, trade_cost) {
         return None;
     }
     let balance = balances.get(platform).copied().unwrap_or(Decimal::ZERO);
@@ -252,6 +315,40 @@ fn eval_buy(
             marginal_value: qty - cost,
         },
     })
+}
+
+/// 有新鲜盘口时，判断按现有深度下单是否仍低于交易所最小股数/名义金额。
+/// 盘口缺失或过期返回 `None`，避免把暂时看不到的深度误标完成。
+fn side_below_venue_min(
+    platform: &str,
+    token_id: &str,
+    buy: bool,
+    qty: Decimal,
+    books: &BookStore,
+    now: Instant,
+    stale: Duration,
+) -> Option<bool> {
+    let depth = walk_book(platform, token_id, buy, qty, books, now, stale)?;
+    let filled = floor_shares(depth.filled);
+    if filled <= Decimal::ZERO {
+        return Some(true);
+    }
+    let walk_notional = depth.worst * filled;
+    if below_venue_mins(platform, buy, filled, walk_notional) {
+        return Some(true);
+    }
+    let raw_cap = if buy {
+        depth.worst.max(depth.worst_plus_two)
+    } else {
+        depth.worst
+    };
+    let cap = align_hedge_price(
+        platform,
+        buy,
+        raw_cap,
+        polymarket_tick(books, platform, token_id),
+    )?;
+    Some(below_venue_mins(platform, buy, filled, cap * filled))
 }
 
 fn walk_book(
@@ -507,6 +604,114 @@ mod tests {
     }
 
     #[test]
+    fn buys_other_side_when_outcome_sell_below_min() {
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        books.replace_snapshot(
+            OUTCOME,
+            "#10",
+            vec![Level {
+                price: d("0.05"),
+                size: d("100"),
+            }],
+            vec![],
+            1,
+            now,
+        );
+        books.replace_snapshot(
+            POLYMARKET,
+            "pm-yes",
+            vec![],
+            vec![Level {
+                price: d("0.40"),
+                size: d("100"),
+            }],
+            1,
+            now,
+        );
+        books.set_tick_size(POLYMARKET, "pm-yes", d("0.01"));
+        let mut balances = HashMap::new();
+        balances.insert(POLYMARKET.into(), d("100"));
+        let actions = plan(&books, &balances, now, "6", "16");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].platform, POLYMARKET);
+        assert_eq!(actions[0].side, HedgeSide::Buy);
+        assert_eq!(actions[0].shares, floor_shares(d("10")));
+    }
+
+    #[test]
+    fn leftover_untradeable_when_both_sides_below_min() {
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        books.replace_snapshot(
+            OUTCOME,
+            "#10",
+            vec![Level {
+                price: d("0.05"),
+                size: d("100"),
+            }],
+            vec![],
+            1,
+            now,
+        );
+        books.replace_snapshot(
+            POLYMARKET,
+            "pm-yes",
+            vec![],
+            vec![Level {
+                price: d("0.40"),
+                size: d("100"),
+            }],
+            1,
+            now,
+        );
+        books.set_tick_size(POLYMARKET, "pm-yes", d("0.01"));
+        // Outcome 多 10 股：卖 10 * 0.05 = 0.50 < 1U；买 PM 10 股 >= 5，名义 4U，仍可买。
+        assert!(!leftover_untradeable(
+            &topic(),
+            &imbalanced_positions("6", "16"),
+            &books,
+            d("1.5"),
+            now,
+            Duration::from_secs(5),
+        ));
+        // 买 PM 只要 3 股 < 5，两边都做不了。
+        books.replace_snapshot(
+            POLYMARKET,
+            "pm-yes",
+            vec![],
+            vec![Level {
+                price: d("0.40"),
+                size: d("100"),
+            }],
+            1,
+            now,
+        );
+        assert!(leftover_untradeable(
+            &topic(),
+            &imbalanced_positions("6", "9"),
+            &books,
+            d("1.5"),
+            now,
+            Duration::from_secs(5),
+        ));
+    }
+
+    #[test]
+    fn leftover_untradeable_false_when_book_missing() {
+        let books = BookStore::default();
+        let now = Instant::now();
+        assert!(!leftover_untradeable(
+            &topic(),
+            &imbalanced_positions("6", "16"),
+            &books,
+            d("1.5"),
+            now,
+            Duration::from_secs(5),
+        ));
+    }
+
+    #[test]
     fn skips_outcome_sell_below_min_notional() {
         let mut books = BookStore::default();
         let now = Instant::now();
@@ -523,6 +728,29 @@ mod tests {
         );
         let actions = plan(&books, &HashMap::new(), now, "6", "10");
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn sells_pm_below_five_shares() {
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        books.replace_snapshot(
+            POLYMARKET,
+            "pm-yes",
+            vec![Level {
+                price: d("0.40"),
+                size: d("10"),
+            }],
+            vec![],
+            1,
+            now,
+        );
+        books.set_tick_size(POLYMARKET, "pm-yes", d("0.01"));
+        let actions = plan(&books, &HashMap::new(), now, "9", "6");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].platform, POLYMARKET);
+        assert_eq!(actions[0].side, HedgeSide::Sell);
+        assert_eq!(actions[0].shares, floor_shares(d("3")));
     }
 
     #[test]

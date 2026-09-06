@@ -82,17 +82,25 @@ pub fn complementary_pairs(labels: &[String]) -> Vec<(String, String)> {
     ]
 }
 
-pub fn min_trade_cost(_platform: &str) -> Decimal {
-    // Polymarket CLOB 与 Outcome/HIP-4 当前均为 1 USDC 名义下限。
-    Decimal::ONE
-}
-
-pub fn min_trade_amount(platform: &str) -> Decimal {
-    if platform == POLYMARKET {
-        Decimal::from(5)
+/// FAK 买入：PM 至少 5 股且 1U；Outcome 买卖都至少 1U。PM FAK 卖出无股数/名义下限。
+pub fn min_trade_cost(platform: &str, buy: bool) -> Decimal {
+    if platform == POLYMARKET && !buy {
+        Decimal::ZERO
     } else {
         Decimal::ONE
     }
+}
+
+pub fn min_trade_amount(platform: &str, buy: bool) -> Decimal {
+    if platform == POLYMARKET && buy {
+        Decimal::from(5)
+    } else {
+        Decimal::ZERO
+    }
+}
+
+pub fn below_venue_mins(platform: &str, buy: bool, shares: Decimal, notional: Decimal) -> bool {
+    shares < min_trade_amount(platform, buy) || notional < min_trade_cost(platform, buy)
 }
 
 pub fn days_until(end_date: Option<DateTime<Utc>>) -> i64 {
@@ -383,10 +391,10 @@ impl Acc {
         if self.is_empty() {
             return false;
         }
-        self.pm_shares >= min_trade_amount(POLYMARKET)
-            && self.pm_cost >= min_trade_cost(POLYMARKET)
-            && self.out_shares >= min_trade_amount(OUTCOME)
-            && self.out_cap * self.out_shares >= min_trade_cost(OUTCOME)
+        self.pm_shares >= min_trade_amount(POLYMARKET, true)
+            && self.pm_cost >= min_trade_cost(POLYMARKET, true)
+            && self.out_shares >= min_trade_amount(OUTCOME, true)
+            && self.out_cap * self.out_shares >= min_trade_cost(OUTCOME, true)
     }
 
     fn passes_profit_and_mins(&self, fees: &FeeContext, limits: &ArbLimits) -> bool {
@@ -684,6 +692,18 @@ mod tests {
             std::time::Duration::from_secs(5),
         )
         .expect("plan")
+    }
+
+    #[test]
+    fn venue_mins_match_fak_and_outcome_rules() {
+        assert!(below_venue_mins(POLYMARKET, true, d("4"), d("2")));
+        assert!(below_venue_mins(POLYMARKET, true, d("5"), d("0.9")));
+        assert!(!below_venue_mins(POLYMARKET, true, d("5"), d("1")));
+        assert!(!below_venue_mins(POLYMARKET, false, d("1"), d("0.01")));
+        assert!(below_venue_mins(OUTCOME, true, d("20"), d("0.99")));
+        assert!(below_venue_mins(OUTCOME, false, d("1"), d("0.5")));
+        assert!(!below_venue_mins(OUTCOME, true, d("2"), d("1")));
+        assert!(!below_venue_mins(OUTCOME, false, d("1"), d("1")));
     }
 
     #[test]
