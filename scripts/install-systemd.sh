@@ -31,7 +31,13 @@ if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
 fi
 
 install -d -m 0755 "$INSTALL_DIR/dist"
-install -m 0755 -o "$SERVICE_USER" -g "$SERVICE_USER" "$BIN_SRC" "$BIN_DST"
+if [[ "$(readlink -f "$BIN_SRC")" == "$(readlink -f "$BIN_DST")" ]]; then
+  # 工作树就是安装目录时，二进制已在目标路径，只校正属主。
+  chown "$SERVICE_USER:$SERVICE_USER" "$BIN_DST"
+  chmod 0755 "$BIN_DST"
+else
+  install -m 0755 -o "$SERVICE_USER" -g "$SERVICE_USER" "$BIN_SRC" "$BIN_DST"
+fi
 
 if [[ ! -f "$INSTALL_DIR/.env" ]]; then
   if [[ -f "$ROOT/.env.example" ]]; then
