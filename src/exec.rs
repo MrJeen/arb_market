@@ -278,6 +278,12 @@ impl Engine {
                     required = %out_need,
                     "outcome buy skipped, usdc insufficient"
                 );
+                self.notify_balance_insufficient(
+                    OUTCOME,
+                    bal,
+                    out_need,
+                    &format!("arb topic={}", topic.key.as_str()),
+                );
                 self.stats.out_bal();
                 return Ok(());
             }
@@ -320,6 +326,12 @@ impl Engine {
                 required = %out_need,
                 %out_balance,
                 "http plan exceeds outcome balance"
+            );
+            self.notify_balance_insufficient(
+                OUTCOME,
+                out_balance,
+                out_need,
+                &format!("http-confirm topic={}", topic.key.as_str()),
             );
             self.stats.exceed_bal();
             return Ok(());
@@ -757,15 +769,30 @@ impl Engine {
         Err(Error::msg("no polymarket funder with sufficient balance"))
     }
 
-    async fn require_outcome_usdc(&self, required: Decimal) -> Result<()> {
+    async fn require_outcome_usdc(&self, required: Decimal, context: &str) -> Result<()> {
         match self.outcome.user_state().await {
             Ok(bal) if bal >= required => Ok(()),
-            Ok(bal) => Err(Error::msg(format!(
-                "outcome buy skipped, usdc {bal} < {required}"
-            ))),
+            Ok(bal) => {
+                self.notify_balance_insufficient(OUTCOME, bal, required, context);
+                Err(Error::msg(format!(
+                    "outcome buy skipped, usdc {bal} < {required}"
+                )))
+            }
             Err(err) => Err(Error::msg(format!(
                 "outcome buy skipped, usdc balance unavailable: {err}"
             ))),
+        }
+    }
+
+    fn notify_balance_insufficient(
+        &self,
+        platform: &str,
+        balance: Decimal,
+        required: Decimal,
+        context: &str,
+    ) {
+        if let Some(notify) = &self.notify {
+            notify.publish_balance_insufficient(platform, balance, required, context);
         }
     }
 
@@ -1040,8 +1067,7 @@ impl Engine {
                     continue;
                 }
                 Some(false) => {
-                    self.store.mark_rebalance(order.id, "completed").await?;
-                    let _ = self.store.refresh_order_actuals(order.id).await;
+                    self.complete_rebalance(order.id).await?;
                     continue;
                 }
                 Some(true) => {}
@@ -1106,8 +1132,7 @@ impl Engine {
                         order_id = order.id,
                         "hedge leftover below venue min, mark rebalance complete"
                     );
-                    self.store.mark_rebalance(order.id, "completed").await?;
-                    let _ = self.store.refresh_order_actuals(order.id).await;
+                    self.complete_rebalance(order.id).await?;
                 }
                 continue;
             }
@@ -1117,6 +1142,23 @@ impl Engine {
                     tracing::error!(error = %err, "hedge submit failed");
                 }
             }
+        }
+        Ok(())
+    }
+
+    async fn complete_rebalance(&self, order_id: i64) -> Result<()> {
+        // 先落最终实际值；失败时保留 pending/actived，下一轮仍可重试并避免漏通知。
+        let (actual_cost, _actual_rev, actual_profit) =
+            self.store.refresh_order_actuals(order_id).await?;
+        self.store.mark_rebalance(order_id, "completed").await?;
+        tracing::info!(
+            order_id,
+            actual_profit = %actual_profit,
+            actual_cost = %actual_cost,
+            "rebalance completed"
+        );
+        if let Some(notify) = &self.notify {
+            notify.publish_order_actuals(order_id, actual_profit, actual_cost);
         }
         Ok(())
     }
@@ -1201,8 +1243,11 @@ impl Engine {
                 self.require_outcome_token(&action.token_id, action.shares)
                     .await?;
             } else {
-                self.require_outcome_usdc(action.shares * action.cap_price)
-                    .await?;
+                self.require_outcome_usdc(
+                    action.shares * action.cap_price,
+                    &format!("rebalance orderId={order_id}"),
+                )
+                .await?;
             }
             let req = MarketOrderRequest {
                 token_id: action.token_id.clone(),

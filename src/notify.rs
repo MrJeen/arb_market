@@ -1,6 +1,12 @@
 use crate::config::Config;
 use chrono::{FixedOffset, Utc};
+use rust_decimal::Decimal;
 use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const BALANCE_ALERT_COOLDOWN: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct NatsNotifier {
@@ -8,6 +14,7 @@ pub struct NatsNotifier {
     subject: String,
     channel: String,
     tag: String,
+    balance_alerts: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -117,6 +124,35 @@ pub fn format_place_notice(tag: &str, notice: &PlaceNotice) -> String {
     lines.join("\n")
 }
 
+pub fn format_order_actuals_notice(
+    tag: &str,
+    order_id: i64,
+    actual_profit: Decimal,
+    actual_cost: Decimal,
+) -> String {
+    format!(
+        "{tag}订单 {order_id} 实际收益 {}，实际成本 {}",
+        actual_profit.normalize(),
+        actual_cost.normalize(),
+    )
+}
+
+pub fn format_balance_insufficient_notice(
+    tag: &str,
+    platform: &str,
+    balance: Decimal,
+    required: Decimal,
+    context: &str,
+) -> String {
+    format!(
+        "⚠️ {tag}余额不足\n🏪 platform: {}\n📋 context: {}\n💰 balance: {}\n💰 required: {}",
+        escape_markdown(platform),
+        escape_markdown(context),
+        balance.normalize(),
+        required.normalize(),
+    )
+}
+
 pub fn format_unknown_timeout_notice(tag: &str, legs: &[crate::store::ClosedLegRef]) -> String {
     let mut lines = vec![
         format!("⚠️ {tag}unknown 腿超时无成交，已标 cancelled"),
@@ -159,6 +195,7 @@ pub async fn connect(cfg: &Config) -> Option<NatsNotifier> {
                 subject: cfg.nats_subject.clone(),
                 channel: cfg.nats_channel.clone(),
                 tag: format_notify_tag(&cfg.cat),
+                balance_alerts: Arc::new(Mutex::new(HashMap::new())),
             })
         }
         Ok(Err(err)) => {
@@ -179,6 +216,56 @@ impl NatsNotifier {
 
     pub fn publish_alert(&self, body: String) {
         self.publish(body);
+    }
+
+    pub fn publish_order_actuals(
+        &self,
+        order_id: i64,
+        actual_profit: Decimal,
+        actual_cost: Decimal,
+    ) {
+        self.publish(format_order_actuals_notice(
+            &self.tag,
+            order_id,
+            actual_profit,
+            actual_cost,
+        ));
+    }
+
+    pub fn publish_balance_insufficient(
+        &self,
+        platform: &str,
+        balance: Decimal,
+        required: Decimal,
+        context: &str,
+    ) {
+        let key = format!("{platform}:{context}");
+        let now = Instant::now();
+        let should_publish = {
+            let mut alerts = self
+                .balance_alerts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            alerts.retain(|_, sent_at| {
+                now.saturating_duration_since(*sent_at) < BALANCE_ALERT_COOLDOWN
+            });
+            match alerts.get(&key) {
+                Some(sent_at)
+                    if now.saturating_duration_since(*sent_at) < BALANCE_ALERT_COOLDOWN =>
+                {
+                    false
+                }
+                _ => {
+                    alerts.insert(key, now);
+                    true
+                }
+            }
+        };
+        if should_publish {
+            self.publish(format_balance_insufficient_notice(
+                &self.tag, platform, balance, required, context,
+            ));
+        }
     }
 
     fn publish(&self, body: String) {
@@ -262,6 +349,30 @@ mod tests {
         assert!(text.contains("polymarket (rewards-11)"));
         assert!(text.contains("label=yes market=#12270: HTTP 429"));
         assert!(!text.contains("Real_Sociedad"));
+    }
+
+    #[test]
+    fn order_actuals_notice_contains_profit_and_cost() {
+        assert_eq!(
+            format_order_actuals_notice("【cat】", 8353, Decimal::new(-29, 2), Decimal::new(29, 2),),
+            "【cat】订单 8353 实际收益 -0.29，实际成本 0.29"
+        );
+    }
+
+    #[test]
+    fn balance_insufficient_notice_contains_amounts_and_context() {
+        let text = format_balance_insufficient_notice(
+            "【market-arb】",
+            "outcome",
+            Decimal::new(125, 1),
+            Decimal::new(20, 0),
+            "arb topic=event_1:0",
+        );
+        assert!(text.contains("余额不足"));
+        assert!(text.contains("platform: outcome"));
+        assert!(text.contains(r"context: arb topic=event\_1:0"));
+        assert!(text.contains("balance: 12.5"));
+        assert!(text.contains("required: 20"));
     }
 
     #[test]

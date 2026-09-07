@@ -522,7 +522,10 @@ impl Store {
         Ok(row.and_then(|item| item.0))
     }
 
-    pub async fn refresh_order_actuals(&self, order_id: i64) -> Result<()> {
+    pub async fn refresh_order_actuals(
+        &self,
+        order_id: i64,
+    ) -> Result<(Decimal, Decimal, Decimal)> {
         let rows: Vec<(
             String,
             String,
@@ -550,7 +553,8 @@ impl Store {
             })
             .collect();
         let (cost, rev, profit) = compute_actuals(&rows);
-        self.update_actuals(order_id, cost, rev, profit).await
+        self.update_actuals(order_id, cost, rev, profit).await?;
+        Ok((cost, rev, profit))
     }
 }
 
