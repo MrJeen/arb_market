@@ -73,6 +73,17 @@ pub async fn run() -> anyhow::Result<()> {
             pm_sub_rx,
             shutdown_rx.clone(),
         ));
+        let engine_auth = engine.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                if let Err(err) = engine_auth.pm.refresh_oldest_expiring_auth().await {
+                    tracing::error!(error = %err, "polymarket auth refresh failed");
+                }
+            }
+        });
     }
     if cfg.platform_enabled(OUTCOME) {
         tokio::spawn(outcome::run_l2_ws(

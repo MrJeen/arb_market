@@ -30,6 +30,8 @@ const FAK_UNFILLED: &str = "no orders found to match with FAK order. FAK orders 
 /// 每个账户在 `POLYMARKET_AUTH_TTL_SECS` 上叠加 10–30 分钟抖动，步长为整分钟。
 const AUTH_TTL_JITTER_MIN_MINS: u64 = 10;
 const AUTH_TTL_JITTER_MAX_MINS: u64 = 30;
+/// 最早一条凭证距过期不足该时长时主动刷新。
+const AUTH_REFRESH_LEAD_SECS: u64 = 10 * 60;
 /// CLOB FAK 市价单精度：maker 最多 2 位小数，taker 最多 5 位小数。
 /// 买单 USDC 向上取到分，避免隐含限价低于盘口；卖单金额仍向下截断。
 const MARKET_MAKER_DECIMALS: u32 = 2;
@@ -157,20 +159,64 @@ impl PolymarketVenue {
         }
         tracing::info!(funder = %cfg.funder_address, "polymarket account authenticating");
         let account = init_account(&self.http, &self.base, &cfg).await?;
-        if let Err(err) = save_api_cred(
-            &self.creds_path,
-            &key,
-            &StoredApiCreds {
-                api_key: account.api_key.clone(),
-                secret: account.api_secret.clone(),
-                passphrase: account.api_passphrase.clone(),
-                created_at: account.created_at,
-            },
-        ) {
+        self.persist_authed(key, account.clone()).await;
+        Ok(account)
+    }
+
+    /// 每分钟读一遍落盘凭证：只看 `created_at` 最早的地址，剩余不足 10 分钟则刷新。
+    pub async fn refresh_oldest_expiring_auth(&self) -> Result<()> {
+        if self.auth_ttl.is_zero() {
+            return Ok(());
+        }
+        let creds = load_api_creds(&self.creds_path);
+        let Some((funder, created_at)) = oldest_stored_cred(&creds) else {
+            return Ok(());
+        };
+        if !self.has_funder(&funder) {
+            tracing::warn!(
+                funder = %funder,
+                "oldest polymarket api creds funder not in config"
+            );
+            return Ok(());
+        }
+        let ttl = effective_auth_ttl(self.auth_ttl, &funder);
+        let now = unix_secs();
+        let remaining = auth_remaining_secs(created_at, ttl, now);
+        if !auth_refresh_due(created_at, ttl, now) {
+            return Ok(());
+        }
+        tracing::info!(
+            funder = %funder,
+            remaining_secs = remaining,
+            ttl_secs = ttl.as_secs(),
+            "polymarket auth refresh due"
+        );
+        let cfg = self
+            .funders
+            .iter()
+            .find(|item| item.funder_address.eq_ignore_ascii_case(&funder))
+            .cloned()
+            .ok_or_else(|| Error::msg("unknown polymarket funder"))?;
+        let _gate = self.init_lock.lock().await;
+        let creds = load_api_creds(&self.creds_path);
+        let Some((latest, created_at)) = oldest_stored_cred(&creds) else {
+            return Ok(());
+        };
+        if latest != funder || !auth_refresh_due(created_at, ttl, unix_secs()) {
+            return Ok(());
+        }
+        tracing::info!(funder = %cfg.funder_address, "polymarket account authenticating");
+        let account = init_account(&self.http, &self.base, &cfg).await?;
+        self.persist_authed(funder.to_ascii_lowercase(), account)
+            .await;
+        Ok(())
+    }
+
+    async fn persist_authed(&self, key: String, account: PolymarketAccount) {
+        if let Err(err) = save_api_cred(&self.creds_path, &key, &stored_creds(&account)) {
             tracing::warn!(error = %err, "polymarket api creds persist failed");
         }
-        self.authed.lock().await.insert(key, account.clone());
-        Ok(account)
+        self.authed.lock().await.insert(key, account);
     }
 
     async fn persist_rr(&self, rr: usize) {
@@ -609,6 +655,34 @@ fn account_from_creds(
         api_passphrase: creds.passphrase.clone(),
         created_at: creds.created_at,
     })
+}
+
+fn stored_creds(account: &PolymarketAccount) -> StoredApiCreds {
+    StoredApiCreds {
+        api_key: account.api_key.clone(),
+        secret: account.api_secret.clone(),
+        passphrase: account.api_passphrase.clone(),
+        created_at: account.created_at,
+    }
+}
+
+fn oldest_stored_cred(creds: &HashMap<String, StoredApiCreds>) -> Option<(String, u64)> {
+    creds
+        .iter()
+        .min_by(|a, b| {
+            a.1.created_at
+                .cmp(&b.1.created_at)
+                .then_with(|| a.0.cmp(b.0))
+        })
+        .map(|(funder, cred)| (funder.clone(), cred.created_at))
+}
+
+fn auth_remaining_secs(created_at: u64, ttl: Duration, now: u64) -> u64 {
+    ttl.as_secs().saturating_sub(now.saturating_sub(created_at))
+}
+
+fn auth_refresh_due(created_at: u64, ttl: Duration, now: u64) -> bool {
+    !ttl.is_zero() && auth_remaining_secs(created_at, ttl, now) < AUTH_REFRESH_LEAD_SECS
 }
 
 fn creds_fresh(created_at: u64, ttl: Duration, now: u64) -> bool {
@@ -1579,5 +1653,32 @@ mod tests {
         assert_eq!(ttl, Duration::from_secs(86_400 + a));
         let other = auth_ttl_jitter_secs("0xdef");
         assert_ne!(a, other);
+    }
+
+    fn sample_cred(created_at: u64) -> StoredApiCreds {
+        StoredApiCreds {
+            api_key: "k".into(),
+            secret: "s".into(),
+            passphrase: "p".into(),
+            created_at,
+        }
+    }
+
+    #[test]
+    fn oldest_stored_cred_picks_earliest_created_at() {
+        let mut creds = HashMap::new();
+        creds.insert("0xbbb".into(), sample_cred(2_000));
+        creds.insert("0xaaa".into(), sample_cred(3_000));
+        creds.insert("0xccc".into(), sample_cred(1_000));
+        assert_eq!(oldest_stored_cred(&creds), Some(("0xccc".into(), 1_000)));
+    }
+
+    #[test]
+    fn auth_refresh_due_only_within_ten_minutes() {
+        let ttl = Duration::from_secs(86_400);
+        assert!(!auth_refresh_due(1_000, ttl, 1_000 + 86_400 - 600));
+        assert!(auth_refresh_due(1_000, ttl, 1_000 + 86_400 - 599));
+        assert!(auth_refresh_due(1_000, ttl, 1_000 + 86_400));
+        assert!(!auth_refresh_due(1_000, Duration::ZERO, 9_999));
     }
 }
