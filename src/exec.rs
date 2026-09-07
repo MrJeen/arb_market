@@ -8,7 +8,7 @@ use crate::config::{Config, OUTCOME, POLYMARKET};
 use crate::discovery::load_active_topics;
 use crate::domain::{Topic, TopicKey};
 use crate::error::{Error, Result};
-use crate::hedge::{leftover_untradeable, needs_rebalance, plan_hedge, HedgeSide};
+use crate::hedge::{hedge_order_tokens, leftover_untradeable, needs_rebalance, plan_hedge, HedgeSide};
 use crate::notify::{self, NatsNotifier, PlaceNotice, PlaceResult};
 use crate::platforms::outcome::OutcomeVenue;
 use crate::platforms::polymarket::PolymarketVenue;
@@ -1067,7 +1067,14 @@ impl Engine {
                 balances.insert(OUTCOME.to_string(), bal);
             }
             let fees = self.fee_context(&topic);
-            self.ensure_topic_pm_ticks(&topic).await;
+            let order_tokens =
+                hedge_order_tokens(&topic, &positions, self.cfg.min_rebalance_qty);
+            self.refresh_hedge_books(order.id, &order_tokens).await;
+            for (platform, token_id) in &order_tokens {
+                if platform == POLYMARKET {
+                    let _ = self.ensure_pm_tick(token_id).await;
+                }
+            }
             let actions = {
                 let books = self.books.lock().await;
                 plan_hedge(
@@ -1274,6 +1281,71 @@ impl Engine {
             "polymarket book resync"
         );
         Ok(topics)
+    }
+
+    async fn refresh_hedge_books(&self, order_id: i64, tokens: &[(String, String)]) {
+        let now = Instant::now();
+        let stale = self.cfg.book_stale;
+        let need: Vec<(String, String)> = {
+            let books = self.books.lock().await;
+            tokens
+                .iter()
+                .filter(|(platform, token_id)| {
+                    books
+                        .get(platform, token_id)
+                        .map(|book| !book.is_fresh(stale, now))
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .collect()
+        };
+        if need.is_empty() {
+            return;
+        }
+        let fetches = need.into_iter().map(|(platform, token_id)| async move {
+            let started = Instant::now();
+            let result = if platform == POLYMARKET {
+                self.pm.rest_book(&token_id).await
+            } else {
+                self.outcome.rest_book(&token_id).await
+            };
+            (platform, token_id, result, Instant::now(), started.elapsed())
+        });
+        for (platform, token_id, result, received_at, elapsed) in
+            futures_util::future::join_all(fetches).await
+        {
+            match result {
+                Ok((bids, asks, exchange_ts_ms)) => {
+                    let applied = self.books.lock().await.replace_snapshot(
+                        &platform,
+                        &token_id,
+                        bids,
+                        asks,
+                        exchange_ts_ms,
+                        received_at,
+                    );
+                    tracing::info!(
+                        order_id,
+                        %platform,
+                        token = %token_id,
+                        exchange_ts_ms,
+                        applied,
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        "hedge rest book fetched"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        order_id,
+                        %platform,
+                        token = %token_id,
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        error = %err,
+                        "hedge rest book failed"
+                    );
+                }
+            }
+        }
     }
 
     async fn ensure_topic_pm_ticks(&self, topic: &Topic) {

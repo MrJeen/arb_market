@@ -3,9 +3,9 @@ use crate::calc::{
     align_hedge_price, below_venue_mins, estimate_taker_fee, floor_shares, FeeContext,
 };
 use crate::config::{OUTCOME, POLYMARKET};
-use crate::domain::Topic;
+use crate::domain::{TokenRef, Topic};
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +37,80 @@ struct Depth {
 
 struct Candidate {
     action: HedgeAction,
+}
+
+struct Imbalance<'a> {
+    excess_platform: &'a str,
+    excess_token: &'a TokenRef,
+    deficit_platform: &'a str,
+    deficit_token: &'a TokenRef,
+    qty_needed: Decimal,
+}
+
+fn imbalance_for<'a>(
+    topic: &'a Topic,
+    pm_label: &str,
+    out_label: &str,
+    diff: Decimal,
+    min_qty: Decimal,
+) -> Option<Imbalance<'a>> {
+    if diff.abs() <= min_qty {
+        return None;
+    }
+    let qty_needed = floor_shares(diff.abs());
+    if qty_needed <= Decimal::ZERO {
+        return None;
+    }
+    let out_token = topic.token(OUTCOME, out_label)?;
+    let pm_token = topic.token(POLYMARKET, pm_label)?;
+    // diff>0: PM[pm_label] 多于 Outcome 互补腿，多余在 PM，缺失在 Outcome。
+    if diff > Decimal::ZERO {
+        Some(Imbalance {
+            excess_platform: POLYMARKET,
+            excess_token: pm_token,
+            deficit_platform: OUTCOME,
+            deficit_token: out_token,
+            qty_needed,
+        })
+    } else {
+        Some(Imbalance {
+            excess_platform: OUTCOME,
+            excess_token: out_token,
+            deficit_platform: POLYMARKET,
+            deficit_token: pm_token,
+            qty_needed,
+        })
+    }
+}
+
+/// 可能下单的 token：每个超额的多余腿（卖）和跨平台缺失腿（买），去重。
+/// 不含同平台对立腿。
+pub fn hedge_order_tokens(
+    topic: &Topic,
+    positions: &Positions,
+    min_qty: Decimal,
+) -> Vec<(String, String)> {
+    let labels = topic.labels();
+    let Some((diff1, diff2)) = position_diffs(positions, &labels) else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    let mut tokens = Vec::new();
+    for (pm_label, out_label, diff) in [
+        (labels[0].as_str(), labels[1].as_str(), diff1),
+        (labels[1].as_str(), labels[0].as_str(), diff2),
+    ] {
+        let Some(imb) = imbalance_for(topic, pm_label, out_label, diff, min_qty) else {
+            continue;
+        };
+        for token in [imb.excess_token, imb.deficit_token] {
+            let key = (token.platform.clone(), token.token_id.clone());
+            if seen.insert(key.clone()) {
+                tokens.push(key);
+            }
+        }
+    }
+    tokens
 }
 
 pub fn position_diffs(positions: &Positions, labels: &[String]) -> Option<(Decimal, Decimal)> {
@@ -99,28 +173,13 @@ fn hedge_one(
     now: Instant,
     stale: Duration,
 ) -> Option<HedgeAction> {
-    if diff.abs() <= min_qty {
-        return None;
-    }
-    let qty_needed = floor_shares(diff.abs());
-    if qty_needed <= Decimal::ZERO {
-        return None;
-    }
-    let out_token = topic.token(OUTCOME, out_label)?;
-    let pm_token = topic.token(POLYMARKET, pm_label)?;
-    // diff>0: PM[pm_label] 多于 Outcome 互补腿，多余在 PM，缺失在 Outcome。
-    let (excess_platform, excess_token, deficit_platform, deficit_token) = if diff > Decimal::ZERO {
-        (POLYMARKET, pm_token, OUTCOME, out_token)
-    } else {
-        (OUTCOME, out_token, POLYMARKET, pm_token)
-    };
-
+    let imb = imbalance_for(topic, pm_label, out_label, diff, min_qty)?;
     let mut candidates = Vec::new();
     if let Some(sell) = eval_sell(
-        excess_platform,
-        &excess_token.token_id,
-        &excess_token.label,
-        qty_needed,
+        imb.excess_platform,
+        &imb.excess_token.token_id,
+        &imb.excess_token.label,
+        imb.qty_needed,
         books,
         fees,
         now,
@@ -129,10 +188,10 @@ fn hedge_one(
         candidates.push(sell);
     }
     if let Some(buy) = eval_buy(
-        deficit_platform,
-        &deficit_token.token_id,
-        &deficit_token.label,
-        qty_needed,
+        imb.deficit_platform,
+        &imb.deficit_token.token_id,
+        &imb.deficit_token.label,
+        imb.qty_needed,
         books,
         balances,
         fees,
@@ -145,9 +204,9 @@ fn hedge_one(
         .into_iter()
         .max_by(|a, b| a.action.marginal_value.cmp(&b.action.marginal_value))?;
     tracing::info!(
-        excess = %format!("{}.{}", excess_platform, excess_token.label),
-        deficit = %format!("{}.{}", deficit_platform, deficit_token.label),
-        qty_needed = %qty_needed,
+        excess = %format!("{}.{}", imb.excess_platform, imb.excess_token.label),
+        deficit = %format!("{}.{}", imb.deficit_platform, imb.deficit_token.label),
+        qty_needed = %imb.qty_needed,
         chosen = %format!("{} {} {}", best.action.platform, match best.action.side {
             HedgeSide::Buy => "BUY",
             HedgeSide::Sell => "SELL",
@@ -187,22 +246,13 @@ pub fn leftover_untradeable(
             continue;
         }
         any = true;
-        let Some(out_token) = topic.token(OUTCOME, out_label) else {
+        let Some(imb) = imbalance_for(topic, pm_label, out_label, diff, min_qty) else {
             return false;
         };
-        let Some(pm_token) = topic.token(POLYMARKET, pm_label) else {
-            return false;
-        };
-        let (excess_platform, excess_token, deficit_platform, deficit_token) =
-            if diff > Decimal::ZERO {
-                (POLYMARKET, pm_token, OUTCOME, out_token)
-            } else {
-                (OUTCOME, out_token, POLYMARKET, pm_token)
-            };
         match (
             side_below_venue_min(
-                excess_platform,
-                &excess_token.token_id,
+                imb.excess_platform,
+                &imb.excess_token.token_id,
                 false,
                 qty,
                 books,
@@ -210,8 +260,8 @@ pub fn leftover_untradeable(
                 stale,
             ),
             side_below_venue_min(
-                deficit_platform,
-                &deficit_token.token_id,
+                imb.deficit_platform,
+                &imb.deficit_token.token_id,
                 true,
                 qty,
                 books,
@@ -494,6 +544,25 @@ mod tests {
             now,
             Duration::from_secs(5),
         )
+    }
+
+    #[test]
+    fn hedge_order_tokens_only_excess_and_cross_deficit() {
+        let tokens = hedge_order_tokens(&topic(), &imbalanced_positions("31", "6"), d("1.5"));
+        let mut keys: Vec<_> = tokens.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![(OUTCOME, "#10"), (POLYMARKET, "pm-yes")]
+        );
+        assert!(!tokens.iter().any(|(p, t)| p == POLYMARKET && t == "pm-no"));
+        assert!(!tokens.iter().any(|(p, t)| p == OUTCOME && t == "#11"));
+    }
+
+    #[test]
+    fn hedge_order_tokens_empty_when_balanced() {
+        let tokens = hedge_order_tokens(&topic(), &imbalanced_positions("6", "6"), d("1.5"));
+        assert!(tokens.is_empty());
     }
 
     #[test]
