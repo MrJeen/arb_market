@@ -90,7 +90,9 @@ impl Engine {
     }
 
     async fn block_new_arb(&self, topic: &str) -> Result<bool> {
-        if self.store.count_active_orders().await? >= self.cfg.max_active_orders as i64 {
+        if self.cfg.max_active_orders > 0
+            && self.store.count_active_orders().await? >= self.cfg.max_active_orders as i64
+        {
             tracing::warn!(
                 topic,
                 limit = self.cfg.max_active_orders,
@@ -1300,7 +1302,10 @@ async fn persist_submit(
                     price,
                     fee: Decimal::ZERO,
                     fee_rate_bps: None,
-                    raw: json!({"source": "submit_ack", "avg_px": avg_px}),
+                    raw: json!({
+                        "source": "submit_ack",
+                        "avg_px": if platform == POLYMARKET { Some(price) } else { *avg_px }
+                    }),
                 };
                 upsert_fill_rows(store, leg_id, &[&trade]).await?;
                 close_leg_matched(store, leg_id, Some(order_id), shares, price, Decimal::ZERO)

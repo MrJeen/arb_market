@@ -35,6 +35,7 @@ pub struct Config {
     pub outcome_taker_fee_rate: Decimal,
     pub pending_leg_timeout: Duration,
     pub unknown_leg_timeout: Duration,
+    /// 累计已下单上限；0 表示不限制。
     pub max_active_orders: usize,
     /// 累计实际亏损达到该值后停止新套利；0 表示不启用。
     pub max_realized_loss: Decimal,
