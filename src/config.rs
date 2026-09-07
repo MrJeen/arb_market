@@ -41,7 +41,7 @@ pub struct Config {
     pub polymarket_clob_url: String,
     pub polymarket_ws_url: String,
     pub polymarket_funders: Vec<PolymarketFunderConfig>,
-    /// L2 认证落盘有效期；0 表示不按时间过期。
+    /// L2 认证落盘有效期；0 表示不按时间过期。实际过期再按账户叠加 10–30 分钟抖动（整分钟）。
     pub polymarket_auth_ttl: Duration,
     pub hyperliquid_info_url: String,
     pub hyperliquid_exchange_url: String,

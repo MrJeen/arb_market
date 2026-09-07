@@ -27,6 +27,9 @@ use tokio_tungstenite::tungstenite::Message;
 const FUNDER_CURSOR_FILE: &str = "polymarket_funder_cursor";
 const API_CREDS_FILE: &str = "polymarket_api_creds.json";
 const FAK_UNFILLED: &str = "no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.";
+/// 每个账户在 `POLYMARKET_AUTH_TTL_SECS` 上叠加 10–30 分钟抖动，步长为整分钟。
+const AUTH_TTL_JITTER_MIN_MINS: u64 = 10;
+const AUTH_TTL_JITTER_MAX_MINS: u64 = 30;
 /// CLOB FAK 市价单精度：maker 最多 2 位小数，taker 最多 5 位小数。
 /// 买单 USDC 向上取到分，避免隐含限价低于盘口；卖单金额仍向下截断。
 const MARKET_MAKER_DECIMALS: u32 = 2;
@@ -95,6 +98,7 @@ impl PolymarketVenue {
                 idx = rr,
                 total = venue.funders.len(),
                 ttl_secs = venue.auth_ttl.as_secs(),
+                jitter_secs = auth_ttl_jitter_secs(&first.funder_address),
                 "polymarket first account ready"
             );
         }
@@ -111,16 +115,17 @@ impl PolymarketVenue {
 
     async fn ensure_account(&self, funder: &str) -> Result<PolymarketAccount> {
         let key = funder.to_ascii_lowercase();
+        let ttl = effective_auth_ttl(self.auth_ttl, &key);
         let now = unix_secs();
         if let Some(account) = self.authed.lock().await.get(&key) {
-            if creds_fresh(account.created_at, self.auth_ttl, now) {
+            if creds_fresh(account.created_at, ttl, now) {
                 return Ok(account.clone());
             }
         }
         let _gate = self.init_lock.lock().await;
         let now = unix_secs();
         if let Some(account) = self.authed.lock().await.get(&key) {
-            if creds_fresh(account.created_at, self.auth_ttl, now) {
+            if creds_fresh(account.created_at, ttl, now) {
                 return Ok(account.clone());
             }
         }
@@ -130,7 +135,7 @@ impl PolymarketVenue {
             .find(|item| item.funder_address.eq_ignore_ascii_case(funder))
             .cloned()
             .ok_or_else(|| Error::msg("unknown polymarket funder"))?;
-        if let Some(stored) = load_fresh_api_cred(&self.creds_path, &key, self.auth_ttl, now) {
+        if let Some(stored) = load_fresh_api_cred(&self.creds_path, &key, ttl, now) {
             match account_from_creds(&cfg, &stored) {
                 Ok(account) => {
                     tracing::info!(
@@ -608,6 +613,23 @@ fn account_from_creds(
 
 fn creds_fresh(created_at: u64, ttl: Duration, now: u64) -> bool {
     ttl.is_zero() || now.saturating_sub(created_at) < ttl.as_secs()
+}
+
+fn auth_ttl_jitter_secs(funder: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in funder.to_ascii_lowercase().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let span = AUTH_TTL_JITTER_MAX_MINS - AUTH_TTL_JITTER_MIN_MINS + 1;
+    (AUTH_TTL_JITTER_MIN_MINS + (hash % span)) * 60
+}
+
+fn effective_auth_ttl(base: Duration, funder: &str) -> Duration {
+    if base.is_zero() {
+        return base;
+    }
+    base.saturating_add(Duration::from_secs(auth_ttl_jitter_secs(funder)))
 }
 
 fn load_api_creds(path: &Path) -> HashMap<String, StoredApiCreds> {
@@ -1543,5 +1565,19 @@ mod tests {
         assert!(load_fresh_api_cred(&path, "0xabc", Duration::from_secs(100), 1_100).is_none());
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("json.tmp"));
+    }
+
+    #[test]
+    fn auth_ttl_jitter_is_stable_and_in_range() {
+        let a = auth_ttl_jitter_secs("0xAbc");
+        let b = auth_ttl_jitter_secs("0xabc");
+        assert_eq!(a, b);
+        assert_eq!(a % 60, 0);
+        assert!((AUTH_TTL_JITTER_MIN_MINS * 60..=AUTH_TTL_JITTER_MAX_MINS * 60).contains(&a));
+        assert_eq!(effective_auth_ttl(Duration::ZERO, "0xabc"), Duration::ZERO);
+        let ttl = effective_auth_ttl(Duration::from_secs(86_400), "0xabc");
+        assert_eq!(ttl, Duration::from_secs(86_400 + a));
+        let other = auth_ttl_jitter_secs("0xdef");
+        assert_ne!(a, other);
     }
 }
