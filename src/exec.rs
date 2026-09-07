@@ -1,8 +1,8 @@
 use crate::book::{BookStore, DirtyCoalescer, OrderBook};
 use crate::calc::{
     below_venue_mins, best_plan, confirm_plan, confirm_plan_reason, diagnose_books,
-    first_usable_ask, inspect_calc, min_trade_amount, min_trade_cost, ArbLimits, ArbPlan,
-    CalcMissSnapshot, FeeContext,
+    estimate_taker_fee, first_usable_ask, inspect_calc, min_trade_amount, min_trade_cost,
+    ArbLimits, ArbPlan, CalcMissSnapshot, FeeContext,
 };
 use crate::config::{Config, OUTCOME, POLYMARKET};
 use crate::discovery::load_active_topics;
@@ -18,7 +18,7 @@ use crate::platforms::{
 use crate::stats::MinuteStats;
 use crate::store::Store;
 use rust_decimal::Decimal;
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -118,14 +118,26 @@ impl Engine {
     }
 
     fn fee_context(&self, topic: &Topic) -> FeeContext {
+        self.fee_context_from(Some(topic))
+    }
+
+    fn fee_context_from(&self, topic: Option<&Topic>) -> FeeContext {
         let rate = topic
-            .polymarket_fee_rate()
+            .and_then(Topic::polymarket_fee_rate)
             .unwrap_or_else(|| self.cfg.polymarket_fee_bps_prior / Decimal::from(10_000));
         FeeContext {
             polymarket_fee_rate: rate,
             outcome_taker_rate: self.cfg.outcome_taker_fee_rate,
             extra_cost_multiplier: self.cfg.extra_cost_multiplier,
         }
+    }
+
+    async fn fee_context_for_order(&self, order_id: i64) -> FeeContext {
+        let Ok(key) = self.store.order_topic_key(order_id).await else {
+            return self.fee_context_from(None);
+        };
+        let topic = self.topics.read().await.get(&key).cloned();
+        self.fee_context_from(topic.as_ref())
     }
 
     async fn evaluate_topic(&self, topic_key: TopicKey) -> Result<()> {
@@ -238,6 +250,7 @@ impl Engine {
     }
 
     async fn execute_plan(&self, topic: &Topic, plan: ArbPlan) -> Result<()> {
+        let fees = self.fee_context(topic);
         let pm_need = plan.pm.cost + plan.pm.fee;
         let out_need = plan.outcome.cost + plan.outcome.fee;
         let (pm_bal, out_bal) =
@@ -403,8 +416,8 @@ impl Engine {
             )
             .await?;
         let (pm_res, out_res) = tokio::join!(
-            self.submit_pm(pm_leg, &funder, &pm_req),
-            self.submit_outcome(out_leg, &out_req)
+            self.submit_pm(pm_leg, &funder, &pm_req, &fees),
+            self.submit_outcome(out_leg, &out_req, &fees)
         );
         if let Err(err) = &pm_res {
             tracing::error!(error = %err, "polymarket submit failed");
@@ -807,48 +820,81 @@ impl Engine {
         }
     }
 
+    async fn token_book_snapshot(&self, platform: &str, token_id: &str) -> Option<Value> {
+        let books = self.books.lock().await;
+        books.get(platform, token_id).map(OrderBook::snapshot_json)
+    }
+
     async fn submit_pm(
         &self,
         leg_id: i64,
         funder: &str,
         req: &MarketOrderRequest,
+        fees: &FeeContext,
     ) -> Result<SubmitResult> {
         let prepared = self.pm.prepare_market_order(funder, req).await?;
+        let book_snapshot = self.token_book_snapshot(POLYMARKET, &req.token_id).await;
         self.store
             .insert_envelope(
                 leg_id,
                 &prepared.order_hash,
                 &prepared.envelope,
                 &prepared.payload,
+                book_snapshot.as_ref(),
             )
             .await?;
-        let result = self.pm.post_prepared(&prepared).await?;
-        persist_submit(&self.store, leg_id, POLYMARKET, req.side, &result).await?;
+        let (result, response) = self.pm.post_prepared(&prepared).await?;
+        persist_submit(
+            &self.store,
+            leg_id,
+            POLYMARKET,
+            req.side,
+            &result,
+            fees,
+            &response,
+        )
+        .await?;
         Ok(result)
     }
 
-    async fn submit_outcome(&self, leg_id: i64, req: &MarketOrderRequest) -> Result<SubmitResult> {
+    async fn submit_outcome(
+        &self,
+        leg_id: i64,
+        req: &MarketOrderRequest,
+        fees: &FeeContext,
+    ) -> Result<SubmitResult> {
         let prepared = self.outcome.prepare_market_order(req)?;
+        let book_snapshot = self.token_book_snapshot(OUTCOME, &req.token_id).await;
         self.store
             .insert_envelope(
                 leg_id,
                 &prepared.order_hash,
                 &prepared.envelope,
                 &prepared.payload,
+                book_snapshot.as_ref(),
             )
             .await?;
-        let result = self.outcome.post_prepared(prepared).await?;
-        persist_submit(&self.store, leg_id, OUTCOME, req.side, &result).await?;
+        let (result, response) = self.outcome.post_prepared(prepared).await?;
+        persist_submit(
+            &self.store,
+            leg_id,
+            OUTCOME,
+            req.side,
+            &result,
+            fees,
+            &response,
+        )
+        .await?;
         Ok(result)
     }
 
     pub async fn reconcile(&self) -> Result<()> {
         let expired = self
             .store
-            .fail_stale_pending_without_envelope(self.cfg.pending_leg_timeout)
+            .fail_stale_pending_unsubmitted(self.cfg.pending_leg_timeout)
             .await?;
         if expired > 0 {
-            tracing::warn!(expired, "failed stale pending legs without envelope");
+            tracing::warn!(expired, "failed stale pending legs never submitted");
         }
         let promoted = self.store.promote_submitted_pending_to_unknown().await?;
         if promoted > 0 {
@@ -932,7 +978,8 @@ impl Engine {
         matched: &[&TradeFill],
     ) -> Result<()> {
         if !matched.is_empty() {
-            return apply_fills(&self.store, leg.id, matched).await;
+            let fees = self.fee_context_for_order(leg.order_id).await;
+            return apply_fills(&self.store, leg.id, &leg.platform, matched, &fees).await;
         }
         match remote_leg_terminal(poll, false) {
             Some(RemoteLegTerminal::Matched) => {
@@ -941,7 +988,8 @@ impl Engine {
                     return Ok(());
                 }
                 let price = poll.and_then(|p| p.price).unwrap_or(Decimal::ZERO);
-                let fee = poll.and_then(|p| p.fee).unwrap_or(Decimal::ZERO);
+                let fees = self.fee_context_for_order(leg.order_id).await;
+                let fee = estimate_taker_fee(&leg.platform, shares, price, &fees);
                 close_leg_matched(
                     &self.store,
                     leg.id,
@@ -949,6 +997,7 @@ impl Engine {
                     shares,
                     price,
                     fee,
+                    poll.map(|p| &p.raw).unwrap_or(&json!({"source": "poll"})),
                 )
                 .await
             }
@@ -1056,7 +1105,7 @@ impl Engine {
             }
             self.store.mark_rebalance(order.id, "actived").await?;
             for action in actions {
-                if let Err(err) = self.execute_hedge(order.id, &action).await {
+                if let Err(err) = self.execute_hedge(order.id, &action, &fees).await {
                     tracing::error!(error = %err, "hedge submit failed");
                 }
             }
@@ -1064,7 +1113,12 @@ impl Engine {
         Ok(())
     }
 
-    async fn execute_hedge(&self, order_id: i64, action: &crate::hedge::HedgeAction) -> Result<()> {
+    async fn execute_hedge(
+        &self,
+        order_id: i64,
+        action: &crate::hedge::HedgeAction,
+        fees: &FeeContext,
+    ) -> Result<()> {
         let side = match action.side {
             HedgeSide::Buy => OrderSide::Buy,
             HedgeSide::Sell => OrderSide::Sell,
@@ -1128,11 +1182,11 @@ impl Engine {
                     self.polymarket_service(&funder),
                     action.cap_price,
                     action.shares,
-                    Decimal::ZERO,
+                    action.fee,
                     None,
                 )
                 .await?;
-            self.submit_pm(leg_id, &funder, &req).await?;
+            self.submit_pm(leg_id, &funder, &req, fees).await?;
             Ok(())
         } else {
             if side == OrderSide::Sell {
@@ -1167,11 +1221,11 @@ impl Engine {
                     None,
                     action.cap_price,
                     action.shares,
-                    Decimal::ZERO,
+                    action.fee,
                     None,
                 )
                 .await?;
-            self.submit_outcome(leg_id, &req).await?;
+            self.submit_outcome(leg_id, &req, fees).await?;
             Ok(())
         }
     }
@@ -1280,7 +1334,10 @@ async fn persist_submit(
     platform: &str,
     side: OrderSide,
     result: &SubmitResult,
+    fees: &FeeContext,
+    response: &serde_json::Value,
 ) -> Result<()> {
+    store.save_submit_response(leg_id, response).await?;
     match result {
         SubmitResult::Ack {
             order_id,
@@ -1292,6 +1349,7 @@ async fn persist_submit(
         } => {
             let fill = ack_fill(platform, side, *making, *taking, *avg_px, envelope);
             if let Some((shares, price)) = fill {
+                let fee = estimate_taker_fee(platform, shares, price, fees);
                 let trade_id = format!("ack:{order_id}");
                 let trade = TradeFill {
                     trade_id: trade_id.clone(),
@@ -1300,7 +1358,7 @@ async fn persist_submit(
                     coin: None,
                     shares,
                     price,
-                    fee: Decimal::ZERO,
+                    fee,
                     fee_rate_bps: None,
                     raw: json!({
                         "source": "submit_ack",
@@ -1308,11 +1366,11 @@ async fn persist_submit(
                     }),
                 };
                 upsert_fill_rows(store, leg_id, &[&trade]).await?;
-                close_leg_matched(store, leg_id, Some(order_id), shares, price, Decimal::ZERO)
+                close_leg_matched(store, leg_id, Some(order_id), shares, price, fee, response)
                     .await?;
             } else {
                 store
-                    .update_leg_submitted(leg_id, "actived", Some(order_id), envelope)
+                    .update_leg_submitted(leg_id, "actived", Some(order_id), response)
                     .await?;
             }
         }
@@ -1327,7 +1385,7 @@ async fn persist_submit(
                     Decimal::ZERO,
                     Decimal::ZERO,
                     Decimal::ZERO,
-                    &json!({"message": message, "envelope": envelope}),
+                    &json!({"message": message, "response": response, "envelope": envelope}),
                 )
                 .await?;
         }
@@ -1342,7 +1400,7 @@ async fn persist_submit(
                     leg_id,
                     "unknown",
                     order_id.as_deref(),
-                    &json!({"message": message, "envelope": envelope}),
+                    &json!({"message": message, "response": response, "envelope": envelope}),
                 )
                 .await?;
         }
@@ -1364,6 +1422,7 @@ async fn persist_submit(
                         "reason": "http_status",
                         "status": status,
                         "message": message,
+                        "response": response,
                         "envelope": envelope
                     }),
                 )
@@ -1496,34 +1555,46 @@ async fn close_leg_matched(
     shares: Decimal,
     price: Decimal,
     fee: Decimal,
+    info: &serde_json::Value,
 ) -> Result<()> {
     store
-        .update_leg_fill(
-            leg_id,
-            "matched",
-            third_order_id,
-            price,
-            shares,
-            fee,
-            &json!({"source": "fak_terminal"}),
-        )
+        .update_leg_fill(leg_id, "matched", third_order_id, price, shares, fee, info)
         .await
 }
 
-async fn apply_fills(store: &Store, leg_id: i64, fills: &[&TradeFill]) -> Result<()> {
-    upsert_fill_rows(store, leg_id, fills).await?;
-    let (price, fee) = fill_price_and_fee(fills, None);
-    let shares: Decimal = fills.iter().map(|f| f.shares).sum();
+async fn apply_fills(
+    store: &Store,
+    leg_id: i64,
+    platform: &str,
+    fills: &[&TradeFill],
+    fees: &FeeContext,
+) -> Result<()> {
+    let priced: Vec<TradeFill> = fills
+        .iter()
+        .map(|fill| {
+            let mut row = (*fill).clone();
+            row.fee = estimate_taker_fee(platform, row.shares, row.price, fees);
+            row
+        })
+        .collect();
+    let refs: Vec<&TradeFill> = priced.iter().collect();
+    upsert_fill_rows(store, leg_id, &refs).await?;
+    let (price, fee) = fill_price_and_fee(&refs, None);
+    let shares: Decimal = priced.iter().map(|f| f.shares).sum();
     if shares <= Decimal::ZERO {
         return Ok(());
     }
     close_leg_matched(
         store,
         leg_id,
-        fills.last().and_then(|f| f.order_id.as_deref()),
+        priced.last().and_then(|f| f.order_id.as_deref()),
         shares,
         price,
         fee,
+        &json!({
+            "source": "venue_fills",
+            "fills": priced.iter().map(|f| f.raw.clone()).collect::<Vec<_>>(),
+        }),
     )
     .await
 }
@@ -1757,6 +1828,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cap_only.1.to_string(), "0.60");
+    }
+
+    #[test]
+    fn fill_fee_uses_actual_shares_and_price() {
+        let fees = FeeContext {
+            polymarket_fee_rate: d("0.07"),
+            outcome_taker_rate: d("0.00035"),
+            extra_cost_multiplier: Decimal::ONE,
+        };
+        let (shares, price) = ack_fill(
+            OUTCOME,
+            OrderSide::Buy,
+            None,
+            Some(d("30")),
+            Some(d("0.949")),
+            &json!({}),
+        )
+        .unwrap();
+        let fee = estimate_taker_fee(OUTCOME, shares, price, &fees);
+        assert_eq!(fee, d("30") * d("0.949") * d("0.00035"));
+        let pm_fee = estimate_taker_fee(POLYMARKET, d("30"), d("0.40"), &fees);
+        assert_eq!(pm_fee, d("30") * d("0.07") * d("0.40") * d("0.60"));
     }
 
     #[test]

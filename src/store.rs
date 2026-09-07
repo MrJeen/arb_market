@@ -156,18 +156,23 @@ impl Store {
         order_hash: &str,
         envelope: &Value,
         http_payload: &Value,
+        book_snapshot: Option<&Value>,
     ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("INSERT INTO signed_envelopes (leg_id, order_hash, payload) VALUES ($1,$2,$3)")
-            .bind(leg_id)
-            .bind(order_hash)
-            .bind(http_payload)
-            .execute(&mut *tx)
-            .await?;
         let client_id = envelope
             .get("cloid")
             .and_then(|v| v.as_str())
             .unwrap_or(order_hash);
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO signed_envelopes (leg_id, order_hash, payload, book_snapshot)
+             VALUES ($1,$2,$3,$4)",
+        )
+        .bind(leg_id)
+        .bind(order_hash)
+        .bind(http_payload)
+        .bind(book_snapshot)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "UPDATE legs SET client_order_id = $2, submitted_at = COALESCE(submitted_at, NOW()),
                     updated_at = NOW()
@@ -178,6 +183,20 @@ impl Store {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn save_submit_response(&self, leg_id: i64, response: &Value) -> Result<()> {
+        sqlx::query(
+            "UPDATE signed_envelopes SET submit_response = $2
+             WHERE id = (
+                 SELECT id FROM signed_envelopes WHERE leg_id = $1 ORDER BY id DESC LIMIT 1
+             )",
+        )
+        .bind(leg_id)
+        .bind(response)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -269,6 +288,15 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    pub async fn order_topic_key(&self, order_id: i64) -> Result<TopicKey> {
+        let (event_id, unified_index): (Uuid, i32) =
+            sqlx::query_as("SELECT event_id, unified_index FROM arb_orders WHERE id = $1")
+                .bind(order_id)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(TopicKey::new(event_id, unified_index))
     }
 
     pub async fn upsert_fill(
@@ -374,16 +402,14 @@ impl Store {
         Ok(exists.is_some())
     }
 
-    pub async fn fail_stale_pending_without_envelope(&self, timeout: Duration) -> Result<u64> {
+    pub async fn fail_stale_pending_unsubmitted(&self, timeout: Duration) -> Result<u64> {
         let secs = timeout.as_secs() as i64;
         let result = sqlx::query(
             "UPDATE legs SET status = 'failed', updated_at = NOW(),
-                    last_order_info = jsonb_build_object('reason','pending_timeout_no_envelope')
+                    last_order_info = jsonb_build_object('reason','pending_timeout_unsubmitted')
              WHERE status = 'pending'
-               AND created_at < NOW() - make_interval(secs => $1)
-               AND NOT EXISTS (
-                 SELECT 1 FROM signed_envelopes e WHERE e.leg_id = legs.id
-               )",
+               AND submitted_at IS NULL
+               AND created_at < NOW() - make_interval(secs => $1)",
         )
         .bind(secs)
         .execute(&self.pool)
@@ -422,10 +448,7 @@ impl Store {
                     last_order_info = COALESCE(last_order_info, '{}'::jsonb)
                         || jsonb_build_object('reason','pending_after_submit')
              WHERE status = 'pending'
-               AND submitted_at IS NOT NULL
-               AND EXISTS (
-                 SELECT 1 FROM signed_envelopes e WHERE e.leg_id = legs.id
-               )",
+               AND submitted_at IS NOT NULL",
         )
         .execute(&self.pool)
         .await?;

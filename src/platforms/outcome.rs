@@ -154,7 +154,7 @@ impl OutcomeVenue {
         })
     }
 
-    pub async fn post_prepared(&self, prepared: PreparedOrder) -> Result<SubmitResult> {
+    pub async fn post_prepared(&self, prepared: PreparedOrder) -> Result<(SubmitResult, Value)> {
         let hash = prepared.order_hash.clone();
         let envelope = prepared.envelope.clone();
         let cloid = envelope
@@ -172,15 +172,29 @@ impl OutcomeVenue {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let body: Value = resp.json().await.unwrap_or(json!({}));
-                Ok(classify_http_submit(status, &body, hash, envelope, &cloid))
+                let stored = if status >= 400 {
+                    json!({ "http_status": status, "body": body })
+                } else {
+                    body.clone()
+                };
+                Ok((
+                    classify_http_submit(status, &body, hash, envelope, &cloid),
+                    stored,
+                ))
             }
-            Err(err) => Ok(classify_submit_transport_error(err, hash, envelope)),
+            Err(err) => {
+                let response = json!({ "error": err.to_string() });
+                Ok((
+                    classify_submit_transport_error(err, hash, envelope),
+                    response,
+                ))
+            }
         }
     }
 
     pub async fn market_order(&self, req: &MarketOrderRequest) -> Result<SubmitResult> {
         let prepared = self.prepare_market_order(req)?;
-        self.post_prepared(prepared).await
+        Ok(self.post_prepared(prepared).await?.0)
     }
 
     pub async fn poll_order(&self, oid: &str, coin: &str) -> Result<OrderPoll> {

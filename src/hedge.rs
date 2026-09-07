@@ -22,6 +22,7 @@ pub struct HedgeAction {
     pub side: HedgeSide,
     pub shares: Decimal,
     pub cap_price: Decimal,
+    pub fee: Decimal,
     pub marginal_value: Decimal,
 }
 
@@ -265,6 +266,7 @@ fn eval_sell(
                 depth.worst,
                 polymarket_tick(books, platform, token_id),
             )?,
+            fee,
             marginal_value: revenue,
         },
     })
@@ -311,6 +313,7 @@ fn eval_buy(
                 cap,
                 polymarket_tick(books, platform, token_id),
             )?,
+            fee,
             // 补齐后锁定兑付 $1/share，边际价值 = 锁定兑付 - 买入成本。
             marginal_value: qty - cost,
         },
@@ -517,6 +520,7 @@ mod tests {
         assert_eq!(actions[0].shares, floor_shares(d("25")));
         // 锁定 25 - 成本 10 = 15
         assert_eq!(actions[0].marginal_value, d("15"));
+        assert_eq!(actions[0].fee, Decimal::ZERO);
     }
 
     #[test]
@@ -555,6 +559,88 @@ mod tests {
         assert_eq!(actions[0].shares, floor_shares(d("25")));
         // 卖出回收 12.5 > 买入锁定 25 - 20 = 5
         assert_eq!(actions[0].marginal_value, d("12.5"));
+        assert_eq!(actions[0].fee, Decimal::ZERO);
+    }
+
+    #[test]
+    fn hedge_buy_and_sell_set_taker_fee() {
+        let fees = FeeContext {
+            polymarket_fee_rate: d("0.07"),
+            outcome_taker_rate: d("0.00035"),
+            extra_cost_multiplier: Decimal::ONE,
+        };
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        books.replace_snapshot(
+            OUTCOME,
+            "#10",
+            vec![],
+            vec![Level {
+                price: d("0.4"),
+                size: d("40"),
+            }],
+            1,
+            now,
+        );
+        let mut balances = HashMap::new();
+        balances.insert(OUTCOME.into(), d("100"));
+        let buy = plan_hedge(
+            &topic(),
+            &imbalanced_positions("31", "6"),
+            &books,
+            &balances,
+            &fees,
+            d("1.5"),
+            now,
+            Duration::from_secs(5),
+        );
+        assert_eq!(buy[0].side, HedgeSide::Buy);
+        assert_eq!(
+            buy[0].fee,
+            estimate_taker_fee(OUTCOME, buy[0].shares, d("0.4"), &fees)
+        );
+        assert!(buy[0].fee > Decimal::ZERO);
+
+        let mut sell_books = BookStore::default();
+        sell_books.replace_snapshot(
+            OUTCOME,
+            "#10",
+            vec![],
+            vec![Level {
+                price: d("0.80"),
+                size: d("40"),
+            }],
+            1,
+            now,
+        );
+        sell_books.replace_snapshot(
+            POLYMARKET,
+            "pm-yes",
+            vec![Level {
+                price: d("0.50"),
+                size: d("40"),
+            }],
+            vec![],
+            1,
+            now,
+        );
+        sell_books.set_tick_size(POLYMARKET, "pm-yes", d("0.01"));
+        let sell = plan_hedge(
+            &topic(),
+            &imbalanced_positions("31", "6"),
+            &sell_books,
+            &balances,
+            &fees,
+            d("1.5"),
+            now,
+            Duration::from_secs(5),
+        );
+        assert_eq!(sell[0].side, HedgeSide::Sell);
+        assert_eq!(
+            sell[0].fee,
+            estimate_taker_fee(POLYMARKET, sell[0].shares, d("0.50"), &fees)
+        );
+        assert!(sell[0].fee > Decimal::ZERO);
     }
 
     #[test]

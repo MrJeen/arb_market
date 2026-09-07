@@ -2,6 +2,7 @@ use crate::config::{OUTCOME, POLYMARKET};
 use crate::domain::TopicKey;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -63,6 +64,18 @@ impl OrderBook {
 
     pub fn best_ask(&self) -> Option<Decimal> {
         best_ask_px(&self.asks)
+    }
+
+    pub fn snapshot_json(&self) -> Value {
+        serde_json::json!({
+            "platform": self.platform,
+            "token_id": self.token_id,
+            "bids": self.bids,
+            "asks": self.asks,
+            "exchange_ts_ms": self.exchange_ts_ms,
+            "tick_size": self.tick_size,
+            "stale": self.stale,
+        })
     }
 }
 

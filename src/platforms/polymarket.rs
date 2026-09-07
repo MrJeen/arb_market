@@ -459,7 +459,7 @@ impl PolymarketVenue {
         })
     }
 
-    pub async fn post_prepared(&self, prepared: &PreparedOrder) -> Result<SubmitResult> {
+    pub async fn post_prepared(&self, prepared: &PreparedOrder) -> Result<(SubmitResult, Value)> {
         let funder = prepared
             .funder
             .as_deref()
@@ -477,8 +477,14 @@ impl PolymarketVenue {
             )
             .await
         {
-            Ok(body) => Ok(parse_submit(&body, order_hash, envelope)),
-            Err(err) => Ok(classify_submit_error(&err, order_hash, envelope)),
+            Ok(body) => {
+                let result = parse_submit(&body, order_hash, envelope);
+                Ok((result, body))
+            }
+            Err(err) => {
+                let response = super::submit_http_error_response(&err);
+                Ok((classify_submit_error(&err, order_hash, envelope), response))
+            }
         }
     }
 
@@ -488,7 +494,7 @@ impl PolymarketVenue {
         req: &MarketOrderRequest,
     ) -> Result<SubmitResult> {
         let prepared = self.prepare_market_order(funder, req).await?;
-        self.post_prepared(&prepared).await
+        Ok(self.post_prepared(&prepared).await?.0)
     }
 
     pub async fn poll_order(&self, funder: &str, order_id: &str) -> Result<OrderPoll> {

@@ -3,7 +3,7 @@ pub mod polymarket;
 
 use crate::error::Result;
 use rust_decimal::Decimal;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 #[derive(Debug, Clone)]
 pub struct PreparedOrder {
@@ -67,6 +67,16 @@ pub enum SubmitResult {
         status: u16,
         message: String,
     },
+}
+
+pub fn submit_http_error_response(err: &crate::error::Error) -> Value {
+    match err {
+        crate::error::Error::Http { status, message } => {
+            let body = serde_json::from_str(message).unwrap_or_else(|_| json!(message));
+            json!({ "http_status": status, "body": body })
+        }
+        other => json!({ "error": other.to_string() }),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -201,5 +211,16 @@ mod tests {
         );
         assert!(ioc_fill(Some(d("0")), Some(d("0.4"))).is_none());
         assert!(ioc_fill(Some(d("5")), None).is_none());
+    }
+
+    #[test]
+    fn submit_http_error_response_keeps_status_and_json_body() {
+        let err = crate::error::Error::Http {
+            status: 400,
+            message: r#"{"error":"Invalid order payload"}"#.into(),
+        };
+        let stored = submit_http_error_response(&err);
+        assert_eq!(stored["http_status"], 400);
+        assert_eq!(stored["body"]["error"], "Invalid order payload");
     }
 }
