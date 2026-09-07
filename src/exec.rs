@@ -1,7 +1,8 @@
 use crate::book::{BookStore, DirtyCoalescer, OrderBook};
 use crate::calc::{
-    below_venue_mins, best_plan, confirm_plan, diagnose_books, first_usable_ask, inspect_calc,
-    min_trade_amount, min_trade_cost, ArbLimits, ArbPlan, CalcMissSnapshot, FeeContext,
+    below_venue_mins, best_plan, confirm_plan, confirm_plan_reason, diagnose_books,
+    first_usable_ask, inspect_calc, min_trade_amount, min_trade_cost, ArbLimits, ArbPlan,
+    CalcMissSnapshot, FeeContext,
 };
 use crate::config::{Config, OUTCOME, POLYMARKET};
 use crate::discovery::load_active_topics;
@@ -198,7 +199,15 @@ impl Engine {
                     )
                 })
                 .unwrap_or((0, 0, None, None, None, None));
-            (plan, pm_book_ts, out_book_ts, pm_ask, pm_sz, out_ask, out_sz)
+            (
+                plan,
+                pm_book_ts,
+                out_book_ts,
+                pm_ask,
+                pm_sz,
+                out_ask,
+                out_sz,
+            )
         };
         self.stats.calc();
         let Some(plan) = plan else {
@@ -681,6 +690,7 @@ impl Engine {
                     &plan.pm.label,
                     &plan.outcome.label,
                 );
+                let reason = confirm_plan_reason(topic, plan, &pm_book, &out_book, &fees, &limits);
                 tracing::info!(
                     topic = %topic.key.as_str(),
                     pm_ts,
@@ -696,10 +706,10 @@ impl Engine {
                     out_prev_ask = %fmt_px(out_prev_ask),
                     out_prev_sz = %fmt_px(out_prev_sz),
                     unit_cost = %fmt_px(miss.unit_cost),
-                    reason = miss.reason,
+                    reason,
                     pm_applied,
                     out_applied,
-                    "http recalc no longer arb"
+                    "http plan not fillable"
                 );
                 self.stats.no_longer();
                 Ok(None)
@@ -1075,7 +1085,9 @@ impl Engine {
             )));
         }
         if action.platform == POLYMARKET {
-            let funder = self.hedge_pm_funder(order_id, &action.token_id, side).await?;
+            let funder = self
+                .hedge_pm_funder(order_id, &action.token_id, side)
+                .await?;
             tracing::info!(
                 order_id,
                 funder = %funder,
@@ -1760,23 +1772,15 @@ mod tests {
 
     #[test]
     fn hedge_buy_uses_order_funder_not_token_buy() {
-        let funder = resolve_hedge_pm_funder(
-            false,
-            Some("0xtoken".into()),
-            Some("0xorder".into()),
-        )
-        .unwrap();
+        let funder =
+            resolve_hedge_pm_funder(false, Some("0xtoken".into()), Some("0xorder".into())).unwrap();
         assert_eq!(funder, "0xorder");
     }
 
     #[test]
     fn hedge_sell_prefers_token_buy_funder() {
-        let funder = resolve_hedge_pm_funder(
-            true,
-            Some("0xtoken".into()),
-            Some("0xorder".into()),
-        )
-        .unwrap();
+        let funder =
+            resolve_hedge_pm_funder(true, Some("0xtoken".into()), Some("0xorder".into())).unwrap();
         assert_eq!(funder, "0xtoken");
     }
 

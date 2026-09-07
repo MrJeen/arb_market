@@ -142,7 +142,8 @@ pub fn plan_arbitrage(
     )
 }
 
-/// 用 HTTP 盘口按原 `ArbPlan` 的同一对 token 再算一次，不换互补方向。
+/// 用最新盘口验证已有 plan：原 shares 能在 cap 内吃满，且按实际均价仍过门槛。
+/// 通过后原样返回 plan，不重算数量和限价。
 pub fn confirm_plan(
     topic: &Topic,
     plan: &ArbPlan,
@@ -151,16 +152,105 @@ pub fn confirm_plan(
     fees: &FeeContext,
     limits: &ArbLimits,
 ) -> Option<ArbPlan> {
-    let pm_token = topic.token(POLYMARKET, &plan.pm.label)?;
-    let out_token = topic.token(OUTCOME, &plan.outcome.label)?;
+    validate_plan_on_books(topic, plan, pm_book, out_book, fees, limits)
+        .ok()
+        .map(|_| plan.clone())
+}
+
+pub fn confirm_plan_reason(
+    topic: &Topic,
+    plan: &ArbPlan,
+    pm_book: &OrderBook,
+    out_book: &OrderBook,
+    fees: &FeeContext,
+    limits: &ArbLimits,
+) -> &'static str {
+    validate_plan_on_books(topic, plan, pm_book, out_book, fees, limits)
+        .err()
+        .unwrap_or("ok")
+}
+
+fn validate_plan_on_books(
+    topic: &Topic,
+    plan: &ArbPlan,
+    pm_book: &OrderBook,
+    out_book: &OrderBook,
+    fees: &FeeContext,
+    limits: &ArbLimits,
+) -> Result<(), &'static str> {
+    let pm_token = topic
+        .token(POLYMARKET, &plan.pm.label)
+        .ok_or("missing_book")?;
+    let out_token = topic
+        .token(OUTCOME, &plan.outcome.label)
+        .ok_or("missing_book")?;
     if pm_token.token_id != plan.pm.token_id
         || out_token.token_id != plan.outcome.token_id
         || pm_book.token_id != plan.pm.token_id
         || out_book.token_id != plan.outcome.token_id
     {
+        return Err("token_mismatch");
+    }
+    let pm_cost = take_asks_cost(&pm_book.asks, plan.pm.shares, plan.pm.cap_price, false)
+        .ok_or("pm_unfillable")?;
+    let out_cost = take_asks_cost(
+        &out_book.asks,
+        plan.outcome.shares,
+        plan.outcome.cap_price,
+        true,
+    )
+    .ok_or("out_unfillable")?;
+    let acc = Acc {
+        pm_shares: plan.pm.shares,
+        out_shares: plan.outcome.shares,
+        pm_cost,
+        out_cost,
+        pm_cap: plan.pm.cap_price,
+        out_cap: plan.outcome.cap_price,
+    };
+    if !acc.passes_mins() {
+        return Err("venue_min");
+    }
+    let metrics = acc.metrics(fees, limits);
+    if metrics.total_cost > limits.cost_limit {
+        return Err("cost_limit");
+    }
+    if metrics.profit < limits.min_profit || metrics.apr < limits.min_apr {
+        return Err("unprofitable");
+    }
+    Ok(())
+}
+
+fn take_asks_cost(
+    asks: &[Level],
+    shares: Decimal,
+    cap: Decimal,
+    floor_out: bool,
+) -> Option<Decimal> {
+    if shares <= Decimal::ZERO {
         return None;
     }
-    plan_arbitrage(topic, pm_book, out_book, pm_token, out_token, fees, limits)
+    let mut asks = asks.to_vec();
+    asks.sort_by(|a, b| a.price.cmp(&b.price));
+    let mut remain = shares;
+    let mut cost = Decimal::ZERO;
+    while remain > Decimal::ZERO {
+        drop_unusable(&mut asks, floor_out);
+        let level = asks.first()?;
+        if level.price > cap {
+            return None;
+        }
+        let available = if floor_out {
+            floor_shares(level.size)
+        } else {
+            level.size
+        };
+        let take = remain.min(available);
+        cost += level.price * take;
+        remain -= take;
+        consume_qty(&mut asks, take, floor_out);
+    }
+    Some(cost)
 }
 
 fn search_pair(
@@ -1216,15 +1306,15 @@ mod tests {
     }
 
     #[test]
-    fn confirm_plan_keeps_pair_when_http_still_arb() {
+    fn confirm_plan_keeps_original_size_and_cap() {
         let mut books = BookStore::default();
         let now = Instant::now();
         snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
         snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
         let first = plan_with(&books, now, &limits("3", "100"));
         let mut http = BookStore::default();
-        snapshot(&mut http, POLYMARKET, "pm-yes", vec![("0.42", "40")], now);
-        snapshot(&mut http, OUTCOME, "#10", vec![("0.42", "40")], now);
+        snapshot(&mut http, POLYMARKET, "pm-yes", vec![("0.39", "80")], now);
+        snapshot(&mut http, OUTCOME, "#10", vec![("0.39", "80")], now);
         let confirmed = confirm_plan(
             &sample_topic(),
             &first,
@@ -1233,12 +1323,67 @@ mod tests {
             &fees_zero(),
             &limits("3", "100"),
         )
-        .expect("still arb");
-        assert_eq!(confirmed.pm.label, first.pm.label);
-        assert_eq!(confirmed.outcome.label, first.outcome.label);
-        assert_eq!(confirmed.pm.token_id, first.pm.token_id);
-        assert_eq!(confirmed.outcome.token_id, first.outcome.token_id);
-        assert_ne!(confirmed.pm.cap_price, first.pm.cap_price);
+        .expect("still fillable");
+        assert_eq!(confirmed.pm.shares, first.pm.shares);
+        assert_eq!(confirmed.outcome.shares, first.outcome.shares);
+        assert_eq!(confirmed.pm.cap_price, first.pm.cap_price);
+        assert_eq!(confirmed.outcome.cap_price, first.outcome.cap_price);
+        assert_eq!(confirmed.pm.avg_price, first.pm.avg_price);
+    }
+
+    #[test]
+    fn confirm_plan_rejects_when_http_worse_than_cap() {
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+        snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+        let first = plan_with(&books, now, &limits("3", "100"));
+        let mut http = BookStore::default();
+        snapshot(&mut http, POLYMARKET, "pm-yes", vec![("0.42", "80")], now);
+        snapshot(&mut http, OUTCOME, "#10", vec![("0.42", "80")], now);
+        assert!(confirm_plan(
+            &sample_topic(),
+            &first,
+            http.get(POLYMARKET, "pm-yes").unwrap(),
+            http.get(OUTCOME, "#10").unwrap(),
+            &fees_zero(),
+            &limits("3", "100"),
+        )
+        .is_none());
+        assert_eq!(
+            confirm_plan_reason(
+                &sample_topic(),
+                &first,
+                http.get(POLYMARKET, "pm-yes").unwrap(),
+                http.get(OUTCOME, "#10").unwrap(),
+                &fees_zero(),
+                &limits("3", "100"),
+            ),
+            "pm_unfillable"
+        );
+    }
+
+    #[test]
+    fn confirm_plan_rejects_when_http_depth_thin() {
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+        snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+        let first = plan_with(&books, now, &limits("3", "100"));
+        let mut http = BookStore::default();
+        snapshot(&mut http, POLYMARKET, "pm-yes", vec![("0.40", "10")], now);
+        snapshot(&mut http, OUTCOME, "#10", vec![("0.40", "10")], now);
+        assert_eq!(
+            confirm_plan_reason(
+                &sample_topic(),
+                &first,
+                http.get(POLYMARKET, "pm-yes").unwrap(),
+                http.get(OUTCOME, "#10").unwrap(),
+                &fees_zero(),
+                &limits("3", "100"),
+            ),
+            "pm_unfillable"
+        );
     }
 
     #[test]
@@ -1297,8 +1442,8 @@ mod tests {
                     size: d("50"),
                 },
                 Level {
-                    price: d("0.42"),
-                    size: d("40"),
+                    price: d("0.40"),
+                    size: d("50"),
                 },
             ],
             exchange_ts_ms: 1,
@@ -1311,8 +1456,8 @@ mod tests {
             token_id: "#10".into(),
             bids: vec![],
             asks: vec![Level {
-                price: d("0.42"),
-                size: d("40"),
+                price: d("0.40"),
+                size: d("50"),
             }],
             exchange_ts_ms: 1,
             received_at: now,
@@ -1327,8 +1472,10 @@ mod tests {
             &fees_zero(),
             &limits("3", "100"),
         )
-        .expect("cheap ask still arb");
-        assert_eq!(confirmed.pm.avg_price, d("0.42"));
+        .expect("cheap ask still fillable");
+        assert_eq!(confirmed.pm.shares, first.pm.shares);
+        assert_eq!(confirmed.pm.cap_price, first.pm.cap_price);
+        assert_eq!(confirmed.pm.avg_price, first.pm.avg_price);
     }
 
     #[test]

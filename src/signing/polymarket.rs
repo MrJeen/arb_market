@@ -1,8 +1,8 @@
 use super::{
     domain_separator, domain_separator_no_contract, encode_address, encode_bytes32, encode_u256,
     encode_u8, keccak, parse_address, typed_data_digest, CLOB_AUTH_MESSAGE, CLOB_AUTH_TYPE,
-    DEPOSIT_WALLET_NAME, DEPOSIT_WALLET_VERSION, NEG_RISK_EXCHANGE, ORDER_TYPE, POLYMARKET_CHAIN_ID,
-    STANDARD_EXCHANGE, TYPED_DATA_SIGN_TYPE,
+    DEPOSIT_WALLET_NAME, DEPOSIT_WALLET_VERSION, NEG_RISK_EXCHANGE, ORDER_TYPE,
+    POLYMARKET_CHAIN_ID, STANDARD_EXCHANGE, TYPED_DATA_SIGN_TYPE,
 };
 use alloy_primitives::{Address, B256, U256};
 use alloy_signer::SignerSync;

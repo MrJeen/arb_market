@@ -152,12 +152,16 @@ impl PolymarketVenue {
         }
         tracing::info!(funder = %cfg.funder_address, "polymarket account authenticating");
         let account = init_account(&self.http, &self.base, &cfg).await?;
-        if let Err(err) = save_api_cred(&self.creds_path, &key, &StoredApiCreds {
-            api_key: account.api_key.clone(),
-            secret: account.api_secret.clone(),
-            passphrase: account.api_passphrase.clone(),
-            created_at: account.created_at,
-        }) {
+        if let Err(err) = save_api_cred(
+            &self.creds_path,
+            &key,
+            &StoredApiCreds {
+                api_key: account.api_key.clone(),
+                secret: account.api_secret.clone(),
+                passphrase: account.api_passphrase.clone(),
+                created_at: account.created_at,
+            },
+        ) {
             tracing::warn!(error = %err, "polymarket api creds persist failed");
         }
         self.authed.lock().await.insert(key, account.clone());
@@ -582,7 +586,10 @@ async fn init_account(
     })
 }
 
-fn account_from_creds(cfg: &PolymarketFunderConfig, creds: &StoredApiCreds) -> Result<PolymarketAccount> {
+fn account_from_creds(
+    cfg: &PolymarketFunderConfig,
+    creds: &StoredApiCreds,
+) -> Result<PolymarketAccount> {
     let signer: PrivateKeySigner = cfg
         .wallet_private_key
         .parse()
