@@ -549,12 +549,12 @@ mod tests {
     #[test]
     fn hedge_order_tokens_only_excess_and_cross_deficit() {
         let tokens = hedge_order_tokens(&topic(), &imbalanced_positions("31", "6"), d("1.5"));
-        let mut keys: Vec<_> = tokens.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();
+        let mut keys: Vec<_> = tokens
+            .iter()
+            .map(|(p, t)| (p.as_str(), t.as_str()))
+            .collect();
         keys.sort();
-        assert_eq!(
-            keys,
-            vec![(OUTCOME, "#10"), (POLYMARKET, "pm-yes")]
-        );
+        assert_eq!(keys, vec![(OUTCOME, "#10"), (POLYMARKET, "pm-yes")]);
         assert!(!tokens.iter().any(|(p, t)| p == POLYMARKET && t == "pm-no"));
         assert!(!tokens.iter().any(|(p, t)| p == OUTCOME && t == "#11"));
     }

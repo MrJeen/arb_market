@@ -8,7 +8,9 @@ use crate::config::{Config, OUTCOME, POLYMARKET};
 use crate::discovery::load_active_topics;
 use crate::domain::{Topic, TopicKey};
 use crate::error::{Error, Result};
-use crate::hedge::{hedge_order_tokens, leftover_untradeable, needs_rebalance, plan_hedge, HedgeSide};
+use crate::hedge::{
+    hedge_order_tokens, leftover_untradeable, needs_rebalance, plan_hedge, HedgeSide,
+};
 use crate::notify::{self, NatsNotifier, PlaceNotice, PlaceResult};
 use crate::platforms::outcome::OutcomeVenue;
 use crate::platforms::polymarket::PolymarketVenue;
@@ -1067,8 +1069,7 @@ impl Engine {
                 balances.insert(OUTCOME.to_string(), bal);
             }
             let fees = self.fee_context(&topic);
-            let order_tokens =
-                hedge_order_tokens(&topic, &positions, self.cfg.min_rebalance_qty);
+            let order_tokens = hedge_order_tokens(&topic, &positions, self.cfg.min_rebalance_qty);
             self.refresh_hedge_books(order.id, &order_tokens).await;
             for (platform, token_id) in &order_tokens {
                 if platform == POLYMARKET {
@@ -1309,7 +1310,13 @@ impl Engine {
             } else {
                 self.outcome.rest_book(&token_id).await
             };
-            (platform, token_id, result, Instant::now(), started.elapsed())
+            (
+                platform,
+                token_id,
+                result,
+                Instant::now(),
+                started.elapsed(),
+            )
         });
         for (platform, token_id, result, received_at, elapsed) in
             futures_util::future::join_all(fetches).await

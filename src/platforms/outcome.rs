@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
+const USDC_BALANCE_CACHE_TTL: Duration = Duration::from_secs(10);
+
 #[derive(Clone)]
 pub struct OutcomeVenue {
     http: reqwest::Client,
@@ -27,6 +29,27 @@ pub struct OutcomeVenue {
     account: Option<String>,
     builder: Option<(String, u32)>,
     nonce: Arc<StdMutex<u64>>,
+    usdc_balance_cache: Arc<Mutex<UsdcBalanceCache>>,
+    usdc_balance_refresh: Arc<Mutex<()>>,
+}
+
+#[derive(Default)]
+struct UsdcBalanceCache {
+    value: Option<(Decimal, Instant)>,
+    generation: u64,
+}
+
+impl UsdcBalanceCache {
+    fn get_fresh(&self, now: Instant) -> Option<Decimal> {
+        self.value.and_then(|(balance, fetched_at)| {
+            (now.saturating_duration_since(fetched_at) < USDC_BALANCE_CACHE_TTL).then_some(balance)
+        })
+    }
+
+    fn invalidate(&mut self) {
+        self.value = None;
+        self.generation = self.generation.wrapping_add(1);
+    }
 }
 
 impl OutcomeVenue {
@@ -53,6 +76,8 @@ impl OutcomeVenue {
                 .clone()
                 .map(|addr| (addr, cfg.outcome_builder_fee)),
             nonce: Arc::new(StdMutex::new(0)),
+            usdc_balance_cache: Arc::new(Mutex::new(UsdcBalanceCache::default())),
+            usdc_balance_refresh: Arc::new(Mutex::new(())),
         })
     }
 
@@ -83,6 +108,49 @@ impl OutcomeVenue {
     }
 
     pub async fn user_state(&self) -> Result<Decimal> {
+        self.cached_usdc_balance(|| self.fetch_usdc_balance()).await
+    }
+
+    async fn cached_usdc_balance<F, Fut>(&self, mut fetch: F) -> Result<Decimal>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<Decimal>>,
+    {
+        if let Some(balance) = self
+            .usdc_balance_cache
+            .lock()
+            .await
+            .get_fresh(Instant::now())
+        {
+            return Ok(balance);
+        }
+
+        // Singleflight：缓存过期时仅一个调用刷新，等待者在拿到锁后复用新值。
+        let _refresh = self.usdc_balance_refresh.lock().await;
+        loop {
+            let generation = {
+                let cache = self.usdc_balance_cache.lock().await;
+                if let Some(balance) = cache.get_fresh(Instant::now()) {
+                    return Ok(balance);
+                }
+                cache.generation
+            };
+            let balance = fetch().await?;
+            let mut cache = self.usdc_balance_cache.lock().await;
+            if cache.generation != generation {
+                // 请求期间发生过下单，不能把可能已过时的余额重新写入缓存。
+                continue;
+            }
+            cache.value = Some((balance, Instant::now()));
+            tracing::debug!(
+                ttl_secs = USDC_BALANCE_CACHE_TTL.as_secs(),
+                "outcome usdc balance cached"
+            );
+            return Ok(balance);
+        }
+    }
+
+    async fn fetch_usdc_balance(&self) -> Result<Decimal> {
         let user = self
             .account
             .clone()
@@ -97,6 +165,11 @@ impl OutcomeVenue {
             .json()
             .await?;
         Ok(parse_usdc_balance(&value))
+    }
+
+    async fn invalidate_usdc_balance(&self) {
+        self.usdc_balance_cache.lock().await.invalidate();
+        tracing::debug!("outcome usdc balance cache invalidated");
     }
 
     pub fn prepare_market_order(&self, req: &MarketOrderRequest) -> Result<PreparedOrder> {
@@ -162,13 +235,15 @@ impl OutcomeVenue {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        match self
+        let response = self
             .http
             .post(&self.exchange_url)
             .json(&prepared.payload)
             .send()
-            .await
-        {
+            .await;
+        // 即使提交结果不明确，也不能继续复用提交前的余额。
+        self.invalidate_usdc_balance().await;
+        match response {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let body: Value = resp.json().await.unwrap_or(json!({}));
@@ -602,6 +677,146 @@ fn coin_aliases_match(got: &str, want: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn test_venue() -> OutcomeVenue {
+        OutcomeVenue {
+            http: reqwest::Client::new(),
+            info_url: "http://127.0.0.1".into(),
+            exchange_url: "http://127.0.0.1".into(),
+            mainnet: true,
+            signer: None,
+            account: Some("0xtest".into()),
+            builder: None,
+            nonce: Arc::new(StdMutex::new(0)),
+            usdc_balance_cache: Arc::new(Mutex::new(UsdcBalanceCache::default())),
+            usdc_balance_refresh: Arc::new(Mutex::new(())),
+        }
+    }
+
+    #[test]
+    fn usdc_cache_expires_after_ten_seconds() {
+        let now = Instant::now();
+        let fresh_at = now
+            .checked_sub(USDC_BALANCE_CACHE_TTL - Duration::from_millis(1))
+            .unwrap();
+        let expired_at = now.checked_sub(USDC_BALANCE_CACHE_TTL).unwrap();
+        let mut cache = UsdcBalanceCache {
+            value: Some((Decimal::from(7), fresh_at)),
+            ..Default::default()
+        };
+        assert_eq!(cache.get_fresh(now), Some(Decimal::from(7)));
+        cache.value = Some((Decimal::from(7), expired_at));
+        assert_eq!(cache.get_fresh(now), None);
+    }
+
+    #[tokio::test]
+    async fn usdc_cache_reuses_success_and_invalidation_refreshes() {
+        let venue = test_venue();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetch = || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Decimal::from(11))
+            }
+        };
+        assert_eq!(
+            venue.cached_usdc_balance(fetch).await.unwrap(),
+            Decimal::from(11)
+        );
+        assert_eq!(
+            venue.cached_usdc_balance(fetch).await.unwrap(),
+            Decimal::from(11)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        venue.invalidate_usdc_balance().await;
+        assert_eq!(
+            venue.cached_usdc_balance(fetch).await.unwrap(),
+            Decimal::from(11)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn usdc_cache_does_not_store_failures() {
+        let venue = test_venue();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let result = venue
+            .cached_usdc_balance(|| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(Error::msg("temporary failure"))
+                }
+            })
+            .await;
+        assert!(result.is_err());
+        let balance = venue
+            .cached_usdc_balance(|| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(Decimal::from(9))
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(balance, Decimal::from(9));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_usdc_calls_share_one_refresh() {
+        let venue = test_venue();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let futures = (0..8).map(|_| {
+            let venue = venue.clone();
+            let calls = calls.clone();
+            async move {
+                venue
+                    .cached_usdc_balance(|| {
+                        let calls = calls.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            Ok(Decimal::from(13))
+                        }
+                    })
+                    .await
+            }
+        });
+        let balances = futures_util::future::join_all(futures).await;
+        assert!(balances
+            .into_iter()
+            .all(|balance| balance.unwrap() == Decimal::from(13)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn invalidation_during_refresh_discards_stale_result() {
+        let venue = test_venue();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let balance = venue
+            .cached_usdc_balance(|| {
+                let venue = venue.clone();
+                let calls = calls.clone();
+                async move {
+                    let call = calls.fetch_add(1, Ordering::SeqCst);
+                    if call == 0 {
+                        venue.invalidate_usdc_balance().await;
+                        Ok(Decimal::from(20))
+                    } else {
+                        Ok(Decimal::from(15))
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(balance, Decimal::from(15));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn parses_l2_snapshot() {
