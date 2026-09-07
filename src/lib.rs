@@ -8,9 +8,11 @@ pub mod exec;
 pub mod hedge;
 pub mod notify;
 pub mod platforms;
+pub mod settlement;
 pub mod signing;
 pub mod stats;
 pub mod store;
+pub mod take_profit;
 
 use crate::book::{BookStore, DirtyCoalescer};
 use crate::config::{Config, OUTCOME, POLYMARKET};
@@ -62,6 +64,7 @@ pub async fn run() -> anyhow::Result<()> {
         out_sub_tx,
         notify,
         stats: Arc::new(MinuteStats::new()),
+        position_scan_cursor: Mutex::new(0),
     });
     engine.refresh_discovery().await?;
 
@@ -151,6 +154,7 @@ pub async fn run() -> anyhow::Result<()> {
     let hedge_interval = cfg.hedge_interval;
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(hedge_interval);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
             if let Err(err) = engine_hedge.hedge_once().await {

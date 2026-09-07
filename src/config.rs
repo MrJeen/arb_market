@@ -20,12 +20,15 @@ pub struct Config {
     pub app_postgres_uri: String,
     pub enabled_platforms: HashSet<String>,
     pub enable_buy: bool,
+    pub take_profit_enabled: bool,
+    pub take_profit_min_gain: Decimal,
     pub discovery_interval: Duration,
     pub reconcile_interval: Duration,
     pub hedge_interval: Duration,
     pub book_stale: Duration,
     pub book_resync: Duration,
     pub book_resync_batch: usize,
+    pub position_scan_batch: usize,
     pub arb_min_profit: Decimal,
     pub arb_min_apr: Decimal,
     pub arb_cost_limit: Decimal,
@@ -79,12 +82,19 @@ impl Config {
             app_postgres_uri: env_required("APP_POSTGRES_URI")?,
             enabled_platforms: enabled,
             enable_buy: env_bool("ENABLE_BUY", false),
+            take_profit_enabled: env_bool("TAKE_PROFIT_ENABLED", false),
+            take_profit_min_gain: parse_nonnegative_decimal(
+                "TAKE_PROFIT_MIN_GAIN",
+                env_opt("TAKE_PROFIT_MIN_GAIN").as_deref(),
+                "0.1",
+            )?,
             discovery_interval: Duration::from_secs(env_u64("DISCOVERY_INTERVAL_SECS", 30)),
             reconcile_interval: Duration::from_secs(env_u64("RECONCILE_INTERVAL_SECS", 2)),
             hedge_interval: Duration::from_secs(env_u64("HEDGE_INTERVAL_SECS", 5)),
             book_stale: Duration::from_millis(env_u64("BOOK_STALE_MS", 5000)),
             book_resync: Duration::from_secs(env_u64("BOOK_RESYNC_SECS", 10)),
             book_resync_batch: env_u64("BOOK_RESYNC_BATCH", 80) as usize,
+            position_scan_batch: env_u64("POSITION_SCAN_BATCH", 100).max(1) as usize,
             arb_min_profit: env_decimal("ARB_MIN_PROFIT", "3")?,
             arb_min_apr: env_decimal("ARB_MIN_APR", "0")?,
             arb_cost_limit: env_decimal("ARB_COST_LIMIT", "100")?,
@@ -303,6 +313,16 @@ fn env_u64(key: &str, default: u64) -> u64 {
     env_opt(key).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+fn parse_nonnegative_decimal(key: &str, raw: Option<&str>, default: &str) -> Result<Decimal> {
+    let text = raw.unwrap_or(default);
+    let value =
+        Decimal::from_str(text).map_err(|_| Error::Config(format!("invalid decimal {key}")))?;
+    if value < Decimal::ZERO {
+        return Err(Error::Config(format!("{key} must be non-negative")));
+    }
+    Ok(value)
+}
+
 fn env_decimal(key: &str, default: &str) -> Result<Decimal> {
     let text = env_opt(key).unwrap_or_else(|| default.to_string());
     Decimal::from_str(&text).map_err(|_| Error::Config(format!("invalid decimal {key}")))
@@ -311,6 +331,20 @@ fn env_decimal(key: &str, default: &str) -> Result<Decimal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validates_nonnegative_decimal_without_environment_mutation() {
+        assert_eq!(
+            parse_nonnegative_decimal("TAKE_PROFIT_MIN_GAIN", Some("0.25"), "0.1").unwrap(),
+            Decimal::new(25, 2)
+        );
+        assert!(
+            parse_nonnegative_decimal("TAKE_PROFIT_MIN_GAIN", Some("-0.01"), "0.1")
+                .unwrap_err()
+                .to_string()
+                .contains("must be non-negative")
+        );
+    }
 
     #[test]
     fn parses_enabled_platforms() {

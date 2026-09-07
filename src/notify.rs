@@ -39,6 +39,29 @@ pub struct PlaceResult {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TakeProfitTriggerNotice {
+    pub order_id: i64,
+    pub title: String,
+    pub expected_gain: Decimal,
+}
+
+#[derive(Debug, Clone)]
+pub struct TakeProfitCompletedNotice {
+    pub order_id: i64,
+    pub title: String,
+    pub actual_profit: Decimal,
+    pub actual_cost: Decimal,
+}
+
+#[derive(Debug, Clone)]
+pub struct SettlementNotice {
+    pub order_id: i64,
+    pub title: String,
+    pub status: String,
+    pub actual_profit: Option<Decimal>,
+}
+
 /// Telegram 旧版 Markdown（parse_mode=Markdown）只需转义 `_ * ` `[`。
 /// `] ( ) \` 不是独立语法，转义后会显示成 `\(`，所以不转义。
 pub fn escape_markdown(s: &str) -> String {
@@ -120,6 +143,41 @@ pub fn format_place_notice(tag: &str, notice: &PlaceNotice) -> String {
     if !failures.is_empty() {
         lines.push("❌ 失败详情:".into());
         lines.extend(failures);
+    }
+    lines.join("\n")
+}
+
+pub fn format_take_profit_trigger_notice(tag: &str, notice: &TakeProfitTriggerNotice) -> String {
+    format!(
+        "📈 {tag}止盈触发\n📋 orderId: {}\n📋 title: {}\n💰 expected gain: {}",
+        notice.order_id,
+        escape_markdown(&notice.title),
+        notice.expected_gain.normalize(),
+    )
+}
+
+pub fn format_take_profit_completed_notice(
+    tag: &str,
+    notice: &TakeProfitCompletedNotice,
+) -> String {
+    format!(
+        "✅ {tag}止盈完成\n📋 orderId: {}\n📋 title: {}\n💰 actual profit: {}\n💰 actual cost: {}",
+        notice.order_id,
+        escape_markdown(&notice.title),
+        notice.actual_profit.normalize(),
+        notice.actual_cost.normalize(),
+    )
+}
+
+pub fn format_settlement_notice(tag: &str, notice: &SettlementNotice) -> String {
+    let mut lines = vec![
+        format!("🏁 {tag}结算更新"),
+        format!("📋 orderId: {}", notice.order_id),
+        format!("📋 title: {}", escape_markdown(&notice.title)),
+        format!("📋 status: {}", escape_markdown(&notice.status)),
+    ];
+    if let Some(actual_profit) = notice.actual_profit {
+        lines.push(format!("💰 actual profit: {}", actual_profit.normalize()));
     }
     lines.join("\n")
 }
@@ -216,6 +274,18 @@ impl NatsNotifier {
 
     pub fn publish_alert(&self, body: String) {
         self.publish(body);
+    }
+
+    pub fn publish_take_profit_trigger(&self, notice: TakeProfitTriggerNotice) {
+        self.publish(format_take_profit_trigger_notice(&self.tag, &notice));
+    }
+
+    pub fn publish_take_profit_completed(&self, notice: TakeProfitCompletedNotice) {
+        self.publish(format_take_profit_completed_notice(&self.tag, &notice));
+    }
+
+    pub fn publish_settlement(&self, notice: SettlementNotice) {
+        self.publish(format_settlement_notice(&self.tag, &notice));
     }
 
     pub fn publish_order_actuals(
@@ -349,6 +419,61 @@ mod tests {
         assert!(text.contains("polymarket (rewards-11)"));
         assert!(text.contains("label=yes market=#12270: HTTP 429"));
         assert!(!text.contains("Real_Sociedad"));
+    }
+
+    #[test]
+    fn take_profit_notices_escape_title_and_include_amounts() {
+        let trigger = format_take_profit_trigger_notice(
+            "【cat】",
+            &TakeProfitTriggerNotice {
+                order_id: 42,
+                title: "Team_A *wins*".into(),
+                expected_gain: Decimal::new(125, 2),
+            },
+        );
+        assert!(trigger.contains("止盈触发"));
+        assert!(trigger.contains(r"Team\_A \*wins\*"));
+        assert!(trigger.contains("expected gain: 1.25"));
+
+        let completed = format_take_profit_completed_notice(
+            "【cat】",
+            &TakeProfitCompletedNotice {
+                order_id: 42,
+                title: "Team_A *wins*".into(),
+                actual_profit: Decimal::new(11, 1),
+                actual_cost: Decimal::new(25, 0),
+            },
+        );
+        assert!(completed.contains("止盈完成"));
+        assert!(completed.contains("actual profit: 1.1"));
+        assert!(completed.contains("actual cost: 25"));
+    }
+
+    #[test]
+    fn settlement_notice_escapes_fields_and_supports_unavailable_profit() {
+        let text = format_settlement_notice(
+            "【cat】",
+            &SettlementNotice {
+                order_id: 7,
+                title: "Event_[A]".into(),
+                status: "settled_final".into(),
+                actual_profit: Some(Decimal::new(-5, 1)),
+            },
+        );
+        assert!(text.contains(r"Event\_\[A]"));
+        assert!(text.contains(r"status: settled\_final"));
+        assert!(text.contains("actual profit: -0.5"));
+
+        let unavailable = format_settlement_notice(
+            "【cat】",
+            &SettlementNotice {
+                order_id: 8,
+                title: "Event B".into(),
+                status: "unavailable".into(),
+                actual_profit: None,
+            },
+        );
+        assert!(!unavailable.contains("actual profit"));
     }
 
     #[test]

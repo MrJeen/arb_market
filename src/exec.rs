@@ -5,24 +5,29 @@ use crate::calc::{
     ArbLimits, ArbPlan, CalcMissSnapshot, FeeContext,
 };
 use crate::config::{Config, OUTCOME, POLYMARKET};
-use crate::discovery::load_active_topics;
-use crate::domain::{Topic, TopicKey};
+use crate::discovery::{load_active_topics, load_topic};
+use crate::domain::{MarketIdentity, Topic, TopicKey};
 use crate::error::{Error, Result};
 use crate::hedge::{
     hedge_order_tokens, leftover_untradeable, needs_rebalance, plan_hedge, HedgeSide,
 };
-use crate::notify::{self, NatsNotifier, PlaceNotice, PlaceResult};
+use crate::notify::{
+    self, NatsNotifier, PlaceNotice, PlaceResult, SettlementNotice, TakeProfitCompletedNotice,
+    TakeProfitTriggerNotice,
+};
 use crate::platforms::outcome::OutcomeVenue;
 use crate::platforms::polymarket::PolymarketVenue;
 use crate::platforms::{
     ioc_fill, pm_fak_fill, MarketOrderRequest, OrderPoll, OrderSide, SubmitResult, TradeFill,
 };
+use crate::settlement::{OutcomeSettlement, SettlementStatus};
 use crate::stats::MinuteStats;
-use crate::store::Store;
+use crate::store::{ArbOrderRow, NewLeg, Store};
+use crate::take_profit::{plan_take_profit, TakeProfitAction, TakeProfitPlan};
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -40,6 +45,7 @@ pub struct Engine {
     pub out_sub_tx: mpsc::Sender<Vec<String>>,
     pub notify: Option<NatsNotifier>,
     pub stats: Arc<MinuteStats>,
+    pub position_scan_cursor: Mutex<i64>,
 }
 
 impl Engine {
@@ -348,6 +354,7 @@ impl Engine {
             .store
             .insert_order(
                 topic.key,
+                &topic.market_identity()?,
                 &topic.title,
                 &topic.market_title,
                 topic.end_date,
@@ -1046,104 +1053,701 @@ impl Engine {
     }
 
     pub async fn hedge_once(&self) -> Result<()> {
-        let orders = self.store.completed_unbalanced_orders().await?;
+        let after_id = *self.position_scan_cursor.lock().await;
+        let orders = self
+            .store
+            .completed_unbalanced_orders(after_id, self.cfg.position_scan_batch)
+            .await?;
+        if let Some(last) = orders.last() {
+            *self.position_scan_cursor.lock().await = last.id;
+        } else if after_id > 0 {
+            *self.position_scan_cursor.lock().await = 0;
+        }
         for order in orders {
-            let key = TopicKey::new(order.event_id, order.unified_index);
-            let topic = self.topics.read().await.get(&key).cloned();
-            let Some(topic) = topic else {
-                continue;
+            if let Err(err) = self.hedge_order_once(&order).await {
+                self.stats.exec_err();
+                tracing::warn!(order_id = order.id, error = %err, "position order scan failed");
+            }
+        }
+        Ok(())
+    }
+
+    async fn hedge_order_once(&self, order: &ArbOrderRow) -> Result<()> {
+        if self.finish_terminal_lifecycle_action(&order).await? {
+            return Ok(());
+        }
+        if self.store.has_open_lifecycle_legs(order.id).await? {
+            tracing::debug!(order_id = order.id, "position action legs in flight");
+            self.stats.lifecycle_busy();
+            return Ok(());
+        }
+        let positions = self.store.positions_for_order(order.id).await?;
+        if !has_position(&positions) {
+            let closed = self.store.mark_position_closed(order.id).await?;
+            tracing::info!(order_id = order.id, closed, "position close attempted");
+            return Ok(());
+        }
+
+        let key = TopicKey::new(order.event_id, order.unified_index);
+        let topic = match self.topics.read().await.get(&key).cloned() {
+            Some(topic) => Some(topic),
+            None => self.restore_historical_topic(order.id, key).await?,
+        };
+        let Some(topic) = topic else {
+            self.stats.unavailable();
+            tracing::warn!(order_id = order.id, topic = %key.as_str(), "position topic unavailable; fail closed");
+            return Ok(());
+        };
+        let identity = match self.market_identity_for_order(order.id, &topic).await {
+            Ok(identity) => identity,
+            Err(err) => {
+                self.stats.unavailable();
+                tracing::warn!(order_id = order.id, topic = %key.as_str(), error = %err, "position market identity unavailable; fail closed");
+                return Ok(());
+            }
+        };
+        let settlement_access = self
+            .settlement_gate(order.id, &order.title, &identity)
+            .await?;
+        if settlement_access == SettlementAccess::Stop {
+            return Ok(());
+        }
+
+        let fees = self.fee_context(&topic);
+
+        if self.cfg.take_profit_enabled
+            && self.cfg.enable_buy
+            && settlement_access == SettlementAccess::All
+        {
+            let take_profit_tokens = take_profit_book_tokens(&topic, &positions);
+            self.refresh_hedge_books(order.id, &take_profit_tokens)
+                .await;
+            for (platform, token_id) in &take_profit_tokens {
+                if platform == POLYMARKET {
+                    let _ = self.ensure_pm_tick(token_id).await;
+                }
+            }
+            self.stats.take_profit_scan();
+            let cached_plan = {
+                let books = self.books.lock().await;
+                plan_take_profit(
+                    &topic,
+                    &positions,
+                    &books,
+                    &fees,
+                    self.cfg.take_profit_min_gain,
+                    Instant::now(),
+                    self.cfg.book_stale,
+                )
             };
-            if self.store.has_open_rebalance_legs(order.id).await? {
-                tracing::debug!(order_id = order.id, "skip hedge, rebalance legs in flight");
-                continue;
-            }
-            let positions = self.store.positions_for_order(order.id).await?;
-            match needs_rebalance(&positions, &topic.labels(), self.cfg.min_rebalance_qty) {
-                None => {
-                    tracing::warn!(
-                        order_id = order.id,
-                        "incomplete positions, skip rebalance complete"
-                    );
-                    continue;
+            if let Some(plan) = cached_plan {
+                self.stats.take_profit_candidate();
+                if let Some(confirmed) = self
+                    .confirm_take_profit(&topic, &positions, &fees, &plan)
+                    .await?
+                {
+                    if self
+                        .settlement_gate(order.id, &order.title, &identity)
+                        .await?
+                        != SettlementAccess::All
+                    {
+                        return Ok(());
+                    }
+                    let Some(claim_id) = self
+                        .store
+                        .try_claim_lifecycle(order.id, "take_profit")
+                        .await?
+                    else {
+                        self.stats.lifecycle_busy();
+                        return Ok(());
+                    };
+                    // Final gate after claiming and immediately before creating either leg.
+                    if self
+                        .settlement_gate(order.id, &order.title, &identity)
+                        .await?
+                        != SettlementAccess::All
+                    {
+                        self.store
+                            .release_lifecycle(order.id, "take_profit", claim_id)
+                            .await?;
+                        return Ok(());
+                    }
+                    self.stats.take_profit_confirmed();
+                    if let Some(notify) = &self.notify {
+                        notify.publish_take_profit_trigger(TakeProfitTriggerNotice {
+                            order_id: order.id,
+                            title: topic.title.clone(),
+                            expected_gain: confirmed.gain,
+                        });
+                    }
+                    let result = self
+                        .execute_take_profit(order.id, claim_id, &topic, &fees, &confirmed)
+                        .await;
+                    if let Err(err) = result {
+                        self.release_failed_zero_leg_claim(order.id, "take_profit", claim_id)
+                            .await?;
+                        return Err(err);
+                    }
+                    return Ok(());
                 }
-                Some(false) => {
+                self.stats.take_profit_cancelled();
+            }
+        }
+
+        match needs_rebalance(&positions, &topic.labels(), self.cfg.min_rebalance_qty) {
+            None => {
+                tracing::warn!(order_id = order.id, "non-binary position cannot be managed");
+                return Ok(());
+            }
+            Some(false) => {
+                if order.rebalance_status != "completed" {
                     self.complete_rebalance(order.id).await?;
-                    continue;
                 }
-                Some(true) => {}
+                return Ok(());
             }
-            if !self.cfg.enable_buy {
-                tracing::info!(order_id = order.id, "hedge skipped, ENABLE_BUY=false");
-                continue;
-            }
-            let order_funder = self.store.order_pm_funder(order.id).await?;
-            let mut balances = HashMap::new();
+            Some(true) => {}
+        }
+        // SELL execution still needs the original funder, but an empty balance map deliberately
+        // disables eval_buy so reduce-only planning can choose an available SELL candidate.
+        let order_funder = self.store.order_pm_funder(order.id).await?;
+        let mut balances = HashMap::new();
+        if settlement_access == SettlementAccess::All && self.cfg.enable_buy {
             if let Some(funder) = order_funder.as_deref() {
                 match self.pm.balance(funder).await {
                     Ok(bal) => {
                         balances.insert(POLYMARKET.to_string(), bal);
                     }
-                    Err(err) => tracing::warn!(
-                        order_id = order.id,
-                        funder,
-                        error = %err,
-                        "hedge polymarket balance unavailable"
-                    ),
+                    Err(err) => {
+                        tracing::warn!(order_id = order.id, funder, error = %err, "hedge polymarket balance unavailable")
+                    }
                 }
             }
             if let Ok(bal) = self.outcome.user_state().await {
                 balances.insert(OUTCOME.to_string(), bal);
             }
-            let fees = self.fee_context(&topic);
-            let order_tokens = hedge_order_tokens(&topic, &positions, self.cfg.min_rebalance_qty);
-            self.refresh_hedge_books(order.id, &order_tokens).await;
-            for (platform, token_id) in &order_tokens {
-                if platform == POLYMARKET {
-                    let _ = self.ensure_pm_tick(token_id).await;
-                }
+        }
+        let order_tokens = hedge_order_tokens(&topic, &positions, self.cfg.min_rebalance_qty);
+        self.refresh_hedge_books(order.id, &order_tokens).await;
+        for (platform, token_id) in &order_tokens {
+            if platform == POLYMARKET {
+                let _ = self.ensure_pm_tick(token_id).await;
             }
-            let actions = {
+        }
+        let actions = {
+            let books = self.books.lock().await;
+            plan_hedge(
+                &topic,
+                &positions,
+                &books,
+                &balances,
+                &fees,
+                self.cfg.min_rebalance_qty,
+                Instant::now(),
+                self.cfg.book_stale,
+            )
+        };
+        if actions.is_empty() {
+            let untradeable = {
                 let books = self.books.lock().await;
-                plan_hedge(
+                leftover_untradeable(
                     &topic,
                     &positions,
                     &books,
-                    &balances,
-                    &fees,
                     self.cfg.min_rebalance_qty,
                     Instant::now(),
                     self.cfg.book_stale,
                 )
             };
-            if actions.is_empty() {
-                let untradeable = {
-                    let books = self.books.lock().await;
-                    leftover_untradeable(
-                        &topic,
-                        &positions,
-                        &books,
-                        self.cfg.min_rebalance_qty,
-                        Instant::now(),
-                        self.cfg.book_stale,
-                    )
-                };
-                if untradeable {
-                    tracing::info!(
-                        order_id = order.id,
-                        "hedge leftover below venue min, mark rebalance complete"
-                    );
-                    self.complete_rebalance(order.id).await?;
-                }
-                continue;
+            if untradeable {
+                self.complete_rebalance(order.id).await?;
             }
+            return Ok(());
+        }
+        let actions: Vec<_> = actions
+            .into_iter()
+            .filter(|action| {
+                action_allowed_for_rebalance(action, settlement_access, self.cfg.enable_buy)
+            })
+            .collect();
+        if actions.is_empty() {
+            tracing::info!(
+                order_id = order.id,
+                "rebalance has no permitted reduce-only actions"
+            );
+            return Ok(());
+        }
+        let Some(claim_id) = self
+            .store
+            .try_claim_lifecycle(order.id, "rebalance")
+            .await?
+        else {
+            self.stats.lifecycle_busy();
+            return Ok(());
+        };
+        // Balances, REST books and planning are complete; gate once more before the first leg.
+        let final_access = self
+            .settlement_gate(order.id, &order.title, &identity)
+            .await?;
+        if final_access == SettlementAccess::Stop
+            || actions.iter().any(|action| {
+                !action_allowed_for_rebalance(action, final_access, self.cfg.enable_buy)
+            })
+        {
+            self.store
+                .release_lifecycle(order.id, "rebalance", claim_id)
+                .await?;
+            return Ok(());
+        }
+        let result = async {
             self.store.mark_rebalance(order.id, "actived").await?;
+            let mut first_error = None;
             for action in actions {
-                if let Err(err) = self.execute_hedge(order.id, &action, &fees).await {
-                    tracing::error!(error = %err, "hedge submit failed");
+                if let Err(err) = self.execute_hedge(order.id, claim_id, &action, &fees).await {
+                    tracing::error!(order_id = order.id, error = %err, "hedge submit failed");
+                    first_error.get_or_insert(err);
                 }
+            }
+            match first_error {
+                Some(err) => Err(err),
+                None => Ok(()),
             }
         }
+        .await;
+        if let Err(err) = result {
+            self.release_failed_zero_leg_claim(order.id, "rebalance", claim_id)
+                .await?;
+            return Err(err);
+        }
         Ok(())
+    }
+
+    async fn restore_historical_topic(
+        &self,
+        order_id: i64,
+        key: TopicKey,
+    ) -> Result<Option<Topic>> {
+        let Some(topic) = load_topic(&self.common, key, &self.cfg.enabled_platforms).await? else {
+            return Ok(None);
+        };
+        // Historical topics are used for this lifecycle pass only. Mutating the active topic map
+        // would let the next discovery refresh race with subscription ownership.
+        tracing::info!(order_id, topic = %key.as_str(), "historical position topic restored");
+        Ok(Some(topic))
+    }
+
+    async fn finish_terminal_lifecycle_action(&self, order: &ArbOrderRow) -> Result<bool> {
+        let (Some(action), Some(claim_id), Some(claimed_at)) = (
+            order.lifecycle_action.as_deref(),
+            order.lifecycle_claim_id,
+            order.lifecycle_claimed_at,
+        ) else {
+            return Ok(false);
+        };
+        let (total, open) = self
+            .store
+            .lifecycle_leg_counts(order.id, action, claim_id)
+            .await?;
+        if total == 0 {
+            let timeout = chrono::Duration::from_std(self.cfg.pending_leg_timeout)
+                .unwrap_or(chrono::Duration::MAX);
+            if chrono::Utc::now().signed_duration_since(claimed_at) > timeout {
+                let released = self
+                    .store
+                    .release_lifecycle(order.id, action, claim_id)
+                    .await?;
+                tracing::warn!(
+                    order_id = order.id,
+                    action,
+                    claim_id = %claim_id,
+                    released,
+                    "stale zero-leg lifecycle claim released"
+                );
+            }
+            // A fresh owner may still be preparing its first leg; either way this row is busy now.
+            return Ok(true);
+        }
+        if open > 0 {
+            return Ok(false);
+        }
+        let has_positive_fill = if action == "take_profit" {
+            self.store
+                .lifecycle_claim_has_positive_fill(order.id, action, claim_id)
+                .await?
+        } else {
+            false
+        };
+        // Keep the claim until actuals are durable: a transient refresh failure must remain
+        // retryable on the next scan and must not lose the completion notification.
+        let take_profit_actuals = if action == "take_profit" && has_positive_fill {
+            Some(self.store.refresh_order_actuals(order.id).await?)
+        } else {
+            None
+        };
+        let released = self
+            .store
+            .release_lifecycle(order.id, action, claim_id)
+            .await?;
+        if !released {
+            tracing::debug!(
+                order_id = order.id,
+                action,
+                claim_id = %claim_id,
+                "terminal lifecycle claim ownership changed"
+            );
+            return Ok(true);
+        }
+        if action == "take_profit" {
+            if let Some((actual_cost, _, actual_profit)) = take_profit_actuals {
+                if let Some(notify) = &self.notify {
+                    notify.publish_take_profit_completed(TakeProfitCompletedNotice {
+                        order_id: order.id,
+                        title: order.title.clone(),
+                        actual_profit,
+                        actual_cost,
+                    });
+                }
+            } else {
+                tracing::info!(order_id = order.id, claim_id = %claim_id, "take profit completed without fills; notification skipped");
+            }
+        }
+        tracing::info!(order_id = order.id, action, claim_id = %claim_id, "position action released");
+        Ok(true)
+    }
+
+    async fn release_failed_zero_leg_claim(
+        &self,
+        order_id: i64,
+        intent: &str,
+        claim_id: uuid::Uuid,
+    ) -> Result<()> {
+        let (total, _) = self
+            .store
+            .lifecycle_leg_counts(order_id, intent, claim_id)
+            .await?;
+        if total == 0 {
+            self.store
+                .release_lifecycle(order_id, intent, claim_id)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn market_identity_for_order(
+        &self,
+        order_id: i64,
+        topic: &Topic,
+    ) -> Result<MarketIdentity> {
+        let stored = self.store.market_identities_for_order(order_id).await?;
+        if stored.get(POLYMARKET).is_some() && stored.get(OUTCOME).is_some() {
+            return Ok(stored);
+        }
+
+        let topic_identity = topic.market_identity()?;
+        let missing_required_identity = [POLYMARKET, OUTCOME]
+            .iter()
+            .any(|platform| stored.get(platform).is_none());
+        if missing_required_identity {
+            // Passing the complete topic identity lets the store detect a conflicting existing
+            // platform while adding only missing rows.
+            let updated = self
+                .store
+                .backfill_market_identity(order_id, &topic_identity)
+                .await?;
+            tracing::info!(order_id, updated, "historical market identity backfilled");
+        }
+        let identity = self.store.market_identities_for_order(order_id).await?;
+        identity.require(POLYMARKET)?;
+        identity.require(OUTCOME)?;
+        Ok(identity)
+    }
+
+    async fn settlement_gate(
+        &self,
+        order_id: i64,
+        title: &str,
+        identity: &MarketIdentity,
+    ) -> Result<SettlementAccess> {
+        self.stats.settlement_scan();
+        let polymarket_market_id = identity.require(POLYMARKET)?;
+        let outcome_market_id = identity.require(OUTCOME)?;
+        let (pm, outcome) = tokio::join!(
+            self.pm.settlement(polymarket_market_id),
+            self.outcome.settlement(outcome_market_id)
+        );
+        let (access, settled_source) = settlement_decision(pm.as_ref(), outcome.as_ref());
+        if let Some(source) = settled_source {
+            // Preserve partial evidence: an independently confirmed settlement must win even when
+            // the other venue failed, and its error remains available for diagnosis.
+            let evidence = json!({
+                "polymarket": settlement_result_evidence(&pm),
+                "outcome": settlement_result_evidence(&outcome),
+            });
+            let first_settlement = self
+                .store
+                .mark_position_settled(order_id, source, &evidence)
+                .await?;
+            if first_settlement {
+                self.stats.settled();
+                if let Some(notify) = &self.notify {
+                    notify.publish_settlement(SettlementNotice {
+                        order_id,
+                        title: title.to_string(),
+                        status: format!("settled ({source})"),
+                        actual_profit: None,
+                    });
+                }
+            } else {
+                tracing::warn!(
+                    order_id,
+                    source,
+                    "settlement confirmed but state update deferred by active claim"
+                );
+            }
+            return Ok(SettlementAccess::Stop);
+        }
+        if access == SettlementAccess::ReduceOnly {
+            self.stats.unavailable();
+            tracing::warn!(
+                order_id,
+                polymarket_error = ?pm.as_ref().err().map(ToString::to_string),
+                outcome_error = ?outcome.as_ref().err().map(ToString::to_string),
+                pm = pm.as_ref().ok().map(|status| status.kind()),
+                outcome = outcome.as_ref().ok().map(|status| status.kind()),
+                "settlement status unavailable; allowing reduce-only SELL"
+            );
+        }
+        Ok(access)
+    }
+
+    async fn confirm_take_profit(
+        &self,
+        topic: &Topic,
+        positions: &crate::hedge::Positions,
+        fees: &FeeContext,
+        cached: &TakeProfitPlan,
+    ) -> Result<Option<TakeProfitPlan>> {
+        let pm_action = cached
+            .actions
+            .iter()
+            .find(|a| a.platform == POLYMARKET)
+            .ok_or_else(|| Error::msg("take profit plan missing polymarket action"))?;
+        let out_action = cached
+            .actions
+            .iter()
+            .find(|a| a.platform == OUTCOME)
+            .ok_or_else(|| Error::msg("take profit plan missing outcome action"))?;
+        let (pm, outcome) = tokio::join!(
+            async {
+                let started = Instant::now();
+                let result = self.pm.rest_book(&pm_action.token_id).await;
+                (result, Instant::now(), started.elapsed())
+            },
+            async {
+                let started = Instant::now();
+                let result = self.outcome.rest_book(&out_action.token_id).await;
+                (result, Instant::now(), started.elapsed())
+            }
+        );
+        let (pm_result, pm_at, pm_elapsed) = pm;
+        let (out_result, out_at, out_elapsed) = outcome;
+        let skew = book_recv_skew(pm_at, out_at);
+        let (pm_bids, pm_asks, pm_ts) = match pm_result {
+            Ok(book) => book,
+            Err(err) => {
+                tracing::warn!(
+                    topic = %topic.key.as_str(),
+                    token = %pm_action.token_id,
+                    elapsed_ms = pm_elapsed.as_millis() as u64,
+                    error = %err,
+                    "take profit polymarket book failed"
+                );
+                self.stats.http_fail();
+                return Ok(None);
+            }
+        };
+        let (out_bids, out_asks, out_ts) = match out_result {
+            Ok(book) => book,
+            Err(err) => {
+                tracing::warn!(
+                    topic = %topic.key.as_str(),
+                    token = %out_action.token_id,
+                    elapsed_ms = out_elapsed.as_millis() as u64,
+                    error = %err,
+                    "take profit outcome book failed"
+                );
+                self.stats.http_fail();
+                return Ok(None);
+            }
+        };
+        if !book_recv_skew_ok(pm_at, out_at, HTTP_BOOK_SKEW_MAX) {
+            tracing::warn!(
+                topic = %topic.key.as_str(),
+                pm_token = %pm_action.token_id,
+                out_token = %out_action.token_id,
+                pm_elapsed_ms = pm_elapsed.as_millis() as u64,
+                out_elapsed_ms = out_elapsed.as_millis() as u64,
+                skew_ms = skew.as_millis() as u64,
+                "take profit http book receive skew exceeded 1s"
+            );
+            self.stats.skew();
+            return Ok(None);
+        }
+        tracing::info!(
+            topic = %topic.key.as_str(),
+            pm_token = %pm_action.token_id,
+            out_token = %out_action.token_id,
+            pm_elapsed_ms = pm_elapsed.as_millis() as u64,
+            out_elapsed_ms = out_elapsed.as_millis() as u64,
+            skew_ms = skew.as_millis() as u64,
+            "take profit rest books fetched"
+        );
+        let mut books = BookStore::default();
+        books.replace_snapshot(
+            POLYMARKET,
+            &pm_action.token_id,
+            pm_bids,
+            pm_asks,
+            pm_ts,
+            pm_at,
+        );
+        books.replace_snapshot(
+            OUTCOME,
+            &out_action.token_id,
+            out_bids,
+            out_asks,
+            out_ts,
+            out_at,
+        );
+        if let Some(tick) = self.ensure_pm_tick(&pm_action.token_id).await {
+            books.set_tick_size(POLYMARKET, &pm_action.token_id, tick);
+        }
+        Ok(plan_take_profit(
+            topic,
+            positions,
+            &books,
+            fees,
+            self.cfg.take_profit_min_gain,
+            Instant::now(),
+            self.cfg.book_stale,
+        ))
+    }
+
+    async fn execute_take_profit(
+        &self,
+        order_id: i64,
+        claim_id: uuid::Uuid,
+        topic: &Topic,
+        fees: &FeeContext,
+        plan: &TakeProfitPlan,
+    ) -> Result<()> {
+        if !self.cfg.enable_buy {
+            return Err(Error::msg("take profit disabled by ENABLE_BUY=false"));
+        }
+        let pm_action = plan
+            .actions
+            .iter()
+            .find(|a| a.platform == POLYMARKET)
+            .ok_or_else(|| Error::msg("take profit plan missing polymarket action"))?;
+        let out_action = plan
+            .actions
+            .iter()
+            .find(|a| a.platform == OUTCOME)
+            .ok_or_else(|| Error::msg("take profit plan missing outcome action"))?;
+        let funder = self
+            .hedge_pm_funder(order_id, &pm_action.token_id, OrderSide::Sell)
+            .await?;
+        let (pm_balance, out_balance) = tokio::join!(
+            self.require_pm_token(&funder, &pm_action.token_id, pm_action.shares),
+            self.require_outcome_token(&out_action.token_id, out_action.shares),
+        );
+        pm_balance?;
+        out_balance?;
+
+        let pm_req = self
+            .take_profit_request(topic, pm_action, Some(&funder))
+            .await;
+        let out_req = self.take_profit_request(topic, out_action, None).await;
+        let leg_ids = self
+            .store
+            .insert_legs_atomic(
+                order_id,
+                "take_profit",
+                claim_id,
+                &[
+                    NewLeg {
+                        platform: POLYMARKET,
+                        token_id: &pm_action.token_id,
+                        label: &pm_action.label,
+                        side: "SELL",
+                        intent: "take_profit",
+                        funder: Some(&funder),
+                        wallet: Some(&funder),
+                        service: self.polymarket_service(&funder),
+                        req_price: pm_action.cap_price,
+                        req_shares: pm_action.shares,
+                        req_fee: pm_action.fee,
+                        client_order_id: None,
+                    },
+                    NewLeg {
+                        platform: OUTCOME,
+                        token_id: &out_action.token_id,
+                        label: &out_action.label,
+                        side: "SELL",
+                        intent: "take_profit",
+                        funder: None,
+                        wallet: self.outcome.account_address(),
+                        service: None,
+                        req_price: out_action.cap_price,
+                        req_shares: out_action.shares,
+                        req_fee: out_action.fee,
+                        client_order_id: None,
+                    },
+                ],
+            )
+            .await?;
+        let [pm_leg, out_leg]: [i64; 2] = leg_ids
+            .try_into()
+            .map_err(|_| Error::msg("take profit must create exactly two legs"))?;
+        let (pm_result, out_result) = tokio::join!(
+            self.submit_pm(pm_leg, &funder, &pm_req, fees),
+            self.submit_outcome(out_leg, &out_req, fees),
+        );
+        if submit_confirmed(&pm_result) {
+            self.stats.take_profit_pm_ok();
+        } else {
+            self.stats.take_profit_pm_fail();
+        }
+        if submit_confirmed(&out_result) {
+            self.stats.take_profit_out_ok();
+        } else {
+            self.stats.take_profit_out_fail();
+        }
+        pm_result?;
+        out_result?;
+        Ok(())
+    }
+
+    async fn take_profit_request(
+        &self,
+        topic: &Topic,
+        action: &TakeProfitAction,
+        funder: Option<&str>,
+    ) -> MarketOrderRequest {
+        let token = topic.token(&action.platform, &action.label);
+        MarketOrderRequest {
+            token_id: action.token_id.clone(),
+            shares: action.shares,
+            cap_price: action.cap_price,
+            side: OrderSide::Sell,
+            neg_risk: token.and_then(|t| t.neg_risk),
+            tick_size: if action.platform == POLYMARKET {
+                self.ensure_pm_tick(&action.token_id).await
+            } else {
+                None
+            },
+            asset_id: token.and_then(|t| t.asset_id),
+            funder_address: funder.map(str::to_string),
+        }
     }
 
     async fn complete_rebalance(&self, order_id: i64) -> Result<()> {
@@ -1166,9 +1770,13 @@ impl Engine {
     async fn execute_hedge(
         &self,
         order_id: i64,
+        claim_id: uuid::Uuid,
         action: &crate::hedge::HedgeAction,
         fees: &FeeContext,
     ) -> Result<()> {
+        if !self.cfg.enable_buy && action.side == HedgeSide::Buy {
+            return Err(Error::msg("hedge BUY disabled by ENABLE_BUY=false"));
+        }
         let side = match action.side {
             HedgeSide::Buy => OrderSide::Buy,
             HedgeSide::Sell => OrderSide::Sell,
@@ -1220,20 +1828,24 @@ impl Engine {
             };
             let leg_id = self
                 .store
-                .insert_leg(
+                .insert_leg_for_claim(
                     order_id,
-                    POLYMARKET,
-                    &action.token_id,
-                    &action.label,
-                    side.as_str(),
                     "rebalance",
-                    Some(&funder),
-                    Some(&funder),
-                    self.polymarket_service(&funder),
-                    action.cap_price,
-                    action.shares,
-                    action.fee,
-                    None,
+                    claim_id,
+                    &NewLeg {
+                        platform: POLYMARKET,
+                        token_id: &action.token_id,
+                        label: &action.label,
+                        side: side.as_str(),
+                        intent: "rebalance",
+                        funder: Some(&funder),
+                        wallet: Some(&funder),
+                        service: self.polymarket_service(&funder),
+                        req_price: action.cap_price,
+                        req_shares: action.shares,
+                        req_fee: action.fee,
+                        client_order_id: None,
+                    },
                 )
                 .await?;
             self.submit_pm(leg_id, &funder, &req, fees).await?;
@@ -1262,20 +1874,24 @@ impl Engine {
             };
             let leg_id = self
                 .store
-                .insert_leg(
+                .insert_leg_for_claim(
                     order_id,
-                    OUTCOME,
-                    &action.token_id,
-                    &action.label,
-                    side.as_str(),
                     "rebalance",
-                    None,
-                    self.outcome.account_address(),
-                    None,
-                    action.cap_price,
-                    action.shares,
-                    action.fee,
-                    None,
+                    claim_id,
+                    &NewLeg {
+                        platform: OUTCOME,
+                        token_id: &action.token_id,
+                        label: &action.label,
+                        side: side.as_str(),
+                        intent: "rebalance",
+                        funder: None,
+                        wallet: self.outcome.account_address(),
+                        service: None,
+                        req_price: action.cap_price,
+                        req_shares: action.shares,
+                        req_fee: action.fee,
+                        client_order_id: None,
+                    },
                 )
                 .await?;
             self.submit_outcome(leg_id, &req, fees).await?;
@@ -1435,6 +2051,104 @@ impl Engine {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettlementAccess {
+    All,
+    ReduceOnly,
+    Stop,
+}
+
+fn action_allowed_for_rebalance(
+    action: &crate::hedge::HedgeAction,
+    access: SettlementAccess,
+    enable_buy: bool,
+) -> bool {
+    match action.side {
+        HedgeSide::Sell => access != SettlementAccess::Stop,
+        HedgeSide::Buy => enable_buy && access == SettlementAccess::All,
+    }
+}
+
+fn has_position(positions: &crate::hedge::Positions) -> bool {
+    positions
+        .values()
+        .flat_map(|labels| labels.values())
+        .any(|qty| !qty.is_zero())
+}
+
+fn take_profit_book_tokens(
+    topic: &Topic,
+    positions: &crate::hedge::Positions,
+) -> Vec<(String, String)> {
+    let labels = topic.labels();
+    if labels.len() != 2 {
+        return Vec::new();
+    }
+    let mut seen = HashSet::new();
+    let mut tokens = Vec::new();
+    for (pm_label, out_label) in [(&labels[0], &labels[1]), (&labels[1], &labels[0])] {
+        if position_qty(positions, POLYMARKET, pm_label) <= Decimal::ZERO
+            || position_qty(positions, OUTCOME, out_label) <= Decimal::ZERO
+        {
+            continue;
+        }
+        for (platform, label) in [(POLYMARKET, pm_label), (OUTCOME, out_label)] {
+            let Some(token) = topic.token(platform, label) else {
+                continue;
+            };
+            let key = (token.platform.clone(), token.token_id.clone());
+            if seen.insert(key.clone()) {
+                tokens.push(key);
+            }
+        }
+    }
+    tokens
+}
+
+fn position_qty(positions: &crate::hedge::Positions, platform: &str, label: &str) -> Decimal {
+    positions
+        .get(platform)
+        .and_then(|by_label| {
+            by_label.get(label).copied().or_else(|| {
+                by_label
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(label))
+                    .map(|(_, qty)| *qty)
+            })
+        })
+        .unwrap_or(Decimal::ZERO)
+}
+
+fn settlement_decision<E1, E2>(
+    polymarket: std::result::Result<&SettlementStatus, E1>,
+    outcome: std::result::Result<&OutcomeSettlement, E2>,
+) -> (SettlementAccess, Option<&'static str>) {
+    if matches!(polymarket, Ok(SettlementStatus::Settled { .. })) {
+        return (SettlementAccess::Stop, Some(POLYMARKET));
+    }
+    if matches!(outcome, Ok(OutcomeSettlement::Settled { .. })) {
+        return (SettlementAccess::Stop, Some(OUTCOME));
+    }
+    if matches!(polymarket, Ok(SettlementStatus::TradableUnsettled))
+        && matches!(outcome, Ok(OutcomeSettlement::Unsettled))
+    {
+        (SettlementAccess::All, None)
+    } else {
+        (SettlementAccess::ReduceOnly, None)
+    }
+}
+
+fn settlement_result_evidence<T, E>(result: &std::result::Result<T, E>) -> Value
+where
+    T: serde::Serialize,
+    E: std::fmt::Display,
+{
+    match result {
+        Ok(status) => json!({"status": status}),
+        Err(err) => json!({"error": err.to_string()}),
+    }
+}
+
 const HTTP_BOOK_SKEW_MAX: Duration = Duration::from_secs(1);
 
 fn fmt_px(price: Option<Decimal>) -> String {
@@ -1574,6 +2288,10 @@ pub fn ack_fill(
         });
         ioc_fill(taking, price)
     }
+}
+
+fn submit_confirmed(result: &Result<SubmitResult>) -> bool {
+    matches!(result, Ok(SubmitResult::Ack { .. }))
 }
 
 fn place_result(
@@ -1854,6 +2572,45 @@ mod tests {
     }
 
     #[test]
+    fn rebalance_permissions_only_relax_for_sell() {
+        let action = |side| crate::hedge::HedgeAction {
+            platform: POLYMARKET.into(),
+            token_id: "token".into(),
+            label: "yes".into(),
+            side,
+            shares: Decimal::ONE,
+            cap_price: Decimal::ONE,
+            fee: Decimal::ZERO,
+            marginal_value: Decimal::ZERO,
+        };
+        assert!(action_allowed_for_rebalance(
+            &action(HedgeSide::Sell),
+            SettlementAccess::ReduceOnly,
+            false,
+        ));
+        assert!(!action_allowed_for_rebalance(
+            &action(HedgeSide::Buy),
+            SettlementAccess::ReduceOnly,
+            true,
+        ));
+        assert!(!action_allowed_for_rebalance(
+            &action(HedgeSide::Buy),
+            SettlementAccess::All,
+            false,
+        ));
+        assert!(action_allowed_for_rebalance(
+            &action(HedgeSide::Buy),
+            SettlementAccess::All,
+            true,
+        ));
+        assert!(!action_allowed_for_rebalance(
+            &action(HedgeSide::Sell),
+            SettlementAccess::Stop,
+            true,
+        ));
+    }
+
+    #[test]
     fn matches_trade_by_order_id_only() {
         let trades = vec![fill("t1", "oid-1", "3", &[]), fill("t2", "oid-2", "9", &[])];
         let matched = filter_trades(&trades, Some("oid-1"), None);
@@ -2016,5 +2773,212 @@ mod tests {
     fn hedge_rejects_without_original_funder() {
         assert!(resolve_hedge_pm_funder(false, Some("0xtoken".into()), None).is_err());
         assert!(resolve_hedge_pm_funder(true, None, None).is_err());
+    }
+
+    #[test]
+    fn take_profit_submit_success_requires_ack() {
+        let envelope = json!({});
+        let ack = Ok(SubmitResult::Ack {
+            order_id: "order-1".into(),
+            order_hash: "h".into(),
+            envelope: envelope.clone(),
+            making: Some(d("1")),
+            taking: Some(d("0.5")),
+            avg_px: Some(d("0.5")),
+        });
+        let no_match = Ok(SubmitResult::NoMatch {
+            order_hash: "h".into(),
+            envelope: envelope.clone(),
+            message: "no fill".into(),
+        });
+        let unknown = Ok(SubmitResult::Unknown {
+            order_id: None,
+            order_hash: "h".into(),
+            envelope: envelope.clone(),
+            message: "transport uncertain".into(),
+        });
+        let failed = Ok(SubmitResult::Failed {
+            order_hash: "h".into(),
+            envelope,
+            status: 400,
+            message: "rejected".into(),
+        });
+        assert!(submit_confirmed(&ack));
+        assert!(!submit_confirmed(&no_match));
+        assert!(!submit_confirmed(&unknown));
+        assert!(!submit_confirmed(&failed));
+        assert!(!submit_confirmed(&Err(Error::msg("submit error"))));
+    }
+
+    #[test]
+    fn settlement_decision_requires_both_known_unsettled_for_full_access() {
+        let pm = SettlementStatus::TradableUnsettled;
+        let outcome = OutcomeSettlement::Unsettled;
+        assert_eq!(
+            settlement_decision::<(), ()>(Ok(&pm), Ok(&outcome)),
+            (SettlementAccess::All, None)
+        );
+        let unavailable = SettlementStatus::Unavailable;
+        assert_eq!(
+            settlement_decision::<(), ()>(Ok(&unavailable), Ok(&outcome)),
+            (SettlementAccess::ReduceOnly, None)
+        );
+    }
+
+    #[test]
+    fn settlement_decision_stops_on_one_successful_settlement_despite_other_error() {
+        let pm_settled = SettlementStatus::Settled { payouts: vec![] };
+        let outcome_settled = OutcomeSettlement::Settled { payouts: vec![] };
+        assert_eq!(
+            settlement_decision::<(), &str>(Ok(&pm_settled), Err("outcome timeout")),
+            (SettlementAccess::Stop, Some(POLYMARKET))
+        );
+        assert_eq!(
+            settlement_decision::<&str, ()>(Err("pm timeout"), Ok(&outcome_settled)),
+            (SettlementAccess::Stop, Some(OUTCOME))
+        );
+        assert_eq!(
+            settlement_decision::<&str, &str>(Err("pm timeout"), Err("outcome timeout")),
+            (SettlementAccess::ReduceOnly, None)
+        );
+    }
+
+    #[test]
+    fn settlement_decision_prefers_polymarket_when_both_settled() {
+        let pm = SettlementStatus::Settled { payouts: vec![] };
+        let outcome = OutcomeSettlement::Settled { payouts: vec![] };
+        assert_eq!(
+            settlement_decision::<(), ()>(Ok(&pm), Ok(&outcome)),
+            (SettlementAccess::Stop, Some(POLYMARKET))
+        );
+    }
+
+    fn take_profit_topic() -> Topic {
+        use crate::domain::TokenRef;
+        use uuid::Uuid;
+
+        let token = |platform: &str, token_id: &str, label: &str| TokenRef {
+            platform: platform.into(),
+            token_id: token_id.into(),
+            label: label.into(),
+            option_id: "1".into(),
+            condition_id: None,
+            asset_id: None,
+            side_index: None,
+            neg_risk: None,
+            fees_enabled: None,
+            fee_rate: None,
+        };
+        Topic {
+            key: TopicKey::new(Uuid::nil(), 0),
+            title: "topic".into(),
+            market_title: "market".into(),
+            end_date: None,
+            tokens: vec![
+                token(POLYMARKET, "pm-yes", "yes"),
+                token(POLYMARKET, "pm-no", "no"),
+                token(OUTCOME, "out-yes", "yes"),
+                token(OUTCOME, "out-no", "no"),
+                token(POLYMARKET, "pm-yes", "YES"),
+            ],
+        }
+    }
+
+    #[test]
+    fn take_profit_tokens_only_include_positive_complementary_pair_and_deduplicate() {
+        let positions = crate::hedge::Positions::from([
+            (
+                POLYMARKET.into(),
+                HashMap::from([("YES".into(), d("3")), ("no".into(), Decimal::ZERO)]),
+            ),
+            (
+                OUTCOME.into(),
+                HashMap::from([("yes".into(), d("4")), ("no".into(), d("2"))]),
+            ),
+        ]);
+
+        assert_eq!(
+            take_profit_book_tokens(&take_profit_topic(), &positions),
+            vec![
+                (POLYMARKET.into(), "pm-yes".into()),
+                (OUTCOME.into(), "out-no".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn take_profit_tokens_include_both_positive_complementary_directions_once() {
+        let positions = crate::hedge::Positions::from([
+            (
+                POLYMARKET.into(),
+                HashMap::from([("yes".into(), d("3")), ("no".into(), d("1"))]),
+            ),
+            (
+                OUTCOME.into(),
+                HashMap::from([("yes".into(), d("4")), ("no".into(), d("2"))]),
+            ),
+        ]);
+        let tokens = take_profit_book_tokens(&take_profit_topic(), &positions);
+
+        assert_eq!(tokens.len(), 4);
+        assert_eq!(tokens.iter().collect::<HashSet<_>>().len(), 4);
+        assert!(tokens.contains(&(POLYMARKET.into(), "pm-yes".into())));
+        assert!(tokens.contains(&(OUTCOME.into(), "out-no".into())));
+        assert!(tokens.contains(&(POLYMARKET.into(), "pm-no".into())));
+        assert!(tokens.contains(&(OUTCOME.into(), "out-yes".into())));
+    }
+
+    #[test]
+    fn take_profit_tokens_deduplicate_shared_token_ids() {
+        let mut topic = take_profit_topic();
+        topic
+            .tokens
+            .iter_mut()
+            .filter(|token| token.platform == POLYMARKET)
+            .for_each(|token| token.token_id = "pm-shared".into());
+        let positions = crate::hedge::Positions::from([
+            (
+                POLYMARKET.into(),
+                HashMap::from([("yes".into(), d("3")), ("no".into(), d("1"))]),
+            ),
+            (
+                OUTCOME.into(),
+                HashMap::from([("yes".into(), d("4")), ("no".into(), d("2"))]),
+            ),
+        ]);
+
+        let tokens = take_profit_book_tokens(&topic, &positions);
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|(platform, token_id)| platform == POLYMARKET && token_id == "pm-shared")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn position_detection_includes_negative_exposure() {
+        let mut positions = crate::hedge::Positions::new();
+        positions
+            .entry(POLYMARKET.into())
+            .or_default()
+            .insert("yes".into(), Decimal::ZERO);
+        positions
+            .entry(OUTCOME.into())
+            .or_default()
+            .insert("no".into(), -Decimal::ONE);
+        assert!(has_position(&positions));
+        positions
+            .get_mut(OUTCOME)
+            .unwrap()
+            .insert("no".into(), Decimal::ZERO);
+        assert!(!has_position(&positions));
+        positions
+            .get_mut(POLYMARKET)
+            .unwrap()
+            .insert("yes".into(), Decimal::ONE);
+        assert!(has_position(&positions));
     }
 }

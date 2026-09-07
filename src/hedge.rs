@@ -593,6 +593,39 @@ mod tests {
     }
 
     #[test]
+    fn empty_balances_force_sell_when_buy_would_otherwise_win() {
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        books.replace_snapshot(
+            OUTCOME,
+            "#10",
+            vec![],
+            vec![Level {
+                price: d("0.25"),
+                size: d("40"),
+            }],
+            1,
+            now,
+        );
+        books.replace_snapshot(
+            POLYMARKET,
+            "pm-yes",
+            vec![Level {
+                price: d("0.30"),
+                size: d("40"),
+            }],
+            vec![],
+            1,
+            now,
+        );
+        books.set_tick_size(POLYMARKET, "pm-yes", d("0.01"));
+        let actions = plan(&books, &HashMap::new(), now, "31", "6");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].platform, POLYMARKET);
+        assert_eq!(actions[0].side, HedgeSide::Sell);
+    }
+
+    #[test]
     fn sells_excess_when_sell_has_higher_marginal_value() {
         let mut books = BookStore::default();
         let now = Instant::now();

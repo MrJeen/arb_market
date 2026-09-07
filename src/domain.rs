@@ -2,7 +2,7 @@ use crate::config::{OUTCOME, POLYMARKET};
 use crate::error::{Error, Result};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use uuid::Uuid;
 
@@ -105,6 +105,56 @@ pub struct TokenRef {
     pub fee_rate: Option<Decimal>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MarketIdentity {
+    market_ids: BTreeMap<String, String>,
+}
+
+impl MarketIdentity {
+    pub fn new(platform: impl Into<String>, market_id: impl Into<String>) -> Result<Self> {
+        let mut identity = Self::default();
+        identity.insert(platform, market_id)?;
+        Ok(identity)
+    }
+
+    pub fn insert(
+        &mut self,
+        platform: impl Into<String>,
+        market_id: impl Into<String>,
+    ) -> Result<Option<String>> {
+        let platform = platform.into().trim().to_ascii_lowercase();
+        let market_id = market_id.into().trim().to_owned();
+        if platform.is_empty() {
+            return Err(Error::msg("market identity platform must not be empty"));
+        }
+        if market_id.is_empty() {
+            return Err(Error::msg("market identity market_id must not be empty"));
+        }
+        Ok(self.market_ids.insert(platform, market_id))
+    }
+
+    pub fn get(&self, platform: &str) -> Option<&str> {
+        self.market_ids
+            .get(&platform.trim().to_ascii_lowercase())
+            .map(String::as_str)
+    }
+
+    pub fn require(&self, platform: &str) -> Result<&str> {
+        self.get(platform)
+            .ok_or_else(|| Error::msg(format!("missing {platform} market identity")))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.market_ids
+            .iter()
+            .map(|(platform, market_id)| (platform.as_str(), market_id.as_str()))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.market_ids.is_empty()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Topic {
     pub key: TopicKey,
@@ -141,6 +191,45 @@ impl Topic {
         }
         pm.fee_rate
     }
+
+    /// Extracts the stable cross-platform market identifiers used after catalog entries expire.
+    pub fn market_identity(&self) -> Result<MarketIdentity> {
+        let mut identity = MarketIdentity::new(
+            POLYMARKET,
+            unique_token_value(self, POLYMARKET, |token| token.condition_id.as_deref())?,
+        )?;
+        identity.insert(
+            OUTCOME,
+            unique_token_value(self, OUTCOME, |token| Some(&token.option_id))?,
+        )?;
+        Ok(identity)
+    }
+}
+
+fn unique_token_value(
+    topic: &Topic,
+    platform: &str,
+    value: impl Fn(&TokenRef) -> Option<&str>,
+) -> Result<String> {
+    let mut found: Option<&str> = None;
+    for token in topic
+        .tokens
+        .iter()
+        .filter(|token| token.platform == platform)
+    {
+        let current = value(token)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| Error::msg(format!("missing {platform} market identity")))?;
+        if found.is_some_and(|existing| existing != current) {
+            return Err(Error::msg(format!(
+                "inconsistent {platform} market identity"
+            )));
+        }
+        found = Some(current);
+    }
+    found
+        .map(str::to_owned)
+        .ok_or_else(|| Error::msg(format!("missing {platform} market identity")))
 }
 
 pub fn side_coin(outcome_id: u64, side_index: u8) -> String {
@@ -237,6 +326,14 @@ fn build_topic(
         }
         if platform == OUTCOME {
             validate_outcome_option(po)?;
+        }
+        if platform == POLYMARKET
+            && po
+                .condition_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+        {
+            return Err(Error::msg("polymarket conditionId must not be empty"));
         }
         by_platform.insert(platform, po);
     }
@@ -354,6 +451,57 @@ mod tests {
         assert_eq!(parse_side_coin("+12110"), Some((1211, 0)));
         assert_eq!(parse_side_coin("#90"), Some((9, 0)));
         assert_eq!(parse_side_coin("#5162"), None);
+    }
+
+    #[test]
+    fn extracts_market_identity_from_topic() {
+        let token = |platform: &str, option_id: &str, condition_id: Option<&str>| TokenRef {
+            platform: platform.into(),
+            token_id: "token".into(),
+            label: "yes".into(),
+            option_id: option_id.into(),
+            condition_id: condition_id.map(str::to_owned),
+            asset_id: None,
+            side_index: None,
+            neg_risk: None,
+            fees_enabled: None,
+            fee_rate: None,
+        };
+        let topic = Topic {
+            key: TopicKey::new(Uuid::nil(), 1),
+            title: String::new(),
+            market_title: String::new(),
+            end_date: None,
+            tokens: vec![
+                token(POLYMARKET, "pm-market", Some("condition")),
+                token(OUTCOME, "516", None),
+            ],
+        };
+
+        let identity = topic.market_identity().unwrap();
+        assert_eq!(identity.require(POLYMARKET).unwrap(), "condition");
+        assert_eq!(identity.require(OUTCOME).unwrap(), "516");
+        assert_eq!(
+            identity.iter().collect::<Vec<_>>(),
+            vec![(OUTCOME, "516"), (POLYMARKET, "condition")]
+        );
+    }
+
+    #[test]
+    fn market_identity_normalizes_platform_and_market_id() {
+        let identity = MarketIdentity::new(" Outcome ", " 516 ").unwrap();
+        assert_eq!(identity.get("outcome"), Some("516"));
+        assert_eq!(identity.get(" OUTCOME "), Some("516"));
+        assert_eq!(
+            identity.iter().collect::<Vec<_>>(),
+            vec![("outcome", "516")]
+        );
+    }
+
+    #[test]
+    fn market_identity_rejects_empty_values() {
+        assert!(MarketIdentity::new(" ", "market").is_err());
+        assert!(MarketIdentity::new("outcome", " ").is_err());
     }
 
     #[test]

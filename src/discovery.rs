@@ -1,13 +1,15 @@
-use crate::domain::{tradable_topics, CatalogEvent, Topic, UnifiedOption};
+use crate::domain::{tradable_topics, CatalogEvent, Topic, TopicKey, UnifiedOption};
 use crate::error::Result;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use std::collections::HashSet;
 use uuid::Uuid;
 
+type CatalogEventRow = (Uuid, String, Option<DateTime<Utc>>, serde_json::Value);
+
 pub async fn load_active_topics(pool: &PgPool, enabled: &HashSet<String>) -> Result<Vec<Topic>> {
     let path = unified_options_platforms_path(enabled);
-    let rows: Vec<(Uuid, String, Option<DateTime<Utc>>, serde_json::Value)> = sqlx::query_as(
+    let rows: Vec<CatalogEventRow> = sqlx::query_as(
         "SELECT id, title, end_date, unified_options
          FROM events
          WHERE status = 'active'
@@ -17,23 +19,61 @@ pub async fn load_active_topics(pool: &PgPool, enabled: &HashSet<String>) -> Res
     .fetch_all(pool)
     .await?;
     let mut topics = Vec::new();
-    for (id, title, end_date, unified) in rows {
-        let options: Vec<UnifiedOption> = match serde_json::from_value(unified) {
-            Ok(v) => v,
+    for row in rows {
+        let id = row.0;
+        let event = match catalog_event_from_row(row) {
+            Ok(event) => event,
             Err(err) => {
                 tracing::warn!(event_id = %id, error = %err, "invalid unified_options");
                 continue;
             }
         };
-        let event = CatalogEvent {
-            id,
-            title,
-            end_date,
-            unified_options: options,
-        };
         topics.extend(tradable_topics(&event, enabled));
     }
     Ok(topics)
+}
+
+/// Loads one topic from the event catalog, including inactive historical events.
+pub async fn load_topic(
+    pool: &PgPool,
+    key: TopicKey,
+    enabled: &HashSet<String>,
+) -> Result<Option<Topic>> {
+    let row: Option<CatalogEventRow> = sqlx::query_as(
+        "SELECT id, title, end_date, unified_options
+         FROM events
+         WHERE id = $1",
+    )
+    .bind(key.event_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let event = match catalog_event_from_row(row) {
+        Ok(event) => event,
+        Err(err) => {
+            tracing::warn!(event_id = %key.event_id, error = %err, "invalid unified_options");
+            return Ok(None);
+        }
+    };
+    Ok(topic_for_key(&event, key, enabled))
+}
+
+fn catalog_event_from_row(row: CatalogEventRow) -> serde_json::Result<CatalogEvent> {
+    let (id, title, end_date, unified_options) = row;
+    Ok(CatalogEvent {
+        id,
+        title,
+        end_date,
+        unified_options: serde_json::from_value::<Vec<UnifiedOption>>(unified_options)?,
+    })
+}
+
+fn topic_for_key(event: &CatalogEvent, key: TopicKey, enabled: &HashSet<String>) -> Option<Topic> {
+    tradable_topics(event, enabled)
+        .into_iter()
+        .find(|topic| topic.key == key)
 }
 
 /// 同一 unified option 上同时出现所有 enabled 平台。平台名来自配置，不写死。
@@ -106,6 +146,40 @@ mod tests {
     }
 
     #[test]
+    fn skips_polymarket_market_without_condition_id() {
+        let unified = json!([{
+            "index": 0,
+            "title": "missing identity",
+            "platformOptions": [
+                {
+                    "platform": "polymarket",
+                    "optionId": "0xabc",
+                    "outcomes": [
+                        {"tokenId": "111", "label": "Yes"},
+                        {"tokenId": "222", "label": "No"}
+                    ]
+                },
+                {
+                    "platform": "outcome",
+                    "optionId": 516,
+                    "outcomes": [
+                        {"tokenId": "#5160", "label": "Yes", "sideIndex": 0},
+                        {"tokenId": "#5161", "label": "No", "sideIndex": 1}
+                    ]
+                }
+            ]
+        }]);
+        let event = CatalogEvent {
+            id: Uuid::nil(),
+            title: "evt".into(),
+            end_date: None,
+            unified_options: serde_json::from_value(unified).unwrap(),
+        };
+        let enabled = HashSet::from([POLYMARKET.to_string(), OUTCOME.to_string()]);
+        assert!(tradable_topics(&event, &enabled).is_empty());
+    }
+
+    #[test]
     fn copies_polymarket_fee_schedule_rate() {
         let unified = json!([{
             "index": 0,
@@ -114,6 +188,7 @@ mod tests {
                 {
                     "platform": "polymarket",
                     "optionId": "0xabc",
+                    "conditionId": "0xcond",
                     "feesEnabled": true,
                     "feeSchedule": { "rate": 0.07, "exponent": 1 },
                     "outcomes": [
@@ -155,6 +230,7 @@ mod tests {
                 {
                     "platform": "polymarket",
                     "optionId": "0xabc",
+                    "conditionId": "0xcond",
                     "feesEnabled": false,
                     "feeSchedule": { "rate": 0.07 },
                     "outcomes": [
@@ -182,6 +258,76 @@ mod tests {
         let enabled = HashSet::from([POLYMARKET.to_string(), OUTCOME.to_string()]);
         let topics = tradable_topics(&event, &enabled);
         assert_eq!(topics[0].polymarket_fee_rate().unwrap().to_string(), "0");
+    }
+
+    #[test]
+    fn selects_exact_topic_from_multiple_unified_options() {
+        let unified = json!([
+            {
+                "index": 3,
+                "title": "first market",
+                "platformOptions": [
+                    {
+                        "platform": "polymarket",
+                        "optionId": "0xfirst",
+                        "conditionId": "0xfirst-cond",
+                        "outcomes": [
+                            {"tokenId": "first-yes", "label": "Yes"},
+                            {"tokenId": "first-no", "label": "No"}
+                        ]
+                    },
+                    {
+                        "platform": "outcome",
+                        "optionId": 516,
+                        "outcomes": [
+                            {"tokenId": "#5160", "label": "Yes", "sideIndex": 0},
+                            {"tokenId": "#5161", "label": "No", "sideIndex": 1}
+                        ]
+                    }
+                ]
+            },
+            {
+                "index": 7,
+                "title": "selected market",
+                "platformOptions": [
+                    {
+                        "platform": "polymarket",
+                        "optionId": "0xselected",
+                        "conditionId": "0xselected-cond",
+                        "outcomes": [
+                            {"tokenId": "selected-yes", "label": "Yes"},
+                            {"tokenId": "selected-no", "label": "No"}
+                        ]
+                    },
+                    {
+                        "platform": "outcome",
+                        "optionId": 517,
+                        "outcomes": [
+                            {"tokenId": "#5170", "label": "Yes", "sideIndex": 0},
+                            {"tokenId": "#5171", "label": "No", "sideIndex": 1}
+                        ]
+                    }
+                ]
+            }
+        ]);
+        let event_id = Uuid::new_v4();
+        let event = CatalogEvent {
+            id: event_id,
+            title: "event".into(),
+            end_date: None,
+            unified_options: serde_json::from_value(unified).unwrap(),
+        };
+        let enabled = HashSet::from([POLYMARKET.to_string(), OUTCOME.to_string()]);
+
+        let topic = topic_for_key(&event, TopicKey::new(event_id, 7), &enabled).unwrap();
+
+        assert_eq!(topic.key, TopicKey::new(event_id, 7));
+        assert_eq!(topic.market_title, "selected market");
+        assert_eq!(
+            topic.token(POLYMARKET, "yes").unwrap().token_id,
+            "selected-yes"
+        );
+        assert!(topic_for_key(&event, TopicKey::new(event_id, 9), &enabled).is_none());
     }
 
     #[test]

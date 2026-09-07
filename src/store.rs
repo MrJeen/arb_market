@@ -1,6 +1,6 @@
 use crate::config::{OUTCOME, POLYMARKET};
-use crate::domain::TopicKey;
-use crate::error::Result;
+use crate::domain::{MarketIdentity, TopicKey};
+use crate::error::{Error, Result};
 use crate::hedge::Positions;
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -16,10 +16,18 @@ pub struct Store {
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ArbOrderRow {
     pub id: i64,
+    pub title: String,
     pub event_id: Uuid,
     pub unified_index: i32,
     pub status: String,
     pub rebalance_status: String,
+    pub position_status: String,
+    pub lifecycle_action: Option<String>,
+    pub lifecycle_claim_id: Option<Uuid>,
+    pub lifecycle_claimed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub settlement_source: Option<String>,
+    pub settlement_result: Option<Value>,
+    pub settled_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -46,6 +54,22 @@ pub struct ClosedLegRef {
     pub id: i64,
     pub order_id: i64,
     pub platform: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NewLeg<'a> {
+    pub platform: &'a str,
+    pub token_id: &'a str,
+    pub label: &'a str,
+    pub side: &'a str,
+    pub intent: &'a str,
+    pub funder: Option<&'a str>,
+    pub wallet: Option<&'a str>,
+    pub service: Option<&'a str>,
+    pub req_price: Decimal,
+    pub req_shares: Decimal,
+    pub req_fee: Decimal,
+    pub client_order_id: Option<&'a str>,
 }
 
 impl Store {
@@ -79,6 +103,7 @@ impl Store {
     pub async fn insert_order(
         &self,
         key: TopicKey,
+        market_identity: &MarketIdentity,
         title: &str,
         market_title: &str,
         end_date: Option<chrono::DateTime<chrono::Utc>>,
@@ -87,10 +112,14 @@ impl Store {
         cost: Decimal,
         fills: &Value,
     ) -> Result<i64> {
+        if market_identity.is_empty() {
+            return Err(Error::msg("order market identity must not be empty"));
+        }
+        let mut tx = self.pool.begin().await?;
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO arb_orders (
-                event_id, unified_index, title, market_title, end_date,
-                estimated_rev, estimated_profit, estimated_cost, fills, status
+                event_id, unified_index, title, market_title, end_date, estimated_rev,
+                estimated_profit, estimated_cost, fills, status
              ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending')
              RETURNING id",
         )
@@ -103,9 +132,95 @@ impl Store {
         .bind(profit)
         .bind(cost)
         .bind(fills)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        for (platform, market_id) in market_identity.iter() {
+            sqlx::query(
+                "INSERT INTO arb_order_market_identities (order_id, platform, market_id)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(id)
+            .bind(platform)
+            .bind(market_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(id)
+    }
+
+    pub async fn market_identities_for_order(&self, order_id: i64) -> Result<MarketIdentity> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT platform, market_id
+             FROM arb_order_market_identities
+             WHERE order_id = $1
+             ORDER BY platform",
+        )
+        .bind(order_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut identity = MarketIdentity::default();
+        for (platform, market_id) in rows {
+            identity.insert(platform, market_id)?;
+        }
+        Ok(identity)
+    }
+
+    /// Adds missing identities without overwriting existing platform mappings.
+    pub async fn backfill_market_identity(
+        &self,
+        order_id: i64,
+        market_identity: &MarketIdentity,
+    ) -> Result<bool> {
+        if market_identity.is_empty() {
+            return Err(Error::msg("backfill market identity must not be empty"));
+        }
+        let mut tx = self.pool.begin().await?;
+        let exists: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM arb_orders WHERE id = $1 FOR UPDATE")
+                .bind(order_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if exists.is_none() {
+            return Err(Error::msg(format!("order {order_id} not found")));
+        }
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT platform, market_id
+             FROM arb_order_market_identities
+             WHERE order_id = $1",
+        )
+        .bind(order_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut existing = MarketIdentity::default();
+        for (platform, market_id) in rows {
+            existing.insert(platform, market_id)?;
+        }
+
+        let mut inserted = false;
+        for (platform, market_id) in market_identity.iter() {
+            if let Some(stored) = existing.get(platform) {
+                if stored != market_id {
+                    return Err(Error::msg(format!(
+                        "conflicting {platform} market identity for order {order_id}: stored {stored}, requested {market_id}"
+                    )));
+                }
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO arb_order_market_identities (order_id, platform, market_id)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(order_id)
+            .bind(platform)
+            .bind(market_id)
+            .execute(&mut *tx)
+            .await?;
+            inserted = true;
+        }
+        tx.commit().await?;
+        Ok(inserted)
     }
 
     pub async fn insert_leg(
@@ -148,6 +263,85 @@ impl Store {
         .fetch_one(&self.pool)
         .await?;
         Ok(id)
+    }
+
+    /// Inserts lifecycle legs only while the caller still owns the claim. The row lock keeps a
+    /// concurrent release/reclaim from crossing the ownership check and inserts.
+    pub async fn insert_legs_atomic(
+        &self,
+        order_id: i64,
+        expected_action: &str,
+        claim_id: Uuid,
+        legs: &[NewLeg<'_>],
+    ) -> Result<Vec<i64>> {
+        validate_lifecycle_action(expected_action)?;
+        let mut tx = self.pool.begin().await?;
+        let ownership: Option<(Option<String>, Option<Uuid>)> = sqlx::query_as(
+            "SELECT lifecycle_action, lifecycle_claim_id
+             FROM arb_orders WHERE id = $1 FOR UPDATE",
+        )
+        .bind(order_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if ownership
+            .as_ref()
+            .map(|(action, id)| (action.as_deref(), *id))
+            != Some((Some(expected_action), Some(claim_id)))
+        {
+            return Err(crate::error::Error::msg(format!(
+                "lifecycle claim ownership lost for order {order_id}"
+            )));
+        }
+
+        let mut ids = Vec::with_capacity(legs.len());
+        for leg in legs {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO legs (
+                    order_id, platform, token_id, label, side, intent,
+                    funder_address, wallet_address, service, req_price, req_shares, req_fee,
+                    client_order_id, lifecycle_claim_id, status
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pending')
+                 RETURNING id",
+            )
+            .bind(order_id)
+            .bind(leg.platform)
+            .bind(leg.token_id)
+            .bind(leg.label)
+            .bind(leg.side)
+            .bind(leg.intent)
+            .bind(leg.funder)
+            .bind(leg.wallet)
+            .bind(leg.service)
+            .bind(leg.req_price)
+            .bind(leg.req_shares)
+            .bind(leg.req_fee)
+            .bind(leg.client_order_id)
+            .bind(claim_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            ids.push(id);
+        }
+        tx.commit().await?;
+        Ok(ids)
+    }
+
+    pub async fn insert_leg_for_claim(
+        &self,
+        order_id: i64,
+        expected_action: &str,
+        claim_id: Uuid,
+        leg: &NewLeg<'_>,
+    ) -> Result<i64> {
+        self.insert_legs_atomic(
+            order_id,
+            expected_action,
+            claim_id,
+            std::slice::from_ref(leg),
+        )
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| crate::error::Error::msg("lifecycle leg was not inserted"))
     }
 
     pub async fn insert_envelope(
@@ -278,15 +472,34 @@ impl Store {
         Ok(rows)
     }
 
-    pub async fn completed_unbalanced_orders(&self) -> Result<Vec<ArbOrderRow>> {
-        let rows = sqlx::query_as::<_, ArbOrderRow>(
-            "SELECT id, event_id, unified_index, status, rebalance_status
-             FROM arb_orders
-             WHERE status = 'completed' AND rebalance_status IN ('pending','actived')
-             ORDER BY id",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+    pub async fn completed_unbalanced_orders(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<ArbOrderRow>> {
+        let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
+        let query = |after_id: i64| {
+            sqlx::query_as::<_, ArbOrderRow>(
+                "SELECT id, title, event_id, unified_index, status, rebalance_status,
+                        position_status, lifecycle_action,
+                        lifecycle_claim_id, lifecycle_claimed_at, settlement_source,
+                        settlement_result, settled_at
+                 FROM arb_orders
+                 WHERE status = 'completed'
+                   AND rebalance_status IN ('pending','actived','completed')
+                   AND position_status = 'watching'
+                   AND settled_at IS NULL
+                   AND id > $1
+                 ORDER BY id
+                 LIMIT $2",
+            )
+            .bind(after_id)
+            .bind(limit)
+        };
+        let mut rows = query(after_id).fetch_all(&self.pool).await?;
+        if rows.is_empty() && after_id > 0 {
+            rows = query(0).fetch_all(&self.pool).await?;
+        }
         Ok(rows)
     }
 
@@ -388,11 +601,145 @@ impl Store {
         Ok(())
     }
 
-    pub async fn has_open_rebalance_legs(&self, order_id: i64) -> Result<bool> {
+    /// Atomically reserves a lifecycle action across concurrent workers.
+    pub async fn try_claim_lifecycle(&self, order_id: i64, action: &str) -> Result<Option<Uuid>> {
+        validate_lifecycle_action(action)?;
+        let claim_id = Uuid::new_v4();
+        let claimed: Option<Uuid> = sqlx::query_scalar(
+            "UPDATE arb_orders
+             SET lifecycle_action = $2, lifecycle_claim_id = $3,
+                 lifecycle_claimed_at = NOW(), updated_at = NOW()
+             WHERE id = $1
+               AND position_status = 'watching'
+               AND lifecycle_action IS NULL
+               AND lifecycle_claim_id IS NULL
+               AND lifecycle_claimed_at IS NULL
+               AND settled_at IS NULL
+             RETURNING lifecycle_claim_id",
+        )
+        .bind(order_id)
+        .bind(action)
+        .bind(claim_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(claimed)
+    }
+
+    /// Releases only the exact claim owned by the caller, preventing an ABA-era worker from
+    /// clearing a newer worker's claim.
+    pub async fn release_lifecycle(
+        &self,
+        order_id: i64,
+        action: &str,
+        claim_id: Uuid,
+    ) -> Result<bool> {
+        validate_lifecycle_action(action)?;
+        let result = sqlx::query(
+            "UPDATE arb_orders
+             SET position_status = 'watching', lifecycle_action = NULL,
+                 lifecycle_claim_id = NULL, lifecycle_claimed_at = NULL, updated_at = NOW()
+             WHERE id = $1 AND settled_at IS NULL
+               AND lifecycle_action = $2 AND lifecycle_claim_id = $3",
+        )
+        .bind(order_id)
+        .bind(action)
+        .bind(claim_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// First settlement wins; retries do not overwrite the recorded evidence.
+    pub async fn mark_position_settled(
+        &self,
+        order_id: i64,
+        source: &str,
+        result: &Value,
+    ) -> Result<bool> {
+        let updated: Option<i64> = sqlx::query_scalar(
+            "UPDATE arb_orders
+             SET position_status = 'settled', lifecycle_action = NULL,
+                 lifecycle_claim_id = NULL, lifecycle_claimed_at = NULL, settlement_source = $2,
+                 settlement_result = $3, settled_at = NOW(),
+                 updated_at = NOW()
+             WHERE id = $1 AND settled_at IS NULL
+               AND lifecycle_action IS NULL
+               AND lifecycle_claim_id IS NULL
+               AND lifecycle_claimed_at IS NULL
+             RETURNING id",
+        )
+        .bind(order_id)
+        .bind(source)
+        .bind(result)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(updated.is_some())
+    }
+
+    pub async fn mark_position_closed(&self, order_id: i64) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE arb_orders
+             SET position_status = 'closed', updated_at = NOW()
+             WHERE id = $1 AND settled_at IS NULL
+               AND lifecycle_action IS NULL
+               AND lifecycle_claim_id IS NULL
+               AND lifecycle_claimed_at IS NULL",
+        )
+        .bind(order_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn lifecycle_leg_counts(
+        &self,
+        order_id: i64,
+        intent: &str,
+        claim_id: Uuid,
+    ) -> Result<(i64, i64)> {
+        validate_lifecycle_action(intent)?;
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*)::BIGINT,
+                    COUNT(*) FILTER (WHERE status IN ('pending','unknown','actived'))::BIGINT
+             FROM legs
+             WHERE order_id = $1 AND intent = $2 AND lifecycle_claim_id = $3",
+        )
+        .bind(order_id)
+        .bind(intent)
+        .bind(claim_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(counts)
+    }
+
+    pub async fn lifecycle_claim_has_positive_fill(
+        &self,
+        order_id: i64,
+        intent: &str,
+        claim_id: Uuid,
+    ) -> Result<bool> {
+        validate_lifecycle_action(intent)?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM legs
+                 WHERE order_id = $1 AND intent = $2 AND lifecycle_claim_id = $3
+                   AND status IN ('matched','completed')
+                   AND COALESCE(actual_shares, 0) > 0
+             )",
+        )
+        .bind(order_id)
+        .bind(intent)
+        .bind(claim_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
+
+    pub async fn has_open_lifecycle_legs(&self, order_id: i64) -> Result<bool> {
         let exists: Option<i64> = sqlx::query_scalar(
             "SELECT id FROM legs
              WHERE order_id = $1
-               AND intent = 'rebalance'
+               AND intent IN ('rebalance','take_profit')
                AND status IN ('pending','unknown','actived')
              LIMIT 1",
         )
@@ -529,23 +876,25 @@ impl Store {
         let rows: Vec<(
             String,
             String,
+            String,
             Option<Decimal>,
             Option<Decimal>,
             Option<Decimal>,
         )> = sqlx::query_as(
-            "SELECT side, platform, actual_shares, actual_price, actual_fee
+            "SELECT side, platform, label, actual_shares, actual_price, actual_fee
                  FROM legs
                  WHERE order_id = $1 AND status IN ('matched','completed')",
         )
         .bind(order_id)
         .fetch_all(&self.pool)
         .await?;
-        let rows: Vec<(String, String, Decimal, Decimal, Decimal)> = rows
+        let rows: Vec<(String, String, String, Decimal, Decimal, Decimal)> = rows
             .into_iter()
-            .map(|(side, platform, shares, price, fee)| {
+            .map(|(side, platform, label, shares, price, fee)| {
                 (
                     side,
                     platform,
+                    label,
                     shares.unwrap_or(Decimal::ZERO),
                     price.unwrap_or(Decimal::ZERO),
                     fee.unwrap_or(Decimal::ZERO),
@@ -558,31 +907,63 @@ impl Store {
     }
 }
 
+fn validate_lifecycle_action(action: &str) -> Result<()> {
+    match action {
+        "take_profit" | "rebalance" => Ok(()),
+        _ => Err(crate::error::Error::msg(format!(
+            "invalid lifecycle action: {action}"
+        ))),
+    }
+}
+
 pub fn compute_actuals(
-    rows: &[(String, String, Decimal, Decimal, Decimal)],
+    rows: &[(String, String, String, Decimal, Decimal, Decimal)],
 ) -> (Decimal, Decimal, Decimal) {
+    use std::collections::{BTreeMap, BTreeSet};
+
     let mut cost = Decimal::ZERO;
     let mut rev = Decimal::ZERO;
-    let mut net_pm = Decimal::ZERO;
-    let mut net_out = Decimal::ZERO;
-    for (side, platform, shares, price, fee) in rows {
-        if side.eq_ignore_ascii_case("SELL") {
+    let mut labels = BTreeSet::new();
+    let mut positions = BTreeMap::new();
+    for (side, platform, label, shares, price, fee) in rows {
+        let is_sell = side.eq_ignore_ascii_case("SELL");
+        if is_sell {
             rev += *shares * *price - *fee;
-            if platform == POLYMARKET {
-                net_pm -= *shares;
-            } else if platform == OUTCOME {
-                net_out -= *shares;
-            }
         } else {
             cost += *shares * *price + *fee;
-            if platform == POLYMARKET {
-                net_pm += *shares;
-            } else if platform == OUTCOME {
-                net_out += *shares;
+        }
+
+        let label = label.to_ascii_lowercase();
+        labels.insert(label.clone());
+        if platform == POLYMARKET || platform == OUTCOME {
+            let position = positions
+                .entry((platform.as_str(), label))
+                .or_insert(Decimal::ZERO);
+            if is_sell {
+                *position -= *shares;
+            } else {
+                *position += *shares;
             }
         }
     }
-    let locked = net_pm.max(Decimal::ZERO).min(net_out.max(Decimal::ZERO));
+
+    // 项目仅支持二元市场，一对跨平台互补份额固定兑付 q/1。
+    let locked = if labels.len() == 2 {
+        let mut labels = labels.iter();
+        let label0 = labels.next().expect("two labels checked");
+        let label1 = labels.next().expect("two labels checked");
+        let position = |platform, label: &String| {
+            positions
+                .get(&(platform, label.clone()))
+                .copied()
+                .unwrap_or(Decimal::ZERO)
+                .max(Decimal::ZERO)
+        };
+        position(POLYMARKET, label0).min(position(OUTCOME, label1))
+            + position(POLYMARKET, label1).min(position(OUTCOME, label0))
+    } else {
+        Decimal::ZERO
+    };
     rev += locked;
     (cost, rev, rev - cost)
 }
@@ -601,11 +982,44 @@ mod tests {
     }
 
     #[test]
-    fn actuals_lock_min_buy_shares_and_add_sell_rev() {
+    fn lifecycle_action_accepts_supported_actions() {
+        assert!(validate_lifecycle_action("take_profit").is_ok());
+        assert!(validate_lifecycle_action("rebalance").is_ok());
+    }
+
+    #[test]
+    fn lifecycle_action_rejects_unknown_actions() {
+        assert!(validate_lifecycle_action("settlement").is_err());
+        assert!(validate_lifecycle_action("").is_err());
+    }
+
+    #[test]
+    fn actuals_lock_opposite_labels_and_add_sell_rev() {
         let rows = vec![
-            ("BUY".into(), POLYMARKET.into(), d("10"), d("0.4"), d("0.1")),
-            ("BUY".into(), OUTCOME.into(), d("8"), d("0.5"), d("0")),
-            ("SELL".into(), POLYMARKET.into(), d("2"), d("0.6"), d("0")),
+            (
+                "BUY".into(),
+                POLYMARKET.into(),
+                "yes".into(),
+                d("10"),
+                d("0.4"),
+                d("0.1"),
+            ),
+            (
+                "BUY".into(),
+                OUTCOME.into(),
+                "no".into(),
+                d("8"),
+                d("0.5"),
+                d("0"),
+            ),
+            (
+                "SELL".into(),
+                POLYMARKET.into(),
+                "yes".into(),
+                d("2"),
+                d("0.6"),
+                d("0"),
+            ),
         ];
         let (cost, rev, profit) = compute_actuals(&rows);
         assert_eq!(cost.to_string(), "8.1");
@@ -614,11 +1028,100 @@ mod tests {
     }
 
     #[test]
-    fn actuals_sell_reduces_locked_shares() {
+    fn actuals_same_labels_do_not_lock() {
         let rows = vec![
-            ("BUY".into(), POLYMARKET.into(), d("100"), d("0.4"), d("0")),
-            ("BUY".into(), OUTCOME.into(), d("100"), d("0.5"), d("0")),
-            ("SELL".into(), POLYMARKET.into(), d("50"), d("0.4"), d("0")),
+            (
+                "BUY".into(),
+                POLYMARKET.into(),
+                "yes".into(),
+                d("10"),
+                d("0.4"),
+                d("0"),
+            ),
+            (
+                "BUY".into(),
+                OUTCOME.into(),
+                "yes".into(),
+                d("8"),
+                d("0.5"),
+                d("0"),
+            ),
+        ];
+        let (cost, rev, profit) = compute_actuals(&rows);
+        assert_eq!(cost, d("8"));
+        assert_eq!(rev, Decimal::ZERO);
+        assert_eq!(profit, d("-8"));
+    }
+
+    #[test]
+    fn actuals_lock_both_complementary_directions() {
+        let rows = vec![
+            (
+                "BUY".into(),
+                POLYMARKET.into(),
+                "yes".into(),
+                d("10"),
+                d("0.4"),
+                d("0"),
+            ),
+            (
+                "BUY".into(),
+                OUTCOME.into(),
+                "no".into(),
+                d("8"),
+                d("0.5"),
+                d("0"),
+            ),
+            (
+                "BUY".into(),
+                POLYMARKET.into(),
+                "no".into(),
+                d("3"),
+                d("0.3"),
+                d("0"),
+            ),
+            (
+                "BUY".into(),
+                OUTCOME.into(),
+                "yes".into(),
+                d("5"),
+                d("0.6"),
+                d("0"),
+            ),
+        ];
+        let (cost, rev, profit) = compute_actuals(&rows);
+        assert_eq!(cost, d("11.9"));
+        assert_eq!(rev, d("11"));
+        assert_eq!(profit, d("-0.9"));
+    }
+
+    #[test]
+    fn actuals_partial_sell_reduces_its_label_position() {
+        let rows = vec![
+            (
+                "BUY".into(),
+                POLYMARKET.into(),
+                "yes".into(),
+                d("100"),
+                d("0.4"),
+                d("0"),
+            ),
+            (
+                "BUY".into(),
+                OUTCOME.into(),
+                "no".into(),
+                d("100"),
+                d("0.5"),
+                d("0"),
+            ),
+            (
+                "SELL".into(),
+                POLYMARKET.into(),
+                "yes".into(),
+                d("50"),
+                d("0.4"),
+                d("0"),
+            ),
         ];
         let (cost, rev, profit) = compute_actuals(&rows);
         assert_eq!(cost, d("90"));

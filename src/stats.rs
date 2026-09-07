@@ -89,6 +89,18 @@ minute_stats! {
     out_ok,
     out_fail,
     exec_err,
+    take_profit_scan,
+    take_profit_candidate,
+    take_profit_confirmed,
+    take_profit_cancelled,
+    take_profit_pm_ok,
+    take_profit_pm_fail,
+    take_profit_out_ok,
+    take_profit_out_fail,
+    settlement_scan,
+    settled,
+    unavailable,
+    lifecycle_busy,
 }
 
 impl MinuteStats {
@@ -132,11 +144,17 @@ mod tests {
         stats.wakeup();
         stats.add_missing_book(3);
         stats.orders();
+        stats.take_profit_candidate();
+        stats.settled();
+        stats.lifecycle_busy();
 
         let first = stats.snapshot_and_reset();
         assert_eq!(first.wakeup, 2);
         assert_eq!(first.missing_book, 3);
         assert_eq!(first.orders, 1);
+        assert_eq!(first.take_profit_candidate, 1);
+        assert_eq!(first.settled, 1);
+        assert_eq!(first.lifecycle_busy, 1);
         assert_eq!(first.calc, 0);
 
         let second = stats.snapshot_and_reset();

@@ -305,6 +305,33 @@ impl PolymarketVenue {
         Ok(units / Decimal::from(1_000_000))
     }
 
+    pub async fn settlement(
+        &self,
+        condition_id: &str,
+    ) -> Result<crate::settlement::SettlementStatus> {
+        if condition_id.is_empty() {
+            return Err(Error::msg("missing polymarket condition_id"));
+        }
+        let started = Instant::now();
+        let value: Value = self
+            .http
+            .get(format!("{}/markets/{condition_id}", self.base))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let status = crate::settlement::parse_polymarket_settlement(&value)?;
+        tracing::info!(
+            service = "polymarket",
+            condition_id,
+            settlement_state = status.kind(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "settlement queried"
+        );
+        Ok(status)
+    }
+
     pub async fn rest_book(&self, token_id: &str) -> Result<(Vec<Level>, Vec<Level>, i64)> {
         let url = format!("{}/book", self.base);
         let value: Value = self

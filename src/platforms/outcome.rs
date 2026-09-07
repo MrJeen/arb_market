@@ -93,6 +93,32 @@ impl OutcomeVenue {
         next
     }
 
+    pub async fn settlement(
+        &self,
+        market_id: &str,
+    ) -> Result<crate::settlement::OutcomeSettlement> {
+        let outcome_id = parse_settlement_market_id(market_id)?;
+        let started = Instant::now();
+        let value: Value = self
+            .http
+            .post(&self.info_url)
+            .json(&json!({"type": "settledOutcome", "outcome": outcome_id}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let status = crate::settlement::parse_outcome_settlement(outcome_id, &value)?;
+        tracing::info!(
+            service = "outcome",
+            outcome_id,
+            settlement_state = status.kind(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "settlement queried"
+        );
+        Ok(status)
+    }
+
     pub async fn rest_book(&self, coin: &str) -> Result<(Vec<Level>, Vec<Level>, i64)> {
         let body = json!({"type": "l2Book", "coin": coin});
         let value: Value = self
@@ -627,6 +653,18 @@ fn random_cloid() -> String {
     format!("0x{}", hex::encode(rand::random::<[u8; 16]>()))
 }
 
+fn parse_settlement_market_id(market_id: &str) -> Result<u64> {
+    let outcome_id = market_id.trim().parse::<u64>().map_err(|_| {
+        Error::msg(format!(
+            "invalid outcome settlement market_id: {market_id:?}"
+        ))
+    })?;
+    if outcome_id == 0 {
+        return Err(Error::msg("outcome settlement market_id must be positive"));
+    }
+    Ok(outcome_id)
+}
+
 fn unix_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -870,6 +908,13 @@ mod tests {
         assert_eq!(parse_coin_balance(&raw, "#5160").to_string(), "7");
         assert_eq!(parse_coin_balance(&raw, "+5160").to_string(), "7");
         assert_eq!(parse_usdc_balance(&raw).to_string(), "10");
+    }
+
+    #[test]
+    fn parses_settlement_market_id() {
+        assert_eq!(parse_settlement_market_id(" 516 ").unwrap(), 516);
+        assert!(parse_settlement_market_id("not-a-number").is_err());
+        assert!(parse_settlement_market_id("0").is_err());
     }
 
     #[test]
