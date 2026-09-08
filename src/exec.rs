@@ -250,15 +250,15 @@ impl Engine {
             out_sz = %fmt_px(out_sz),
             "arb opportunity"
         );
-        if !self.cfg.enable_trading {
-            self.stats.trading_disabled();
+        if !self.cfg.enable_arb {
+            self.stats.arb_disabled();
             return Ok(());
         }
         self.execute_plan(&topic, plan).await
     }
 
     async fn execute_plan(&self, topic: &Topic, plan: ArbPlan) -> Result<()> {
-        self.ensure_trading_enabled("arbitrage")?;
+        self.ensure_trading_enabled(TradingIntent::Arbitrage)?;
         let fees = self.fee_context(topic);
         let pm_need = plan.pm.cost + plan.pm.fee;
         let out_need = plan.outcome.cost + plan.outcome.fee;
@@ -347,7 +347,7 @@ impl Engine {
             return Ok(());
         }
 
-        self.ensure_trading_enabled("arbitrage")?;
+        self.ensure_trading_enabled(TradingIntent::Arbitrage)?;
         let fills = json!([
             {"platform": POLYMARKET, "token": plan.pm.token_id, "label": plan.pm.label, "shares": plan.pm.shares, "price": plan.pm.cap_price},
             {"platform": OUTCOME, "token": plan.outcome.token_id, "label": plan.outcome.label, "shares": plan.outcome.shares, "price": plan.outcome.cap_price}
@@ -439,8 +439,8 @@ impl Engine {
             )
             .await?;
         let (pm_res, out_res) = tokio::join!(
-            self.submit_pm(pm_leg, &funder, &pm_req, &fees),
-            self.submit_outcome(out_leg, &out_req, &fees)
+            self.submit_pm(pm_leg, &funder, &pm_req, &fees, TradingIntent::Arbitrage),
+            self.submit_outcome(out_leg, &out_req, &fees, TradingIntent::Arbitrage)
         );
         if let Err(err) = &pm_res {
             tracing::error!(error = %err, "polymarket submit failed");
@@ -863,8 +863,8 @@ impl Engine {
         books.get(platform, token_id).map(OrderBook::snapshot_json)
     }
 
-    fn ensure_trading_enabled(&self, action: &str) -> Result<()> {
-        ensure_trading_submission_enabled(self.cfg.enable_trading, action)
+    fn ensure_trading_enabled(&self, intent: TradingIntent) -> Result<()> {
+        ensure_trading_submission_enabled(intent.enabled(&self.cfg), intent)
     }
 
     async fn submit_pm(
@@ -873,8 +873,9 @@ impl Engine {
         funder: &str,
         req: &MarketOrderRequest,
         fees: &FeeContext,
+        intent: TradingIntent,
     ) -> Result<SubmitResult> {
-        self.ensure_trading_enabled("polymarket submission")?;
+        self.ensure_trading_enabled(intent)?;
         let prepared = self.pm.prepare_market_order(funder, req).await?;
         let book_snapshot = self.token_book_snapshot(POLYMARKET, &req.token_id).await;
         self.store
@@ -905,8 +906,9 @@ impl Engine {
         leg_id: i64,
         req: &MarketOrderRequest,
         fees: &FeeContext,
+        intent: TradingIntent,
     ) -> Result<SubmitResult> {
-        self.ensure_trading_enabled("outcome submission")?;
+        self.ensure_trading_enabled(intent)?;
         let prepared = self.outcome.prepare_market_order(req)?;
         let book_snapshot = self.token_book_snapshot(OUTCOME, &req.token_id).await;
         self.store
@@ -1125,7 +1127,7 @@ impl Engine {
 
         let fees = self.fee_context(&topic);
 
-        if self.cfg.take_profit_enabled && settlement_access == SettlementAccess::All {
+        if settlement_access == SettlementAccess::All {
             let take_profit_tokens = take_profit_book_tokens(&topic, &positions);
             self.refresh_hedge_books(order.id, &take_profit_tokens)
                 .await;
@@ -1153,50 +1155,49 @@ impl Engine {
                     .confirm_take_profit(&topic, &positions, &fees, &plan)
                     .await?
                 {
-                    if !self.cfg.enable_trading {
-                        self.stats.trading_disabled();
-                        tracing::info!(
-                            order_id = order.id,
-                            "take profit calculated; submission disabled"
-                        );
+                    if self.cfg.enable_take_profit {
+                        let Some(claim_id) = self
+                            .store
+                            .try_claim_lifecycle(order.id, "take_profit")
+                            .await?
+                        else {
+                            self.stats.lifecycle_busy();
+                            return Ok(());
+                        };
+                        // Final gate after claiming and immediately before creating either leg.
+                        if self
+                            .settlement_gate(order.id, &order.title, &identity)
+                            .await?
+                            != SettlementAccess::All
+                        {
+                            self.store
+                                .release_lifecycle(order.id, "take_profit", claim_id)
+                                .await?;
+                            return Ok(());
+                        }
+                        self.stats.take_profit_confirmed();
+                        if let Some(notify) = &self.notify {
+                            notify.publish_take_profit_trigger(TakeProfitTriggerNotice {
+                                order_id: order.id,
+                                title: topic.title.clone(),
+                                expected_gain: confirmed.gain,
+                            });
+                        }
+                        let result = self
+                            .execute_take_profit(order.id, claim_id, &topic, &fees, &confirmed)
+                            .await;
+                        if let Err(err) = result {
+                            self.release_failed_zero_leg_claim(order.id, "take_profit", claim_id)
+                                .await?;
+                            return Err(err);
+                        }
                         return Ok(());
                     }
-                    let Some(claim_id) = self
-                        .store
-                        .try_claim_lifecycle(order.id, "take_profit")
-                        .await?
-                    else {
-                        self.stats.lifecycle_busy();
-                        return Ok(());
-                    };
-                    // Final gate after claiming and immediately before creating either leg.
-                    if self
-                        .settlement_gate(order.id, &order.title, &identity)
-                        .await?
-                        != SettlementAccess::All
-                    {
-                        self.store
-                            .release_lifecycle(order.id, "take_profit", claim_id)
-                            .await?;
-                        return Ok(());
-                    }
-                    self.stats.take_profit_confirmed();
-                    if let Some(notify) = &self.notify {
-                        notify.publish_take_profit_trigger(TakeProfitTriggerNotice {
-                            order_id: order.id,
-                            title: topic.title.clone(),
-                            expected_gain: confirmed.gain,
-                        });
-                    }
-                    let result = self
-                        .execute_take_profit(order.id, claim_id, &topic, &fees, &confirmed)
-                        .await;
-                    if let Err(err) = result {
-                        self.release_failed_zero_leg_claim(order.id, "take_profit", claim_id)
-                            .await?;
-                        return Err(err);
-                    }
-                    return Ok(());
+                    self.stats.take_profit_disabled();
+                    tracing::info!(
+                        order_id = order.id,
+                        "take profit calculated; submission disabled"
+                    );
                 }
                 self.stats.take_profit_cancelled();
             }
@@ -1282,8 +1283,8 @@ impl Engine {
             );
             return Ok(());
         }
-        if !self.cfg.enable_trading {
-            self.stats.trading_disabled();
+        if !self.cfg.enable_rebalance {
+            self.stats.rebalance_disabled();
             tracing::info!(
                 order_id = order.id,
                 "rebalance calculated; submission disabled"
@@ -1688,7 +1689,7 @@ impl Engine {
         fees: &FeeContext,
         plan: &TakeProfitPlan,
     ) -> Result<()> {
-        self.ensure_trading_enabled("take profit")?;
+        self.ensure_trading_enabled(TradingIntent::TakeProfit)?;
         let pm_action = plan
             .actions
             .iter()
@@ -1755,8 +1756,8 @@ impl Engine {
             .try_into()
             .map_err(|_| Error::msg("take profit must create exactly two legs"))?;
         let (pm_result, out_result) = tokio::join!(
-            self.submit_pm(pm_leg, &funder, &pm_req, fees),
-            self.submit_outcome(out_leg, &out_req, fees),
+            self.submit_pm(pm_leg, &funder, &pm_req, fees, TradingIntent::TakeProfit),
+            self.submit_outcome(out_leg, &out_req, fees, TradingIntent::TakeProfit),
         );
         if submit_confirmed(&pm_result) {
             self.stats.take_profit_pm_ok();
@@ -1820,7 +1821,7 @@ impl Engine {
         action: &crate::hedge::HedgeAction,
         fees: &FeeContext,
     ) -> Result<()> {
-        self.ensure_trading_enabled("hedge")?;
+        self.ensure_trading_enabled(TradingIntent::Rebalance)?;
         let side = match action.side {
             HedgeSide::Buy => OrderSide::Buy,
             HedgeSide::Sell => OrderSide::Sell,
@@ -1892,7 +1893,8 @@ impl Engine {
                     },
                 )
                 .await?;
-            self.submit_pm(leg_id, &funder, &req, fees).await?;
+            self.submit_pm(leg_id, &funder, &req, fees, TradingIntent::Rebalance)
+                .await?;
             Ok(())
         } else {
             if side == OrderSide::Sell {
@@ -1938,7 +1940,8 @@ impl Engine {
                     },
                 )
                 .await?;
-            self.submit_outcome(leg_id, &req, fees).await?;
+            self.submit_outcome(leg_id, &req, fees, TradingIntent::Rebalance)
+                .await?;
             Ok(())
         }
     }
@@ -2102,13 +2105,50 @@ enum SettlementAccess {
     Stop,
 }
 
-fn ensure_trading_submission_enabled(enabled: bool, action: &str) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TradingIntent {
+    Arbitrage,
+    Rebalance,
+    TakeProfit,
+}
+
+impl TradingIntent {
+    fn enabled(self, cfg: &Config) -> bool {
+        workflow_switch_enabled(
+            cfg.enable_arb,
+            cfg.enable_rebalance,
+            cfg.enable_take_profit,
+            self,
+        )
+    }
+
+    fn env_name(self) -> &'static str {
+        match self {
+            Self::Arbitrage => "ENABLE_ARB",
+            Self::Rebalance => "ENABLE_REBALANCE",
+            Self::TakeProfit => "ENABLE_TAKE_PROFIT",
+        }
+    }
+}
+
+fn workflow_switch_enabled(
+    enable_arb: bool,
+    enable_rebalance: bool,
+    enable_take_profit: bool,
+    intent: TradingIntent,
+) -> bool {
+    match intent {
+        TradingIntent::Arbitrage => enable_arb,
+        TradingIntent::Rebalance => enable_rebalance,
+        TradingIntent::TakeProfit => enable_take_profit,
+    }
+}
+
+fn ensure_trading_submission_enabled(enabled: bool, intent: TradingIntent) -> Result<()> {
     if enabled {
         Ok(())
     } else {
-        Err(Error::msg(format!(
-            "{action} disabled by ENABLE_TRADING=false"
-        )))
+        Err(Error::msg(format!("{}=false", intent.env_name())))
     }
 }
 
@@ -2625,16 +2665,36 @@ mod tests {
     }
 
     #[test]
-    fn trading_switch_blocks_every_submission_kind() {
-        for action in [
-            "arbitrage BUY",
-            "take profit SELL",
-            "rebalance BUY",
-            "rebalance SELL",
+    fn workflow_switch_matrix_is_independent() {
+        for mask in 0_u8..8 {
+            let arb = mask & 1 != 0;
+            let rebalance = mask & 2 != 0;
+            let take_profit = mask & 4 != 0;
+            assert_eq!(
+                workflow_switch_enabled(arb, rebalance, take_profit, TradingIntent::Arbitrage),
+                arb
+            );
+            assert_eq!(
+                workflow_switch_enabled(arb, rebalance, take_profit, TradingIntent::Rebalance),
+                rebalance
+            );
+            assert_eq!(
+                workflow_switch_enabled(arb, rebalance, take_profit, TradingIntent::TakeProfit),
+                take_profit
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_switches_block_their_own_submission_kind() {
+        for intent in [
+            TradingIntent::Arbitrage,
+            TradingIntent::Rebalance,
+            TradingIntent::TakeProfit,
         ] {
-            let err = ensure_trading_submission_enabled(false, action).unwrap_err();
-            assert!(err.to_string().contains("ENABLE_TRADING=false"));
-            assert!(ensure_trading_submission_enabled(true, action).is_ok());
+            let err = ensure_trading_submission_enabled(false, intent).unwrap_err();
+            assert!(err.to_string().contains(intent.env_name()));
+            assert!(ensure_trading_submission_enabled(true, intent).is_ok());
         }
     }
 

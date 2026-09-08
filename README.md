@@ -26,7 +26,7 @@ cp polymarket_funders.json.example polymarket_funders.json
 cargo run --release
 ```
 
-`ENABLE_TRADING=false` 时服务仍扫描并计算套利、止盈和再平衡，但禁止提交任何自动 BUY/SELL，也不会为这些动作创建新订单腿。该总闸不影响成交回填、结算处理，也不限制显式人工入口 `place-test --confirm`。升级时必须将旧 `ENABLE_BUY` 改为 `ENABLE_TRADING`；缺少新变量会安全地保持停单。配置项见 `.env.example`。
+自动交易由三个互相独立、默认关闭的执行开关控制：`ENABLE_ARB`（新套利）、`ENABLE_REBALANCE`（再平衡）、`ENABLE_TAKE_PROFIT`（止盈）。某项为 `false` 时仍扫描并计算对应机会，但不会 claim 生命周期动作、写入新订单/交易腿或提交真实交易；其他已开启流程不受影响。成交回填、结算处理也不受这些开关影响，显式人工入口 `place-test --confirm` 保持独立。旧 `ENABLE_TRADING`、`ENABLE_BUY`、`TAKE_PROFIT_ENABLED` 不再读取，升级时必须逐项配置。详见 `.env.example`。
 
 ## 市场与结算口径
 
