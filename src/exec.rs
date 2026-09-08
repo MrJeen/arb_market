@@ -250,14 +250,15 @@ impl Engine {
             out_sz = %fmt_px(out_sz),
             "arb opportunity"
         );
-        if !self.cfg.enable_buy {
-            self.stats.buy_disabled();
+        if !self.cfg.enable_trading {
+            self.stats.trading_disabled();
             return Ok(());
         }
         self.execute_plan(&topic, plan).await
     }
 
     async fn execute_plan(&self, topic: &Topic, plan: ArbPlan) -> Result<()> {
+        self.ensure_trading_enabled("arbitrage")?;
         let fees = self.fee_context(topic);
         let pm_need = plan.pm.cost + plan.pm.fee;
         let out_need = plan.outcome.cost + plan.outcome.fee;
@@ -346,6 +347,7 @@ impl Engine {
             return Ok(());
         }
 
+        self.ensure_trading_enabled("arbitrage")?;
         let fills = json!([
             {"platform": POLYMARKET, "token": plan.pm.token_id, "label": plan.pm.label, "shares": plan.pm.shares, "price": plan.pm.cap_price},
             {"platform": OUTCOME, "token": plan.outcome.token_id, "label": plan.outcome.label, "shares": plan.outcome.shares, "price": plan.outcome.cap_price}
@@ -861,6 +863,10 @@ impl Engine {
         books.get(platform, token_id).map(OrderBook::snapshot_json)
     }
 
+    fn ensure_trading_enabled(&self, action: &str) -> Result<()> {
+        ensure_trading_submission_enabled(self.cfg.enable_trading, action)
+    }
+
     async fn submit_pm(
         &self,
         leg_id: i64,
@@ -868,6 +874,7 @@ impl Engine {
         req: &MarketOrderRequest,
         fees: &FeeContext,
     ) -> Result<SubmitResult> {
+        self.ensure_trading_enabled("polymarket submission")?;
         let prepared = self.pm.prepare_market_order(funder, req).await?;
         let book_snapshot = self.token_book_snapshot(POLYMARKET, &req.token_id).await;
         self.store
@@ -899,6 +906,7 @@ impl Engine {
         req: &MarketOrderRequest,
         fees: &FeeContext,
     ) -> Result<SubmitResult> {
+        self.ensure_trading_enabled("outcome submission")?;
         let prepared = self.outcome.prepare_market_order(req)?;
         let book_snapshot = self.token_book_snapshot(OUTCOME, &req.token_id).await;
         self.store
@@ -1061,6 +1069,8 @@ impl Engine {
         if let Some(last) = orders.last() {
             *self.position_scan_cursor.lock().await = last.id;
         } else if after_id > 0 {
+            // The store already attempted a wraparound query; reset the persisted cursor state
+            // when the entire watching set is empty so later inserts start from the beginning.
             *self.position_scan_cursor.lock().await = 0;
         }
         for order in orders {
@@ -1073,7 +1083,7 @@ impl Engine {
     }
 
     async fn hedge_order_once(&self, order: &ArbOrderRow) -> Result<()> {
-        if self.finish_terminal_lifecycle_action(&order).await? {
+        if self.finish_terminal_lifecycle_action(order).await? {
             return Ok(());
         }
         if self.store.has_open_lifecycle_legs(order.id).await? {
@@ -1115,10 +1125,7 @@ impl Engine {
 
         let fees = self.fee_context(&topic);
 
-        if self.cfg.take_profit_enabled
-            && self.cfg.enable_buy
-            && settlement_access == SettlementAccess::All
-        {
+        if self.cfg.take_profit_enabled && settlement_access == SettlementAccess::All {
             let take_profit_tokens = take_profit_book_tokens(&topic, &positions);
             self.refresh_hedge_books(order.id, &take_profit_tokens)
                 .await;
@@ -1146,11 +1153,12 @@ impl Engine {
                     .confirm_take_profit(&topic, &positions, &fees, &plan)
                     .await?
                 {
-                    if self
-                        .settlement_gate(order.id, &order.title, &identity)
-                        .await?
-                        != SettlementAccess::All
-                    {
+                    if !self.cfg.enable_trading {
+                        self.stats.trading_disabled();
+                        tracing::info!(
+                            order_id = order.id,
+                            "take profit calculated; submission disabled"
+                        );
                         return Ok(());
                     }
                     let Some(claim_id) = self
@@ -1207,11 +1215,11 @@ impl Engine {
             }
             Some(true) => {}
         }
-        // SELL execution still needs the original funder, but an empty balance map deliberately
-        // disables eval_buy so reduce-only planning can choose an available SELL candidate.
+        // Full-access planning reads balances regardless of the trading switch so dry-run
+        // calculations match live trading. Reduce-only deliberately leaves balances empty.
         let order_funder = self.store.order_pm_funder(order.id).await?;
         let mut balances = HashMap::new();
-        if settlement_access == SettlementAccess::All && self.cfg.enable_buy {
+        if settlement_access == SettlementAccess::All {
             if let Some(funder) = order_funder.as_deref() {
                 match self.pm.balance(funder).await {
                     Ok(bal) => {
@@ -1265,14 +1273,20 @@ impl Engine {
         }
         let actions: Vec<_> = actions
             .into_iter()
-            .filter(|action| {
-                action_allowed_for_rebalance(action, settlement_access, self.cfg.enable_buy)
-            })
+            .filter(|action| action_allowed_for_rebalance(action, settlement_access))
             .collect();
         if actions.is_empty() {
             tracing::info!(
                 order_id = order.id,
                 "rebalance has no permitted reduce-only actions"
+            );
+            return Ok(());
+        }
+        if !self.cfg.enable_trading {
+            self.stats.trading_disabled();
+            tracing::info!(
+                order_id = order.id,
+                "rebalance calculated; submission disabled"
             );
             return Ok(());
         }
@@ -1289,9 +1303,9 @@ impl Engine {
             .settlement_gate(order.id, &order.title, &identity)
             .await?;
         if final_access == SettlementAccess::Stop
-            || actions.iter().any(|action| {
-                !action_allowed_for_rebalance(action, final_access, self.cfg.enable_buy)
-            })
+            || actions
+                .iter()
+                .any(|action| !action_allowed_for_rebalance(action, final_access))
         {
             self.store
                 .release_lifecycle(order.id, "rebalance", claim_id)
@@ -1476,31 +1490,65 @@ impl Engine {
         );
         let (access, settled_source) = settlement_decision(pm.as_ref(), outcome.as_ref());
         if let Some(source) = settled_source {
-            // Preserve partial evidence: an independently confirmed settlement must win even when
-            // the other venue failed, and its error remains available for diagnosis.
             let evidence = json!({
                 "polymarket": settlement_result_evidence(&pm),
                 "outcome": settlement_result_evidence(&outcome),
             });
-            let first_settlement = self
-                .store
-                .mark_position_settled(order_id, source, &evidence)
-                .await?;
-            if first_settlement {
-                self.stats.settled();
-                if let Some(notify) = &self.notify {
-                    notify.publish_settlement(SettlementNotice {
+            // One confirmed venue is enough to stop trading, but both payouts are required before
+            // terminal state and actuals are made durable. Until then the watching row is retried.
+            if let (
+                Ok(SettlementStatus::Settled {
+                    payouts: pm_payouts,
+                }),
+                Ok(OutcomeSettlement::Settled {
+                    payouts: outcome_payouts,
+                }),
+            ) = (&pm, &outcome)
+            {
+                let mut payouts = HashMap::new();
+                for payout in pm_payouts {
+                    payouts.insert(
+                        (POLYMARKET.to_string(), payout.token_id.clone()),
+                        payout.payout,
+                    );
+                }
+                for payout in outcome_payouts {
+                    payouts.insert(
+                        (OUTCOME.to_string(), payout.token_id.clone()),
+                        payout.payout,
+                    );
+                }
+                if let Some((_, _, actual_profit)) = self
+                    .store
+                    .finalize_position_settlement(
                         order_id,
-                        title: title.to_string(),
-                        status: format!("settled ({source})"),
-                        actual_profit: None,
-                    });
+                        "polymarket+outcome",
+                        &evidence,
+                        &payouts,
+                    )
+                    .await?
+                {
+                    self.stats.settled();
+                    if let Some(notify) = &self.notify {
+                        notify.publish_settlement(SettlementNotice {
+                            order_id,
+                            title: title.to_string(),
+                            status: "settled (polymarket+outcome)".to_string(),
+                            actual_profit: Some(actual_profit),
+                        });
+                    }
+                } else {
+                    tracing::warn!(
+                        order_id,
+                        source,
+                        "settlement confirmed but finalization deferred by active claim"
+                    );
                 }
             } else {
                 tracing::warn!(
                     order_id,
                     source,
-                    "settlement confirmed but state update deferred by active claim"
+                    "settlement detected; waiting for both venue payouts"
                 );
             }
             return Ok(SettlementAccess::Stop);
@@ -1640,9 +1688,7 @@ impl Engine {
         fees: &FeeContext,
         plan: &TakeProfitPlan,
     ) -> Result<()> {
-        if !self.cfg.enable_buy {
-            return Err(Error::msg("take profit disabled by ENABLE_BUY=false"));
-        }
+        self.ensure_trading_enabled("take profit")?;
         let pm_action = plan
             .actions
             .iter()
@@ -1774,9 +1820,7 @@ impl Engine {
         action: &crate::hedge::HedgeAction,
         fees: &FeeContext,
     ) -> Result<()> {
-        if !self.cfg.enable_buy && action.side == HedgeSide::Buy {
-            return Err(Error::msg("hedge BUY disabled by ENABLE_BUY=false"));
-        }
+        self.ensure_trading_enabled("hedge")?;
         let side = match action.side {
             HedgeSide::Buy => OrderSide::Buy,
             HedgeSide::Sell => OrderSide::Sell,
@@ -2058,14 +2102,23 @@ enum SettlementAccess {
     Stop,
 }
 
+fn ensure_trading_submission_enabled(enabled: bool, action: &str) -> Result<()> {
+    if enabled {
+        Ok(())
+    } else {
+        Err(Error::msg(format!(
+            "{action} disabled by ENABLE_TRADING=false"
+        )))
+    }
+}
+
 fn action_allowed_for_rebalance(
     action: &crate::hedge::HedgeAction,
     access: SettlementAccess,
-    enable_buy: bool,
 ) -> bool {
     match action.side {
         HedgeSide::Sell => access != SettlementAccess::Stop,
-        HedgeSide::Buy => enable_buy && access == SettlementAccess::All,
+        HedgeSide::Buy => access == SettlementAccess::All,
     }
 }
 
@@ -2572,7 +2625,21 @@ mod tests {
     }
 
     #[test]
-    fn rebalance_permissions_only_relax_for_sell() {
+    fn trading_switch_blocks_every_submission_kind() {
+        for action in [
+            "arbitrage BUY",
+            "take profit SELL",
+            "rebalance BUY",
+            "rebalance SELL",
+        ] {
+            let err = ensure_trading_submission_enabled(false, action).unwrap_err();
+            assert!(err.to_string().contains("ENABLE_TRADING=false"));
+            assert!(ensure_trading_submission_enabled(true, action).is_ok());
+        }
+    }
+
+    #[test]
+    fn rebalance_permissions_follow_settlement_access() {
         let action = |side| crate::hedge::HedgeAction {
             platform: POLYMARKET.into(),
             token_id: "token".into(),
@@ -2586,27 +2653,22 @@ mod tests {
         assert!(action_allowed_for_rebalance(
             &action(HedgeSide::Sell),
             SettlementAccess::ReduceOnly,
-            false,
         ));
         assert!(!action_allowed_for_rebalance(
             &action(HedgeSide::Buy),
             SettlementAccess::ReduceOnly,
-            true,
-        ));
-        assert!(!action_allowed_for_rebalance(
-            &action(HedgeSide::Buy),
-            SettlementAccess::All,
-            false,
         ));
         assert!(action_allowed_for_rebalance(
             &action(HedgeSide::Buy),
             SettlementAccess::All,
-            true,
+        ));
+        assert!(action_allowed_for_rebalance(
+            &action(HedgeSide::Sell),
+            SettlementAccess::All,
         ));
         assert!(!action_allowed_for_rebalance(
             &action(HedgeSide::Sell),
             SettlementAccess::Stop,
-            true,
         ));
     }
 

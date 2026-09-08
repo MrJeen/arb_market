@@ -172,6 +172,94 @@ async fn stale_token_cannot_release_or_insert_under_new_claim() {
 
 #[tokio::test]
 #[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn settlement_finalization_is_atomic_and_idempotent() {
+    let fixture = Fixture::new().await.expect(POSTGRES_REQUIRED);
+
+    let exercised: Result<_> = async {
+        sqlx::query(
+            "INSERT INTO legs
+             (order_id, platform, token_id, label, side, intent, status,
+              actual_shares, actual_price, actual_fee)
+             VALUES
+             ($1, 'polymarket', 'pm-yes', 'yes', 'BUY', 'arb_buy', 'matched', 10, 0.4, 0),
+             ($1, 'outcome', '#5161', 'no', 'BUY', 'arb_buy', 'matched', 10, 0.5, 0)",
+        )
+        .bind(fixture.order_id)
+        .execute(&fixture.store.pool)
+        .await?;
+        let payouts = std::collections::HashMap::from([
+            (
+                ("polymarket".to_string(), "pm-yes".to_string()),
+                Decimal::ONE,
+            ),
+            (("outcome".to_string(), "#5161".to_string()), Decimal::ONE),
+        ]);
+        let first = fixture
+            .store
+            .finalize_position_settlement(
+                fixture.order_id,
+                "polymarket+outcome",
+                &json!({"both": "settled"}),
+                &payouts,
+            )
+            .await?;
+        let second = fixture
+            .store
+            .finalize_position_settlement(
+                fixture.order_id,
+                "polymarket+outcome",
+                &json!({"both": "settled"}),
+                &payouts,
+            )
+            .await?;
+        let row = sqlx::query(
+            "SELECT position_status, actual_cost, actual_rev, actual_profit, settled_at
+             FROM arb_orders WHERE id = $1",
+        )
+        .bind(fixture.order_id)
+        .fetch_one(&fixture.store.pool)
+        .await?;
+        Ok::<_, anyhow::Error>((first, second, row))
+    }
+    .await;
+
+    if let Err(err) = fixture.cleanup().await {
+        eprintln!("cleanup failed: {err:#}");
+    }
+    let (first, second, row) = exercised.expect("settlement finalization");
+    assert_eq!(
+        first,
+        Some((
+            Decimal::new(90, 1),
+            Decimal::new(200, 1),
+            Decimal::new(110, 1)
+        ))
+    );
+    assert_eq!(second, None);
+    assert_eq!(
+        row.try_get::<String, _>("position_status").unwrap(),
+        "settled"
+    );
+    assert_eq!(
+        row.try_get::<Decimal, _>("actual_cost").unwrap(),
+        Decimal::new(90, 1)
+    );
+    assert_eq!(
+        row.try_get::<Decimal, _>("actual_rev").unwrap(),
+        Decimal::new(200, 1)
+    );
+    assert_eq!(
+        row.try_get::<Decimal, _>("actual_profit").unwrap(),
+        Decimal::new(110, 1)
+    );
+    assert!(row
+        .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("settled_at")
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
 async fn settlement_waits_for_claim_release_and_preserves_first_evidence() {
     let fixture = Fixture::new().await.expect(POSTGRES_REQUIRED);
     let first_result = json!({"winner": "yes", "round": 1});

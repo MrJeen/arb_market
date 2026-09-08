@@ -8,6 +8,15 @@ use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::Duration;
 use uuid::Uuid;
 
+type ActualLegRow = (
+    String,
+    String,
+    String,
+    Option<Decimal>,
+    Option<Decimal>,
+    Option<Decimal>,
+);
+
 #[derive(Debug, Clone)]
 pub struct Store {
     pub pool: PgPool,
@@ -676,6 +685,82 @@ impl Store {
         Ok(updated.is_some())
     }
 
+    /// Atomically finalizes a settled position from token-level payouts and all durable fills.
+    pub async fn finalize_position_settlement(
+        &self,
+        order_id: i64,
+        source: &str,
+        result: &Value,
+        payouts: &std::collections::HashMap<(String, String), Decimal>,
+    ) -> Result<Option<(Decimal, Decimal, Decimal)>> {
+        let mut tx = self.pool.begin().await?;
+        let finalizable: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM arb_orders
+             WHERE id = $1 AND settled_at IS NULL
+               AND lifecycle_action IS NULL
+               AND lifecycle_claim_id IS NULL
+               AND lifecycle_claimed_at IS NULL
+             FOR UPDATE",
+        )
+        .bind(order_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if finalizable.is_none() {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let rows: Vec<ActualLegRow> = sqlx::query_as(
+            "SELECT side, platform, token_id, actual_shares, actual_price, actual_fee
+             FROM legs
+             WHERE order_id = $1
+               AND status IN ('matched','completed','cancelled','failed')",
+        )
+        .bind(order_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let rows: Vec<_> = rows
+            .into_iter()
+            .map(|(side, platform, token_id, shares, price, fee)| {
+                (
+                    side,
+                    platform,
+                    token_id,
+                    shares.unwrap_or(Decimal::ZERO),
+                    price.unwrap_or(Decimal::ZERO),
+                    fee.unwrap_or(Decimal::ZERO),
+                )
+            })
+            .collect();
+        let (cost, rev, profit) = compute_settled_actuals(&rows, payouts)?;
+        let updated: Option<i64> = sqlx::query_scalar(
+            "UPDATE arb_orders
+             SET actual_cost = $2, actual_rev = $3, actual_profit = $4,
+                 position_status = 'settled', lifecycle_action = NULL,
+                 lifecycle_claim_id = NULL, lifecycle_claimed_at = NULL,
+                 settlement_source = $5, settlement_result = $6, settled_at = NOW(),
+                 updated_at = NOW()
+             WHERE id = $1 AND settled_at IS NULL
+               AND lifecycle_action IS NULL
+               AND lifecycle_claim_id IS NULL
+               AND lifecycle_claimed_at IS NULL
+             RETURNING id",
+        )
+        .bind(order_id)
+        .bind(cost)
+        .bind(rev)
+        .bind(profit)
+        .bind(source)
+        .bind(result)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if updated.is_none() {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        tx.commit().await?;
+        Ok(Some((cost, rev, profit)))
+    }
+
     pub async fn mark_position_closed(&self, order_id: i64) -> Result<bool> {
         let result = sqlx::query(
             "UPDATE arb_orders
@@ -873,14 +958,7 @@ impl Store {
         &self,
         order_id: i64,
     ) -> Result<(Decimal, Decimal, Decimal)> {
-        let rows: Vec<(
-            String,
-            String,
-            String,
-            Option<Decimal>,
-            Option<Decimal>,
-            Option<Decimal>,
-        )> = sqlx::query_as(
+        let rows: Vec<ActualLegRow> = sqlx::query_as(
             "SELECT side, platform, label, actual_shares, actual_price, actual_fee
                  FROM legs
                  WHERE order_id = $1 AND status IN ('matched','completed')",
@@ -914,6 +992,48 @@ fn validate_lifecycle_action(action: &str) -> Result<()> {
             "invalid lifecycle action: {action}"
         ))),
     }
+}
+
+fn compute_settled_actuals(
+    rows: &[(String, String, String, Decimal, Decimal, Decimal)],
+    payouts: &std::collections::HashMap<(String, String), Decimal>,
+) -> Result<(Decimal, Decimal, Decimal)> {
+    use std::collections::BTreeMap;
+
+    let mut cost = Decimal::ZERO;
+    let mut rev = Decimal::ZERO;
+    let mut positions = BTreeMap::new();
+    for (side, platform, token_id, shares, price, fee) in rows {
+        let position = positions
+            .entry((platform.clone(), token_id.clone()))
+            .or_insert(Decimal::ZERO);
+        if side.eq_ignore_ascii_case("SELL") {
+            rev += *shares * *price - *fee;
+            *position -= *shares;
+        } else {
+            cost += *shares * *price + *fee;
+            *position += *shares;
+        }
+    }
+    for ((platform, token_id), shares) in positions {
+        if shares < Decimal::ZERO {
+            return Err(Error::msg(format!(
+                "negative settled position for {platform}:{token_id}: {shares}"
+            )));
+        }
+        if shares.is_zero() {
+            continue;
+        }
+        let payout = payouts
+            .get(&(platform.clone(), token_id.clone()))
+            .ok_or_else(|| {
+                Error::msg(format!(
+                    "missing settlement payout for {platform}:{token_id}"
+                ))
+            })?;
+        rev += shares * *payout;
+    }
+    Ok((cost, rev, rev - cost))
 }
 
 pub fn compute_actuals(
@@ -991,6 +1111,66 @@ mod tests {
     fn lifecycle_action_rejects_unknown_actions() {
         assert!(validate_lifecycle_action("settlement").is_err());
         assert!(validate_lifecycle_action("").is_err());
+    }
+
+    #[test]
+    fn settled_actuals_use_remaining_token_payouts_without_locked_double_count() {
+        let rows = vec![
+            (
+                "BUY".into(),
+                POLYMARKET.into(),
+                "pm-yes".into(),
+                d("10"),
+                d("0.4"),
+                d("0"),
+            ),
+            (
+                "BUY".into(),
+                OUTCOME.into(),
+                "#5161".into(),
+                d("8"),
+                d("0.5"),
+                d("0"),
+            ),
+            (
+                "SELL".into(),
+                POLYMARKET.into(),
+                "pm-yes".into(),
+                d("2"),
+                d("0.6"),
+                d("0"),
+            ),
+        ];
+        let payouts = std::collections::HashMap::from([
+            ((POLYMARKET.into(), "pm-yes".into()), Decimal::ONE),
+            ((OUTCOME.into(), "#5161".into()), Decimal::ONE),
+        ]);
+        let (cost, rev, profit) = compute_settled_actuals(&rows, &payouts).unwrap();
+        assert_eq!(cost, d("8"));
+        assert_eq!(rev, d("17.2"));
+        assert_eq!(profit, d("9.2"));
+    }
+
+    #[test]
+    fn settled_actuals_reject_missing_payout_and_negative_position() {
+        let buy = vec![(
+            "BUY".into(),
+            OUTCOME.into(),
+            "#5160".into(),
+            d("1"),
+            d("0.4"),
+            d("0"),
+        )];
+        assert!(compute_settled_actuals(&buy, &std::collections::HashMap::new()).is_err());
+        let sell = vec![(
+            "SELL".into(),
+            OUTCOME.into(),
+            "#5160".into(),
+            d("1"),
+            d("0.4"),
+            d("0"),
+        )];
+        assert!(compute_settled_actuals(&sell, &std::collections::HashMap::new()).is_err());
     }
 
     #[test]

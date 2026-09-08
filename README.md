@@ -26,7 +26,11 @@ cp polymarket_funders.json.example polymarket_funders.json
 cargo run --release
 ```
 
-`ENABLE_BUY=false` 时只计算、不下新套利单，也不提交自动对冲。配置项见 `.env.example`。
+`ENABLE_TRADING=false` 时服务仍扫描并计算套利、止盈和再平衡，但禁止提交任何自动 BUY/SELL，也不会为这些动作创建新订单腿。该总闸不影响成交回填、结算处理，也不限制显式人工入口 `place-test --confirm`。升级时必须将旧 `ENABLE_BUY` 改为 `ENABLE_TRADING`；缺少新变量会安全地保持停单。配置项见 `.env.example`。
+
+## 市场与结算口径
+
+common 数据库提供给本服务的统一事件视为已经完成业务筛选的二元市场，跨平台互补份额按每对固定兑付 $1 计算。Outcome `settledOutcome.settleFraction` 仅用于判断二元胜负：大于其补数 `1-fraction` 时 side 0 胜，小于时 side 1 胜；非 0/1 的值同样按此大小关系归一化为 0/1。两者相等（通常为 `0.5`）是约定的特殊情况，side 0 与 side 1 **均按胜出、每股兑付 1** 处理。此规则是本项目业务口径，不采用 HIP-4 原始分数兑付。缺字段或不可解析值不会落为已结算。
 
 ## 本地下单测试
 

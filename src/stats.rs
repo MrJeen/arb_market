@@ -75,7 +75,7 @@ minute_stats! {
     stale_unknown,
     max_orders,
     max_loss,
-    buy_disabled,
+    trading_disabled,
     pm_bal,
     out_bal,
     http_fail,

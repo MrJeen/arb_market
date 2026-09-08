@@ -105,26 +105,24 @@ pub fn parse_outcome_settlement(outcome_id: u64, value: &Value) -> Result<Outcom
         .or_else(|| value.get("settle_fraction"))
         .and_then(parse_decimal)
         .ok_or_else(|| Error::msg("outcome settled response missing settleFraction"))?;
-    let complement = Decimal::ONE - fraction;
-    // 项目只按二元胜负归一化；相等时按 Outcome 约定选择 side 0。
-    let side0_wins = fraction >= complement;
+    let complement = Decimal::ONE
+        .checked_sub(fraction)
+        .ok_or_else(|| Error::msg("outcome settleFraction is outside decimal range"))?;
+    // common 只向本服务提供二元事件。上游分数按两侧大小归一化；平局按双方胜出。
+    let (side0_payout, side1_payout) = match fraction.cmp(&complement) {
+        std::cmp::Ordering::Greater => (Decimal::ONE, Decimal::ZERO),
+        std::cmp::Ordering::Less => (Decimal::ZERO, Decimal::ONE),
+        std::cmp::Ordering::Equal => (Decimal::ONE, Decimal::ONE),
+    };
     Ok(OutcomeSettlement::Settled {
         payouts: vec![
             SettlementPayout {
                 token_id: crate::domain::side_coin(outcome_id, 0),
-                payout: if side0_wins {
-                    Decimal::ONE
-                } else {
-                    Decimal::ZERO
-                },
+                payout: side0_payout,
             },
             SettlementPayout {
                 token_id: crate::domain::side_coin(outcome_id, 1),
-                payout: if side0_wins {
-                    Decimal::ZERO
-                } else {
-                    Decimal::ONE
-                },
+                payout: side1_payout,
             },
         ],
     })
@@ -231,11 +229,12 @@ mod tests {
     }
 
     #[test]
-    fn outcome_binary_fractions_produce_binary_payouts() {
+    fn outcome_fractions_are_normalized_to_binary_payouts() {
         for (fraction, first, second) in [
             ("0", Decimal::ZERO, Decimal::ONE),
             ("1", Decimal::ONE, Decimal::ZERO),
             ("0.25", Decimal::ZERO, Decimal::ONE),
+            ("0.75", Decimal::ONE, Decimal::ZERO),
             ("1.1", Decimal::ONE, Decimal::ZERO),
             ("-0.1", Decimal::ZERO, Decimal::ONE),
         ] {
@@ -258,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn outcome_tie_selects_side_zero_and_rejects_malformed_settlement() {
+    fn outcome_tie_selects_both_sides_and_rejects_malformed_settlement() {
         assert_eq!(
             parse_outcome_settlement(95, &json!({"settleFraction": "0.5"})).unwrap(),
             OutcomeSettlement::Settled {
@@ -269,7 +268,7 @@ mod tests {
                     },
                     SettlementPayout {
                         token_id: "#951".into(),
-                        payout: Decimal::ZERO
+                        payout: Decimal::ONE
                     },
                 ]
             }

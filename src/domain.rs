@@ -266,6 +266,9 @@ pub fn validate_outcome_option(option: &PlatformOption) -> Result<()> {
     if option.outcomes.len() != 2 {
         return Err(Error::msg("outcome market must have exactly two sides"));
     }
+    let mut side_indices = HashSet::new();
+    let mut token_ids = HashSet::new();
+    let mut labels = HashSet::new();
     for spec in &option.outcomes {
         let side_index = spec
             .side_index
@@ -273,6 +276,16 @@ pub fn validate_outcome_option(option: &PlatformOption) -> Result<()> {
             .ok_or_else(|| Error::msg("missing outcome sideIndex"))?;
         if side_index > 1 {
             return Err(Error::msg("outcome sideIndex must be 0 or 1"));
+        }
+        if !side_indices.insert(side_index) {
+            return Err(Error::msg("outcome sideIndex must uniquely cover 0 and 1"));
+        }
+        if !token_ids.insert(spec.token_id.as_str()) {
+            return Err(Error::msg("outcome tokenId must be unique"));
+        }
+        let label = spec.label.trim().to_ascii_lowercase();
+        if label.is_empty() || !labels.insert(label) {
+            return Err(Error::msg("outcome labels must be nonempty and unique"));
         }
         let expected_coin = side_coin(outcome_id, side_index);
         if spec.token_id != expected_coin {
@@ -289,6 +302,9 @@ pub fn validate_outcome_option(option: &PlatformOption) -> Result<()> {
                 )));
             }
         }
+    }
+    if side_indices != HashSet::from([0, 1]) {
+        return Err(Error::msg("outcome sides must exactly cover 0 and 1"));
     }
     Ok(())
 }
@@ -502,6 +518,38 @@ mod tests {
     fn market_identity_rejects_empty_values() {
         assert!(MarketIdentity::new(" ", "market").is_err());
         assert!(MarketIdentity::new("outcome", " ").is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_outcome_side_or_label() {
+        let option = |outcomes| PlatformOption {
+            title: String::new(),
+            platform: OUTCOME.into(),
+            option_id: "516".into(),
+            condition_id: None,
+            outcomes,
+            fees_enabled: None,
+            fee_schedule: None,
+            neg_risk: None,
+        };
+        let spec = |token_id: &str, label: &str, side_index| OutcomeSpec {
+            token_id: token_id.into(),
+            label: label.into(),
+            index_set: None,
+            asset_id: None,
+            side_index: Some(side_index),
+            neg_risk: None,
+        };
+        assert!(validate_outcome_option(&option(vec![
+            spec("#5160", "yes", 0),
+            spec("#5160", "no", 0),
+        ]))
+        .is_err());
+        assert!(validate_outcome_option(&option(vec![
+            spec("#5160", "yes", 0),
+            spec("#5161", "YES", 1),
+        ]))
+        .is_err());
     }
 
     #[test]
