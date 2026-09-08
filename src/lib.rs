@@ -39,7 +39,8 @@ pub async fn run() -> anyhow::Result<()> {
     let store = Store::connect(&cfg.app_postgres_uri).await?;
     store.migrate().await?;
     let common = connect_common(&cfg.common_postgres_uri).await?;
-    let pm = PolymarketVenue::connect(&cfg).await?;
+    let stats = Arc::new(MinuteStats::new());
+    let pm = PolymarketVenue::connect(&cfg, stats.clone()).await?;
     let outcome = OutcomeVenue::connect(&cfg)?;
     let books = Arc::new(Mutex::new(BookStore::default()));
     let dirty = Arc::new(Mutex::new(DirtyCoalescer::default()));
@@ -63,7 +64,7 @@ pub async fn run() -> anyhow::Result<()> {
         pm_sub_tx,
         out_sub_tx,
         notify,
-        stats: Arc::new(MinuteStats::new()),
+        stats,
         position_scan_cursor: Mutex::new(0),
     });
     engine.refresh_discovery().await?;

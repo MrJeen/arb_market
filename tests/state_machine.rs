@@ -172,6 +172,114 @@ async fn stale_token_cannot_release_or_insert_under_new_claim() {
 
 #[tokio::test]
 #[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn settlement_pending_is_durable_blocks_claim_and_can_finalize() {
+    let fixture = Fixture::new().await.expect(POSTGRES_REQUIRED);
+    let first_result = json!({"polymarket": "settled", "outcome": "unsettled"});
+    let second_result = json!({"polymarket": "settled", "outcome": "timeout"});
+    let exercised: Result<_> = async {
+        sqlx::query(
+            "INSERT INTO legs
+             (order_id, platform, token_id, label, side, intent, status,
+              actual_shares, actual_price, actual_fee)
+             VALUES
+             ($1, 'polymarket', 'pm-yes', 'yes', 'BUY', 'arb_buy', 'matched', 10, 0.4, 0),
+             ($1, 'outcome', '#5161', 'no', 'BUY', 'arb_buy', 'matched', 10, 0.55, 0)",
+        )
+        .bind(fixture.order_id)
+        .execute(&fixture.store.pool)
+        .await?;
+        let first = fixture
+            .store
+            .mark_settlement_pending(fixture.order_id, "polymarket", &first_result)
+            .await?;
+        let second = fixture
+            .store
+            .mark_settlement_pending(fixture.order_id, "polymarket", &second_result)
+            .await?;
+        let claim = fixture
+            .store
+            .try_claim_lifecycle(fixture.order_id, "rebalance")
+            .await?;
+        let scanned = fixture.store.completed_unbalanced_orders(0, 20).await?;
+        let before: (
+            String,
+            Option<Decimal>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<Value>,
+        ) = sqlx::query_as(
+            "SELECT position_status, NULLIF(actual_rev, 0), settled_at, settlement_pending_result
+             FROM arb_orders WHERE id = $1",
+        )
+        .bind(fixture.order_id)
+        .fetch_one(&fixture.store.pool)
+        .await?;
+        let payouts = std::collections::HashMap::from([
+            (
+                ("polymarket".to_string(), "pm-yes".to_string()),
+                Decimal::ONE,
+            ),
+            (
+                ("outcome".to_string(), "#5161".to_string()),
+                Decimal::new(5, 1),
+            ),
+        ]);
+        let finalized = fixture
+            .store
+            .finalize_position_settlement(
+                fixture.order_id,
+                "polymarket+outcome",
+                &json!({"both": "settled"}),
+                &payouts,
+            )
+            .await?;
+        let after: (String, Option<chrono::DateTime<chrono::Utc>>, Option<Value>) = sqlx::query_as(
+            "SELECT position_status, settlement_pending_since, settlement_pending_result
+             FROM arb_orders WHERE id = $1",
+        )
+        .bind(fixture.order_id)
+        .fetch_one(&fixture.store.pool)
+        .await?;
+        Ok((first, second, claim, scanned, before, finalized, after))
+    }
+    .await;
+    fixture.cleanup().await.expect("clean up test order");
+    let (first, second, claim, scanned, before, finalized, after) =
+        exercised.expect("settlement pending lifecycle");
+    let (first_since, entered) = first.expect("entered pending");
+    assert!(entered);
+    assert_eq!(second, Some((first_since, false)));
+    assert_eq!(claim, None);
+    assert!(
+        scanned
+            .iter()
+            .any(|order| order.id == fixture.order_id
+                && order.position_status == "settlement_pending")
+    );
+    assert_eq!(
+        before,
+        (
+            "settlement_pending".into(),
+            None,
+            None,
+            Some(first_result.clone())
+        )
+    );
+    assert_eq!(
+        finalized,
+        Some((
+            Decimal::new(95, 1),
+            Decimal::new(150, 1),
+            Decimal::new(55, 1)
+        ))
+    );
+    assert_eq!(
+        after,
+        ("settled".into(), Some(first_since), Some(first_result))
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
 async fn settlement_finalization_is_atomic_and_idempotent() {
     let fixture = Fixture::new().await.expect(POSTGRES_REQUIRED);
 

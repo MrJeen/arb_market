@@ -30,7 +30,9 @@ cargo run --release
 
 ## 市场与结算口径
 
-common 数据库提供给本服务的统一事件视为已经完成业务筛选的二元市场，跨平台互补份额按每对固定兑付 $1 计算。Outcome `settledOutcome.settleFraction` 仅用于判断二元胜负：大于其补数 `1-fraction` 时 side 0 胜，小于时 side 1 胜；非 0/1 的值同样按此大小关系归一化为 0/1。两者相等（通常为 `0.5`）是约定的特殊情况，side 0 与 side 1 **均按胜出、每股兑付 1** 处理。此规则是本项目业务口径，不采用 HIP-4 原始分数兑付。缺字段或不可解析值不会落为已结算。
+common 数据库提供给本服务的统一事件视为已经完成业务筛选的二元市场。Outcome 结算遵循 HIP-4 原始分数兑付：side 0 每股兑付 `settleFraction`，side 1 每股兑付 `1-settleFraction`，两侧合计为 1；`0.5` 时两侧各兑付 0.5。分数必须位于 `[0,1]`，缺字段、不可解析或越界值不会落为已结算。
+
+任一平台先确认结算时，订单进入 `settlement_pending`：该订单立即停止止盈、再平衡和所有新交易，只保留两平台结算查询。两平台 payout 都可信后才核算最终 `actual_cost`、`actual_rev`、`actual_profit` 并转为 `settled`；不会用单平台结果推算另一侧，也不会自动卖出另一平台持仓。
 
 ## 本地下单测试
 

@@ -9,6 +9,7 @@ use crate::error::{Error, Result};
 use crate::signing::polymarket::{
     clob_auth_headers, l2_hmac_signature, order_hash_hex, sign_order, SignedOrder,
 };
+use crate::stats::MinuteStats;
 use alloy_primitives::{Address, B256};
 use alloy_signer_local::PrivateKeySigner;
 use futures_util::{SinkExt, StreamExt};
@@ -26,6 +27,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 const FUNDER_CURSOR_FILE: &str = "polymarket_funder_cursor";
 const API_CREDS_FILE: &str = "polymarket_api_creds.json";
+const USDC_BALANCE_CACHE_TTL: Duration = Duration::from_secs(10);
 const FAK_UNFILLED: &str = "no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.";
 /// 每个账户在 `POLYMARKET_AUTH_TTL_SECS` 上叠加 10–30 分钟抖动，步长为整分钟。
 const AUTH_TTL_JITTER_MIN_MINS: u64 = 10;
@@ -70,10 +72,27 @@ pub struct PolymarketVenue {
     tick_cache: Arc<Mutex<HashMap<String, Decimal>>>,
     neg_risk_cache: Arc<Mutex<HashMap<String, bool>>>,
     rr: Arc<Mutex<usize>>,
+    usdc_balance_cache: Arc<Mutex<HashMap<String, FunderBalanceEntry>>>,
+    usdc_balance_refreshes: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    stats: Arc<MinuteStats>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct FunderBalanceEntry {
+    value: Option<(Decimal, Instant)>,
+    generation: u64,
+}
+
+impl FunderBalanceEntry {
+    fn get_fresh(self, now: Instant) -> Option<Decimal> {
+        self.value.and_then(|(balance, fetched_at)| {
+            (now.saturating_duration_since(fetched_at) < USDC_BALANCE_CACHE_TTL).then_some(balance)
+        })
+    }
 }
 
 impl PolymarketVenue {
-    pub async fn connect(cfg: &Config) -> Result<Self> {
+    pub async fn connect(cfg: &Config, stats: Arc<MinuteStats>) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()?;
@@ -92,6 +111,9 @@ impl PolymarketVenue {
             tick_cache: Arc::new(Mutex::new(HashMap::new())),
             neg_risk_cache: Arc::new(Mutex::new(HashMap::new())),
             rr: Arc::new(Mutex::new(rr)),
+            usdc_balance_cache: Arc::new(Mutex::new(HashMap::new())),
+            usdc_balance_refreshes: Arc::new(Mutex::new(HashMap::new())),
+            stats,
         };
         if let Some(first) = venue.funders.get(rr).cloned() {
             venue.ensure_account(&first.funder_address).await?;
@@ -253,6 +275,69 @@ impl PolymarketVenue {
     }
 
     pub async fn balance(&self, funder: &str) -> Result<Decimal> {
+        self.stats.pm_balance_call();
+        self.cached_usdc_balance(funder, || self.fetch_usdc_balance(funder))
+            .await
+    }
+
+    async fn cached_usdc_balance<F, Fut>(&self, funder: &str, mut fetch: F) -> Result<Decimal>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<Decimal>>,
+    {
+        let key = funder.to_ascii_lowercase();
+        if let Some(balance) = self
+            .usdc_balance_cache
+            .lock()
+            .await
+            .get(&key)
+            .copied()
+            .and_then(|entry| entry.get_fresh(Instant::now()))
+        {
+            self.stats.pm_balance_cache_hit();
+            return Ok(balance);
+        }
+        let refresh = {
+            let mut refreshes = self.usdc_balance_refreshes.lock().await;
+            refreshes
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _guard = refresh.lock().await;
+        loop {
+            let generation = {
+                let cache = self.usdc_balance_cache.lock().await;
+                if let Some(balance) = cache
+                    .get(&key)
+                    .copied()
+                    .and_then(|entry| entry.get_fresh(Instant::now()))
+                {
+                    self.stats.pm_balance_cache_hit();
+                    return Ok(balance);
+                }
+                cache.get(&key).map(|entry| entry.generation).unwrap_or(0)
+            };
+            self.stats.pm_balance_refresh();
+            let balance = match fetch().await {
+                Ok(balance) => balance,
+                Err(err) => {
+                    self.stats.pm_balance_refresh_fail();
+                    return Err(err);
+                }
+            };
+            let mut cache = self.usdc_balance_cache.lock().await;
+            let entry = cache.entry(key.clone()).or_default();
+            if entry.generation != generation {
+                continue;
+            }
+            entry.value = Some((balance, Instant::now()));
+            tracing::debug!(funder = %key, ttl_secs = USDC_BALANCE_CACHE_TTL.as_secs(), "polymarket usdc balance cached");
+            return Ok(balance);
+        }
+    }
+
+    async fn fetch_usdc_balance(&self, funder: &str) -> Result<Decimal> {
         let account = self.ensure_account(funder).await?;
         let value = self
             .l2_json(
@@ -276,6 +361,15 @@ impl PolymarketVenue {
             .unwrap_or_else(|| "0".into());
         let units: Decimal = raw.parse().unwrap_or(Decimal::ZERO);
         Ok(units / Decimal::from(1_000_000))
+    }
+
+    async fn invalidate_usdc_balance(&self, funder: &str) {
+        let key = funder.to_ascii_lowercase();
+        let mut cache = self.usdc_balance_cache.lock().await;
+        let entry = cache.entry(key.clone()).or_default();
+        entry.value = None;
+        entry.generation = entry.generation.wrapping_add(1);
+        tracing::debug!(funder = %key, "polymarket usdc balance cache invalidated");
     }
 
     pub async fn token_balance(&self, funder: &str, token_id: &str) -> Result<Decimal> {
@@ -494,7 +588,7 @@ impl PolymarketVenue {
         let account = self.ensure_account(funder).await?;
         let order_hash = prepared.order_hash.clone();
         let envelope = prepared.envelope.clone();
-        match self
+        let response = self
             .l2_json(
                 &account,
                 reqwest::Method::POST,
@@ -502,8 +596,10 @@ impl PolymarketVenue {
                 &[],
                 Some(&prepared.payload),
             )
-            .await
-        {
+            .await;
+        // 提交结果无论明确与否，都不能继续复用提交前余额。
+        self.invalidate_usdc_balance(funder).await;
+        match response {
             Ok(body) => {
                 let result = parse_submit(&body, order_hash, envelope);
                 Ok((result, body))
@@ -1373,6 +1469,145 @@ fn redact_http(text: &str) -> String {
 mod tests {
     use super::*;
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn cache_test_venue() -> PolymarketVenue {
+        PolymarketVenue {
+            http: reqwest::Client::new(),
+            base: "http://127.0.0.1".into(),
+            funders: Vec::new(),
+            authed: Arc::new(Mutex::new(HashMap::new())),
+            init_lock: Arc::new(Mutex::new(())),
+            cursor_path: PathBuf::new(),
+            creds_path: PathBuf::new(),
+            auth_ttl: Duration::from_secs(1),
+            tick_cache: Arc::new(Mutex::new(HashMap::new())),
+            neg_risk_cache: Arc::new(Mutex::new(HashMap::new())),
+            rr: Arc::new(Mutex::new(0)),
+            usdc_balance_cache: Arc::new(Mutex::new(HashMap::new())),
+            usdc_balance_refreshes: Arc::new(Mutex::new(HashMap::new())),
+            stats: Arc::new(MinuteStats::new()),
+        }
+    }
+
+    #[test]
+    fn funder_balance_cache_expires_after_ten_seconds() {
+        let now = Instant::now();
+        let fresh = FunderBalanceEntry {
+            value: Some((Decimal::ONE, now - Duration::from_secs(9))),
+            generation: 0,
+        };
+        let expired = FunderBalanceEntry {
+            value: Some((Decimal::ONE, now - Duration::from_secs(10))),
+            generation: 0,
+        };
+        assert_eq!(fresh.get_fresh(now), Some(Decimal::ONE));
+        assert_eq!(expired.get_fresh(now), None);
+    }
+
+    #[tokio::test]
+    async fn funder_balance_cache_reuses_and_normalizes_address() {
+        let venue = cache_test_venue();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetch = || {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Decimal::from(11))
+            }
+        };
+        assert_eq!(
+            venue.cached_usdc_balance("0xAbC", fetch).await.unwrap(),
+            Decimal::from(11)
+        );
+        assert_eq!(
+            venue.cached_usdc_balance("0xaBc", fetch).await.unwrap(),
+            Decimal::from(11)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        venue.invalidate_usdc_balance("0xABC").await;
+        assert_eq!(
+            venue.cached_usdc_balance("0xabc", fetch).await.unwrap(),
+            Decimal::from(11)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_funder_uses_single_refresh() {
+        let venue = cache_test_venue();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let futures = (0..8).map(|_| {
+            let venue = venue.clone();
+            let calls = calls.clone();
+            async move {
+                venue
+                    .cached_usdc_balance("0xabc", || async {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Ok(Decimal::from(13))
+                    })
+                    .await
+            }
+        });
+        let results = futures_util::future::join_all(futures).await;
+        assert!(results
+            .into_iter()
+            .all(|value| value.unwrap() == Decimal::from(13)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn different_funders_refresh_independently() {
+        let venue = cache_test_venue();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let fetch = |value| {
+            let active = active.clone();
+            let peak = peak.clone();
+            async move {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(Decimal::from(value))
+            }
+        };
+        let (a, b) = tokio::join!(
+            venue.cached_usdc_balance("0xa", || fetch(1)),
+            venue.cached_usdc_balance("0xb", || fetch(2))
+        );
+        assert_eq!(a.unwrap(), Decimal::ONE);
+        assert_eq!(b.unwrap(), Decimal::from(2));
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn funder_balance_failures_are_not_cached_and_invalidation_wins() {
+        let venue = cache_test_venue();
+        assert!(venue
+            .cached_usdc_balance("0xa", || async { Err(Error::msg("fail")) })
+            .await
+            .is_err());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let value = venue
+            .cached_usdc_balance("0xa", || {
+                let venue = venue.clone();
+                let calls = calls.clone();
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        venue.invalidate_usdc_balance("0xa").await;
+                        Ok(Decimal::from(20))
+                    } else {
+                        Ok(Decimal::from(15))
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(value, Decimal::from(15));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn order_submit_payload_matches_clob_v2_wire_types() {

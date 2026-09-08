@@ -105,15 +105,14 @@ pub fn parse_outcome_settlement(outcome_id: u64, value: &Value) -> Result<Outcom
         .or_else(|| value.get("settle_fraction"))
         .and_then(parse_decimal)
         .ok_or_else(|| Error::msg("outcome settled response missing settleFraction"))?;
+    if !(Decimal::ZERO..=Decimal::ONE).contains(&fraction) {
+        return Err(Error::msg("outcome settleFraction must be between 0 and 1"));
+    }
     let complement = Decimal::ONE
         .checked_sub(fraction)
         .ok_or_else(|| Error::msg("outcome settleFraction is outside decimal range"))?;
-    // common 只向本服务提供二元事件。上游分数按两侧大小归一化；平局按双方胜出。
-    let (side0_payout, side1_payout) = match fraction.cmp(&complement) {
-        std::cmp::Ordering::Greater => (Decimal::ONE, Decimal::ZERO),
-        std::cmp::Ordering::Less => (Decimal::ZERO, Decimal::ONE),
-        std::cmp::Ordering::Equal => (Decimal::ONE, Decimal::ONE),
-    };
+    // HIP-4 按原始分数兑付：side 0 得 fraction，side 1 得其补数。
+    let (side0_payout, side1_payout) = (fraction, complement);
     Ok(OutcomeSettlement::Settled {
         payouts: vec![
             SettlementPayout {
@@ -229,26 +228,25 @@ mod tests {
     }
 
     #[test]
-    fn outcome_fractions_are_normalized_to_binary_payouts() {
-        for (fraction, first, second) in [
-            ("0", Decimal::ZERO, Decimal::ONE),
-            ("1", Decimal::ONE, Decimal::ZERO),
-            ("0.25", Decimal::ZERO, Decimal::ONE),
-            ("0.75", Decimal::ONE, Decimal::ZERO),
-            ("1.1", Decimal::ONE, Decimal::ZERO),
-            ("-0.1", Decimal::ZERO, Decimal::ONE),
+    fn outcome_fractions_produce_protocol_payouts() {
+        for (value, first, second) in [
+            (json!("0"), "0", "1"),
+            (json!("0.25"), "0.25", "0.75"),
+            (json!(0.5), "0.5", "0.5"),
+            (json!("0.75"), "0.75", "0.25"),
+            (json!("1"), "1", "0"),
         ] {
             assert_eq!(
-                parse_outcome_settlement(95, &json!({"settleFraction": fraction})).unwrap(),
+                parse_outcome_settlement(95, &json!({"settleFraction": value})).unwrap(),
                 OutcomeSettlement::Settled {
                     payouts: vec![
                         SettlementPayout {
                             token_id: "#950".into(),
-                            payout: first
+                            payout: first.parse().unwrap()
                         },
                         SettlementPayout {
                             token_id: "#951".into(),
-                            payout: second
+                            payout: second.parse().unwrap()
                         },
                     ]
                 }
@@ -257,24 +255,13 @@ mod tests {
     }
 
     #[test]
-    fn outcome_tie_selects_both_sides_and_rejects_malformed_settlement() {
-        assert_eq!(
-            parse_outcome_settlement(95, &json!({"settleFraction": "0.5"})).unwrap(),
-            OutcomeSettlement::Settled {
-                payouts: vec![
-                    SettlementPayout {
-                        token_id: "#950".into(),
-                        payout: Decimal::ONE
-                    },
-                    SettlementPayout {
-                        token_id: "#951".into(),
-                        payout: Decimal::ONE
-                    },
-                ]
-            }
-        );
-
-        for malformed in [json!({}), json!({"settleFraction": "not-a-decimal"})] {
+    fn outcome_rejects_out_of_range_or_malformed_settlement() {
+        for malformed in [
+            json!({}),
+            json!({"settleFraction": "not-a-decimal"}),
+            json!({"settleFraction": "-0.1"}),
+            json!({"settleFraction": "1.1"}),
+        ] {
             assert!(parse_outcome_settlement(95, &malformed).is_err());
         }
     }

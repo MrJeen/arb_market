@@ -37,6 +37,9 @@ pub struct ArbOrderRow {
     pub settlement_source: Option<String>,
     pub settlement_result: Option<Value>,
     pub settled_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub settlement_pending_since: Option<chrono::DateTime<chrono::Utc>>,
+    pub settlement_pending_source: Option<String>,
+    pub settlement_pending_result: Option<Value>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -492,11 +495,12 @@ impl Store {
                 "SELECT id, title, event_id, unified_index, status, rebalance_status,
                         position_status, lifecycle_action,
                         lifecycle_claim_id, lifecycle_claimed_at, settlement_source,
-                        settlement_result, settled_at
+                        settlement_result, settled_at, settlement_pending_since,
+                        settlement_pending_source, settlement_pending_result
                  FROM arb_orders
                  WHERE status = 'completed'
                    AND rebalance_status IN ('pending','actived','completed')
-                   AND position_status = 'watching'
+                   AND position_status IN ('watching','settlement_pending')
                    AND settled_at IS NULL
                    AND id > $1
                  ORDER BY id
@@ -656,6 +660,44 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    /// Stops all lifecycle trading after the first venue confirms settlement.
+    /// Returns the durable first-seen timestamp and whether this call entered pending.
+    pub async fn mark_settlement_pending(
+        &self,
+        order_id: i64,
+        source: &str,
+        result: &Value,
+    ) -> Result<Option<(chrono::DateTime<chrono::Utc>, bool)>> {
+        let entered: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "UPDATE arb_orders
+             SET position_status = 'settlement_pending',
+                 settlement_pending_since = NOW(), settlement_pending_source = $2,
+                 settlement_pending_result = $3, updated_at = NOW()
+             WHERE id = $1 AND position_status = 'watching' AND settled_at IS NULL
+               AND lifecycle_action IS NULL
+               AND lifecycle_claim_id IS NULL
+               AND lifecycle_claimed_at IS NULL
+             RETURNING settlement_pending_since",
+        )
+        .bind(order_id)
+        .bind(source)
+        .bind(result)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(since) = entered {
+            return Ok(Some((since, true)));
+        }
+        let existing: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT settlement_pending_since FROM arb_orders
+             WHERE id = $1 AND position_status = 'settlement_pending' AND settled_at IS NULL",
+        )
+        .bind(order_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        Ok(existing.map(|since| (since, false)))
     }
 
     /// First settlement wins; retries do not overwrite the recorded evidence.
@@ -1149,6 +1191,41 @@ mod tests {
         assert_eq!(cost, d("8"));
         assert_eq!(rev, d("17.2"));
         assert_eq!(profit, d("9.2"));
+    }
+
+    #[test]
+    fn settled_actuals_use_fractional_outcome_payout_regardless_of_pm_winner() {
+        let rows = vec![
+            (
+                "BUY".into(),
+                POLYMARKET.into(),
+                "pm-yes".into(),
+                d("10"),
+                d("0.4"),
+                Decimal::ZERO,
+            ),
+            (
+                "BUY".into(),
+                OUTCOME.into(),
+                "#5161".into(),
+                d("10"),
+                d("0.55"),
+                Decimal::ZERO,
+            ),
+        ];
+        for (pm_payout, expected_rev, expected_profit) in [
+            (Decimal::ZERO, d("5"), d("-4.5")),
+            (Decimal::ONE, d("15"), d("5.5")),
+        ] {
+            let payouts = std::collections::HashMap::from([
+                ((POLYMARKET.into(), "pm-yes".into()), pm_payout),
+                ((OUTCOME.into(), "#5161".into()), d("0.5")),
+            ]);
+            assert_eq!(
+                compute_settled_actuals(&rows, &payouts).unwrap(),
+                (d("9.5"), expected_rev, expected_profit)
+            );
+        }
     }
 
     #[test]

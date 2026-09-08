@@ -1085,6 +1085,15 @@ impl Engine {
     }
 
     async fn hedge_order_once(&self, order: &ArbOrderRow) -> Result<()> {
+        if settlement_only_scan(&order.position_status) {
+            self.stats.settlement_pending_scan();
+            let identity = self.store.market_identities_for_order(order.id).await?;
+            identity.require(POLYMARKET)?;
+            identity.require(OUTCOME)?;
+            self.settlement_gate(order.id, &order.title, &identity)
+                .await?;
+            return Ok(());
+        }
         if self.finish_terminal_lifecycle_action(order).await? {
             return Ok(());
         }
@@ -1193,13 +1202,14 @@ impl Engine {
                         }
                         return Ok(());
                     }
-                    self.stats.take_profit_disabled();
+                    record_take_profit_not_submitted(&self.stats, true);
                     tracing::info!(
                         order_id = order.id,
                         "take profit calculated; submission disabled"
                     );
+                } else {
+                    record_take_profit_not_submitted(&self.stats, false);
                 }
-                self.stats.take_profit_cancelled();
             }
         }
 
@@ -1546,11 +1556,51 @@ impl Engine {
                     );
                 }
             } else {
-                tracing::warn!(
-                    order_id,
-                    source,
-                    "settlement detected; waiting for both venue payouts"
-                );
+                match self
+                    .store
+                    .mark_settlement_pending(order_id, source, &evidence)
+                    .await?
+                {
+                    Some((pending_since, true)) => {
+                        self.stats.settlement_pending_entered();
+                        tracing::warn!(
+                            order_id,
+                            source,
+                            pending_since = %pending_since,
+                            polymarket_error = ?pm.as_ref().err().map(ToString::to_string),
+                            outcome_error = ?outcome.as_ref().err().map(ToString::to_string),
+                            pm = pm.as_ref().ok().map(|status| status.kind()),
+                            outcome = outcome.as_ref().ok().map(|status| status.kind()),
+                            "settlement pending entered; all position trading stopped"
+                        );
+                    }
+                    Some((pending_since, false)) => {
+                        let pending_secs = chrono::Utc::now()
+                            .signed_duration_since(pending_since)
+                            .num_seconds()
+                            .max(0);
+                        tracing::warn!(
+                            order_id,
+                            source,
+                            pending_since = %pending_since,
+                            pending_secs,
+                            polymarket_error = ?pm.as_ref().err().map(ToString::to_string),
+                            outcome_error = ?outcome.as_ref().err().map(ToString::to_string),
+                            pm = pm.as_ref().ok().map(|status| status.kind()),
+                            outcome = outcome.as_ref().ok().map(|status| status.kind()),
+                            "settlement pending; waiting for both venue payouts"
+                        );
+                    }
+                    None => tracing::warn!(
+                        order_id,
+                        source,
+                        polymarket_error = ?pm.as_ref().err().map(ToString::to_string),
+                        outcome_error = ?outcome.as_ref().err().map(ToString::to_string),
+                        pm = pm.as_ref().ok().map(|status| status.kind()),
+                        outcome = outcome.as_ref().ok().map(|status| status.kind()),
+                        "settlement pending transition deferred by active claim"
+                    ),
+                }
             }
             return Ok(SettlementAccess::Stop);
         }
@@ -1562,7 +1612,7 @@ impl Engine {
                 outcome_error = ?outcome.as_ref().err().map(ToString::to_string),
                 pm = pm.as_ref().ok().map(|status| status.kind()),
                 outcome = outcome.as_ref().ok().map(|status| status.kind()),
-                "settlement status unavailable; allowing reduce-only SELL"
+                "settlement status unavailable; reduce-only access selected"
             );
         }
         Ok(access)
@@ -2210,6 +2260,18 @@ fn position_qty(positions: &crate::hedge::Positions, platform: &str, label: &str
             })
         })
         .unwrap_or(Decimal::ZERO)
+}
+
+fn settlement_only_scan(position_status: &str) -> bool {
+    position_status == "settlement_pending"
+}
+
+fn record_take_profit_not_submitted(stats: &MinuteStats, disabled: bool) {
+    if disabled {
+        stats.take_profit_disabled();
+    } else {
+        stats.take_profit_cancelled();
+    }
 }
 
 fn settlement_decision<E1, E2>(
@@ -2930,6 +2992,28 @@ mod tests {
         assert!(!submit_confirmed(&unknown));
         assert!(!submit_confirmed(&failed));
         assert!(!submit_confirmed(&Err(Error::msg("submit error"))));
+    }
+
+    #[test]
+    fn settlement_pending_uses_settlement_only_scan() {
+        assert!(settlement_only_scan("settlement_pending"));
+        for status in ["watching", "closed", "settled"] {
+            assert!(!settlement_only_scan(status));
+        }
+    }
+
+    #[test]
+    fn take_profit_disabled_and_cancelled_metrics_are_exclusive() {
+        let stats = MinuteStats::new();
+        record_take_profit_not_submitted(&stats, true);
+        let disabled = stats.snapshot_and_reset();
+        assert_eq!(disabled.take_profit_disabled, 1);
+        assert_eq!(disabled.take_profit_cancelled, 0);
+
+        record_take_profit_not_submitted(&stats, false);
+        let cancelled = stats.snapshot_and_reset();
+        assert_eq!(cancelled.take_profit_disabled, 0);
+        assert_eq!(cancelled.take_profit_cancelled, 1);
     }
 
     #[test]

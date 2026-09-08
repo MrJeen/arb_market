@@ -58,7 +58,13 @@ async fn main() -> anyhow::Result<()> {
     let need_pm = jobs.iter().any(|j| j.platform == POLYMARKET);
     let need_out = jobs.iter().any(|j| j.platform == OUTCOME);
     let pm = if need_pm {
-        Some(PolymarketVenue::connect(&cfg).await?)
+        Some(
+            PolymarketVenue::connect(
+                &cfg,
+                std::sync::Arc::new(market_arb::stats::MinuteStats::new()),
+            )
+            .await?,
+        )
     } else {
         None
     };
