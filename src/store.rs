@@ -484,8 +484,11 @@ impl Store {
         Ok(rows)
     }
 
-    pub async fn completed_unbalanced_orders(
+    /// 活跃持仓与 `settlement_pending` 使用各自的游标和节奏，因此按状态分别取批次，
+    /// 避免等待态订单占用活跃订单的扫描配额。
+    async fn scan_orders_by_position_status(
         &self,
+        position_status: &str,
         after_id: i64,
         limit: usize,
     ) -> Result<Vec<ArbOrderRow>> {
@@ -500,12 +503,13 @@ impl Store {
                  FROM arb_orders
                  WHERE status = 'completed'
                    AND rebalance_status IN ('pending','actived','completed')
-                   AND position_status IN ('watching','settlement_pending')
+                   AND position_status = $1
                    AND settled_at IS NULL
-                   AND id > $1
+                   AND id > $2
                  ORDER BY id
-                 LIMIT $2",
+                 LIMIT $3",
             )
+            .bind(position_status)
             .bind(after_id)
             .bind(limit)
         };
@@ -514,6 +518,24 @@ impl Store {
             rows = query(0).fetch_all(&self.pool).await?;
         }
         Ok(rows)
+    }
+
+    pub async fn completed_unbalanced_orders(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<ArbOrderRow>> {
+        self.scan_orders_by_position_status("watching", after_id, limit)
+            .await
+    }
+
+    pub async fn settlement_pending_orders(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<ArbOrderRow>> {
+        self.scan_orders_by_position_status("settlement_pending", after_id, limit)
+            .await
     }
 
     pub async fn order_topic_key(&self, order_id: i64) -> Result<TopicKey> {
@@ -698,6 +720,22 @@ impl Store {
         .await?
         .flatten();
         Ok(existing.map(|since| (since, false)))
+    }
+
+    /// 诊断用：返回 `position_status`、是否已结算、以及当前持有的 lifecycle 动作。
+    /// 行不存在时返回 `None`，用于区分"被并发终态化"和"行已被删除"。
+    pub async fn position_state(
+        &self,
+        order_id: i64,
+    ) -> Result<Option<(String, bool, Option<String>)>> {
+        let row: Option<(String, bool, Option<String>)> = sqlx::query_as(
+            "SELECT position_status, settled_at IS NOT NULL, lifecycle_action
+             FROM arb_orders WHERE id = $1",
+        )
+        .bind(order_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
     }
 
     /// First settlement wins; retries do not overwrite the recorded evidence.

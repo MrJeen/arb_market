@@ -37,6 +37,17 @@ impl OutcomeSettlement {
             Self::Unsettled => "unsettled",
         }
     }
+
+    /// HIP-4 分数兑付落在 `(0,1)` 时，跨平台互补一对不再兑付 $1，套利与对冲的估值前提失效。
+    /// 只用于观测：调用方据此告警，不改变入账口径。
+    pub fn is_fractional(&self) -> bool {
+        match self {
+            Self::Settled { payouts } => payouts
+                .iter()
+                .any(|payout| payout.payout != Decimal::ZERO && payout.payout != Decimal::ONE),
+            Self::Unsettled => false,
+        }
+    }
 }
 
 /// 单个平台 token 的每股结算金额。
@@ -252,6 +263,20 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn fractional_detection_only_fires_between_zero_and_one() {
+        for binary in [json!("0"), json!("1"), json!(0), json!(1)] {
+            let settled = parse_outcome_settlement(95, &json!({"settleFraction": binary})).unwrap();
+            assert!(!settled.is_fractional(), "{binary} must stay binary");
+        }
+        for fractional in [json!("0.25"), json!(0.5), json!("0.999")] {
+            let settled =
+                parse_outcome_settlement(95, &json!({"settleFraction": fractional})).unwrap();
+            assert!(settled.is_fractional(), "{fractional} must be flagged");
+        }
+        assert!(!OutcomeSettlement::Unsettled.is_fractional());
     }
 
     #[test]

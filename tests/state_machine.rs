@@ -4,15 +4,17 @@
 //! `APP_POSTGRES_URI`:
 //! `cargo test --test state_machine -- --ignored --nocapture`
 //!
-//! The tests run migrations, create orders with unique event UUIDs, and delete only the rows they
-//! created. They never truncate or otherwise reset the configured database.
+//! The tests run migrations and delete only their own orders. Migration tests use private schemas
+//! and drop only those schemas. They never truncate or otherwise reset the configured database.
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use market_arb::domain::{MarketIdentity, TopicKey};
-use market_arb::store::{NewLeg, Store};
+use market_arb::store::{ArbOrderRow, NewLeg, Store};
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
-use sqlx::Row;
+use sqlx::{migrate::Migrator, postgres::PgPoolOptions, PgPool, Row};
+use std::borrow::Cow;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 const POSTGRES_REQUIRED: &str = "requires APP_POSTGRES_URI; run manually against a test database";
@@ -31,14 +33,7 @@ impl Fixture {
         let store = Store::connect(&uri).await?;
         store.migrate().await?;
 
-        // A unique event_id isolates this row from application data and concurrently running tests.
-        let order_id = sqlx::query_scalar(
-            "INSERT INTO arb_orders (event_id, unified_index, status)\n             VALUES ($1, 0, 'completed')\n             RETURNING id",
-        )
-        .bind(Uuid::new_v4())
-        .fetch_one(&store.pool)
-        .await?;
-
+        let order_id = insert_completed_order(&store.pool).await?;
         Ok(Self { store, order_id })
     }
 
@@ -55,6 +50,276 @@ impl Fixture {
         tx.commit().await?;
         Ok(())
     }
+}
+
+async fn insert_completed_order(pool: &PgPool) -> Result<i64> {
+    // A unique event_id isolates this row from application data and concurrently running tests.
+    Ok(sqlx::query_scalar(
+        "INSERT INTO arb_orders (event_id, unified_index, status)
+         VALUES ($1, 0, 'completed') RETURNING id",
+    )
+    .bind(Uuid::new_v4())
+    .fetch_one(pool)
+    .await?)
+}
+
+async fn order_snapshot(pool: &PgPool, order_id: i64) -> Result<Value> {
+    Ok(
+        sqlx::query_scalar("SELECT to_jsonb(o) FROM arb_orders o WHERE id = $1")
+            .bind(order_id)
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+struct MigrationFixture {
+    store: Store,
+    admin: PgPool,
+    schema: String,
+}
+
+impl MigrationFixture {
+    async fn new() -> Result<Self> {
+        let uri = std::env::var("APP_POSTGRES_URI")
+            .expect("set APP_POSTGRES_URI before running ignored PostgreSQL tests");
+        assert!(!uri.trim().is_empty(), "APP_POSTGRES_URI must not be empty");
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&uri)
+            .await?;
+        // The identifier is generated here, never taken from configuration or database data.
+        let schema = format!("settlement_test_{}", Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin)
+            .await?;
+        let connection_schema = schema.clone();
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .after_connect(move |connection, _| {
+                let schema = connection_schema.clone();
+                Box::pin(async move {
+                    // Every connection isolates both application tables and _sqlx_migrations.
+                    sqlx::query("SELECT set_config('search_path', $1, false)")
+                        .bind(schema)
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&uri)
+            .await;
+        match pool {
+            Ok(pool) => Ok(Self {
+                store: Store { pool },
+                admin,
+                schema,
+            }),
+            Err(err) => {
+                if let Err(cleanup) = sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+                    .execute(&admin)
+                    .await
+                {
+                    eprintln!("migration schema cleanup failed: {cleanup}");
+                }
+                admin.close().await;
+                Err(err.into())
+            }
+        }
+    }
+
+    async fn cleanup(self) -> Result<()> {
+        self.store.pool.close().await;
+        let result = sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
+            .execute(&self.admin)
+            .await;
+        self.admin.close().await;
+        result?;
+        Ok(())
+    }
+}
+
+async fn position_status_width(pool: &PgPool) -> Result<i32> {
+    Ok(sqlx::query_scalar(
+        "SELECT character_maximum_length FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'arb_orders' AND column_name = 'position_status'",
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn fresh_migrations_support_settlement_pending() {
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let evidence = json!({"polymarket": "settled", "outcome": "unsettled"});
+    let exercised: Result<_> = async {
+        fixture.store.migrate().await?;
+        let width = position_status_width(&fixture.store.pool).await?;
+        let order_id = insert_completed_order(&fixture.store.pool).await?;
+        let before = order_snapshot(&fixture.store.pool, order_id).await?;
+        let entered = fixture
+            .store
+            .mark_settlement_pending(order_id, "polymarket", &evidence)
+            .await?;
+        let after = order_snapshot(&fixture.store.pool, order_id).await?;
+        fixture.store.migrate().await?;
+        let repeated = order_snapshot(&fixture.store.pool, order_id).await?;
+        Ok((width, before, entered, after, repeated))
+    }
+    .await;
+    fixture.cleanup().await.expect("clean up migration schema");
+    let (width, before, entered, after, repeated) = exercised.expect("fresh migration lifecycle");
+    assert_eq!(width, 32);
+    assert_eq!(before["position_status"], "watching");
+    assert!(entered.expect("pending transition").1);
+    assert_eq!(after["position_status"], "settlement_pending");
+    assert!(!after["settlement_pending_since"].is_null());
+    assert_eq!(after["settlement_pending_source"], "polymarket");
+    assert_eq!(after["settlement_pending_result"], evidence);
+    assert_eq!(repeated, after);
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn migration_0009_upgrades_0008_preserving_rows() {
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let all = sqlx::migrate!("./migrations");
+    let prefix = Migrator {
+        migrations: Cow::Owned(all.iter().filter(|m| m.version <= 8).cloned().collect()),
+        ..Migrator::DEFAULT
+    };
+    let evidence = json!({"polymarket": "settled", "outcome": "unsettled"});
+    let exercised: Result<_> = async {
+        prefix.run(&fixture.store.pool).await?;
+        let old_width = position_status_width(&fixture.store.pool).await?;
+        let order_id = insert_completed_order(&fixture.store.pool).await?;
+        let before = order_snapshot(&fixture.store.pool, order_id).await?;
+        let old_pending = fixture
+            .store
+            .mark_settlement_pending(order_id, "polymarket", &evidence)
+            .await;
+        ensure!(
+            matches!(&old_pending, Err(market_arb::error::Error::Sqlx(sqlx::Error::Database(err)))
+                if err.code().as_deref() == Some("22001")),
+            "0008 must reject the overlong pending status: {old_pending:?}"
+        );
+        ensure!(
+            order_snapshot(&fixture.store.pool, order_id).await? == before,
+            "failed pending transition must preserve the original order"
+        );
+        let old_migrations: Vec<(i64, Vec<u8>)> =
+            sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(&fixture.store.pool)
+                .await?;
+        fixture.store.migrate().await?;
+        let new_width = position_status_width(&fixture.store.pool).await?;
+        let upgraded = order_snapshot(&fixture.store.pool, order_id).await?;
+        let preserved: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT version, checksum FROM _sqlx_migrations WHERE version <= 8 ORDER BY version",
+        )
+        .fetch_all(&fixture.store.pool)
+        .await?;
+        let entered = fixture
+            .store
+            .mark_settlement_pending(order_id, "polymarket", &evidence)
+            .await?;
+        let after = order_snapshot(&fixture.store.pool, order_id).await?;
+        fixture.store.migrate().await?;
+        let repeated = order_snapshot(&fixture.store.pool, order_id).await?;
+        let rollback = prefix.run(&fixture.store.pool).await;
+        Ok((
+            old_width,
+            new_width,
+            before,
+            upgraded,
+            old_migrations,
+            preserved,
+            entered,
+            after,
+            repeated,
+            rollback,
+        ))
+    }
+    .await;
+    fixture.cleanup().await.expect("clean up migration schema");
+    let (
+        old_width,
+        new_width,
+        before,
+        upgraded,
+        old_migrations,
+        preserved,
+        entered,
+        after,
+        repeated,
+        rollback,
+    ) = exercised.expect("upgrade from original 0008");
+    assert_eq!(old_width, 16);
+    assert_eq!(new_width, 32);
+    assert_eq!(before["position_status"], "watching");
+    assert_eq!(upgraded, before);
+    assert_eq!(old_migrations.len(), 8);
+    assert_eq!(preserved, old_migrations);
+    assert!(entered.expect("pending transition after upgrade").1);
+    assert_eq!(after["position_status"], "settlement_pending");
+    assert_eq!(after["settlement_pending_result"], evidence);
+    assert_eq!(repeated, after);
+    assert!(matches!(
+        rollback,
+        Err(sqlx::migrate::MigrateError::VersionMissing(9))
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn watching_and_pending_scans_partition_the_position_set() {
+    // A private schema keeps the scan sets deterministic; the shared database holds live orders.
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let evidence = json!({"outcome": "settled", "polymarket": "unavailable"});
+    let exercised: Result<_> = async {
+        fixture.store.migrate().await?;
+        let watching = insert_completed_order(&fixture.store.pool).await?;
+        let pending = insert_completed_order(&fixture.store.pool).await?;
+        let entered = fixture
+            .store
+            .mark_settlement_pending(pending, "outcome", &evidence)
+            .await?;
+        ensure!(
+            entered.is_some_and(|(_, entered)| entered),
+            "second order must enter pending"
+        );
+        let watching_ids = scan_ids(fixture.store.completed_unbalanced_orders(0, 10).await?);
+        let pending_ids = scan_ids(fixture.store.settlement_pending_orders(0, 10).await?);
+        // 每个集合各自回绕：一侧的游标不会跳过或提前消耗另一侧的行。
+        let watching_wrapped = scan_ids(
+            fixture
+                .store
+                .completed_unbalanced_orders(watching, 10)
+                .await?,
+        );
+        let pending_wrapped = scan_ids(fixture.store.settlement_pending_orders(pending, 10).await?);
+        Ok((
+            watching,
+            pending,
+            watching_ids,
+            pending_ids,
+            watching_wrapped,
+            pending_wrapped,
+        ))
+    }
+    .await;
+    fixture.cleanup().await.expect("clean up migration schema");
+    let (watching, pending, watching_ids, pending_ids, watching_wrapped, pending_wrapped) =
+        exercised.expect("partition watching and pending scans");
+    assert_eq!(watching_ids, vec![watching]);
+    assert_eq!(pending_ids, vec![pending]);
+    assert_eq!(watching_wrapped, vec![watching]);
+    assert_eq!(pending_wrapped, vec![pending]);
+}
+
+fn scan_ids(rows: Vec<ArbOrderRow>) -> Vec<i64> {
+    rows.into_iter().map(|row| row.id).collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -200,7 +465,9 @@ async fn settlement_pending_is_durable_blocks_claim_and_can_finalize() {
             .store
             .try_claim_lifecycle(fixture.order_id, "rebalance")
             .await?;
-        let scanned = fixture.store.completed_unbalanced_orders(0, 20).await?;
+        // pending 订单只出现在结算清扫集合里，不再占用活跃订单的扫描配额。
+        let pending_scanned = fixture.store.settlement_pending_orders(0, 20).await?;
+        let watching_scanned = fixture.store.completed_unbalanced_orders(0, 20).await?;
         let before: (
             String,
             Option<Decimal>,
@@ -239,22 +506,34 @@ async fn settlement_pending_is_durable_blocks_claim_and_can_finalize() {
         .bind(fixture.order_id)
         .fetch_one(&fixture.store.pool)
         .await?;
-        Ok((first, second, claim, scanned, before, finalized, after))
+        Ok((
+            first,
+            second,
+            claim,
+            pending_scanned,
+            watching_scanned,
+            before,
+            finalized,
+            after,
+        ))
     }
     .await;
     fixture.cleanup().await.expect("clean up test order");
-    let (first, second, claim, scanned, before, finalized, after) =
+    let (first, second, claim, pending_scanned, watching_scanned, before, finalized, after) =
         exercised.expect("settlement pending lifecycle");
     let (first_since, entered) = first.expect("entered pending");
     assert!(entered);
     assert_eq!(second, Some((first_since, false)));
     assert_eq!(claim, None);
     assert!(
-        scanned
+        pending_scanned
             .iter()
             .any(|order| order.id == fixture.order_id
                 && order.position_status == "settlement_pending")
     );
+    assert!(!watching_scanned
+        .iter()
+        .any(|order| order.id == fixture.order_id));
     assert_eq!(
         before,
         (
@@ -364,6 +643,136 @@ async fn settlement_finalization_is_atomic_and_idempotent() {
         .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("settled_at")
         .unwrap()
         .is_some());
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn settlement_finalization_errors_preserve_state_and_can_retry() {
+    for pending in [false, true] {
+        for negative in [false, true] {
+            let fixture = Fixture::new().await.expect(POSTGRES_REQUIRED);
+            let pending_evidence = json!({"outcome": "settled", "polymarket": "unavailable"});
+            let final_evidence = json!({"both": "settled"});
+            let exercised: Result<_> = async {
+                sqlx::query(
+                    "INSERT INTO legs
+                     (order_id, platform, token_id, label, side, intent, status,
+                      actual_shares, actual_price, actual_fee)
+                     VALUES ($1, 'outcome', '#5160', 'yes', $2, 'arb_buy', 'matched', 1, 0.4, 0)",
+                )
+                .bind(fixture.order_id)
+                .bind(if negative { "SELL" } else { "BUY" })
+                .execute(&fixture.store.pool)
+                .await?;
+                if pending {
+                    let entered = fixture
+                        .store
+                        .mark_settlement_pending(fixture.order_id, "outcome", &pending_evidence)
+                        .await?;
+                    ensure!(
+                        entered.is_some_and(|(_, entered)| entered),
+                        "must enter pending"
+                    );
+                }
+                let before = order_snapshot(&fixture.store.pool, fixture.order_id).await?;
+                let payout_key = ("outcome".to_string(), "#5160".to_string());
+                let mut payouts = HashMap::new();
+                if negative {
+                    payouts.insert(payout_key.clone(), Decimal::new(5, 1));
+                }
+                let rejected = fixture
+                    .store
+                    .finalize_position_settlement(
+                        fixture.order_id,
+                        "polymarket+outcome",
+                        &final_evidence,
+                        &payouts,
+                    )
+                    .await;
+                let expected_error = if negative {
+                    "negative settled position for outcome:#5160"
+                } else {
+                    "missing settlement payout for outcome:#5160"
+                };
+                ensure!(
+                    matches!(&rejected, Err(err) if err.to_string().contains(expected_error)),
+                    "expected {expected_error}, got {rejected:?}"
+                );
+                let after_error = order_snapshot(&fixture.store.pool, fixture.order_id).await?;
+                ensure!(
+                    after_error == before,
+                    "rejected finalization must not update the order"
+                );
+
+                if negative {
+                    sqlx::query("UPDATE legs SET side = 'BUY' WHERE order_id = $1")
+                        .bind(fixture.order_id)
+                        .execute(&fixture.store.pool)
+                        .await?;
+                } else {
+                    payouts.insert(payout_key, Decimal::new(5, 1));
+                }
+                let finalized = fixture
+                    .store
+                    .finalize_position_settlement(
+                        fixture.order_id,
+                        "polymarket+outcome",
+                        &final_evidence,
+                        &payouts,
+                    )
+                    .await?;
+                let after = order_snapshot(&fixture.store.pool, fixture.order_id).await?;
+                let repeated = fixture
+                    .store
+                    .finalize_position_settlement(
+                        fixture.order_id,
+                        "polymarket+outcome",
+                        &json!({"retry": "must not replace evidence"}),
+                        &payouts,
+                    )
+                    .await?;
+                let after_repeat = order_snapshot(&fixture.store.pool, fixture.order_id).await?;
+                Ok((before, finalized, after, repeated, after_repeat))
+            }
+            .await;
+            fixture.cleanup().await.expect("clean up test order");
+            let (before, finalized, after, repeated, after_repeat) =
+                exercised.unwrap_or_else(|err| {
+                    panic!("finalization pending={pending} negative={negative}: {err:#}")
+                });
+            assert_eq!(
+                before["position_status"],
+                if pending {
+                    "settlement_pending"
+                } else {
+                    "watching"
+                }
+            );
+            assert_eq!(
+                finalized,
+                Some((Decimal::new(4, 1), Decimal::new(5, 1), Decimal::new(1, 1)))
+            );
+            assert_eq!(after["position_status"], "settled");
+            assert!(!after["settled_at"].is_null());
+            assert_eq!(after["settlement_source"], "polymarket+outcome");
+            assert_eq!(after["settlement_result"], final_evidence);
+            for field in [
+                "settlement_pending_since",
+                "settlement_pending_source",
+                "settlement_pending_result",
+            ] {
+                assert_eq!(
+                    after[field], before[field],
+                    "first pending evidence: {field}"
+                );
+            }
+            if pending {
+                assert_eq!(after["settlement_pending_result"], pending_evidence);
+            }
+            assert_eq!(repeated, None);
+            assert_eq!(after_repeat, after);
+        }
+    }
 }
 
 #[tokio::test]

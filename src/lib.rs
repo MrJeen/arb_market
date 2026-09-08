@@ -66,6 +66,8 @@ pub async fn run() -> anyhow::Result<()> {
         notify,
         stats,
         position_scan_cursor: Mutex::new(0),
+        settlement_scan_cursor: Mutex::new(0),
+        last_settlement_sweep: Mutex::new(None),
     });
     engine.refresh_discovery().await?;
 

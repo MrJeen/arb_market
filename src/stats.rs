@@ -106,6 +106,8 @@ minute_stats! {
     settlement_scan,
     settlement_pending_entered,
     settlement_pending_scan,
+    settlement_finalize_fail,
+    outcome_fractional_settlement,
     settled,
     unavailable,
     lifecycle_busy,
@@ -154,6 +156,7 @@ mod tests {
         stats.orders();
         stats.take_profit_candidate();
         stats.settled();
+        stats.settlement_finalize_fail();
         stats.lifecycle_busy();
 
         let first = stats.snapshot_and_reset();
@@ -162,6 +165,7 @@ mod tests {
         assert_eq!(first.orders, 1);
         assert_eq!(first.take_profit_candidate, 1);
         assert_eq!(first.settled, 1);
+        assert_eq!(first.settlement_finalize_fail, 1);
         assert_eq!(first.lifecycle_busy, 1);
         assert_eq!(first.calc, 0);
 

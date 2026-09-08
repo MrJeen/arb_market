@@ -28,6 +28,7 @@ use tokio_tungstenite::tungstenite::Message;
 const FUNDER_CURSOR_FILE: &str = "polymarket_funder_cursor";
 const API_CREDS_FILE: &str = "polymarket_api_creds.json";
 const USDC_BALANCE_CACHE_TTL: Duration = Duration::from_secs(10);
+const USDC_BALANCE_MAX_REFRESH_ATTEMPTS: usize = 3;
 const FAK_UNFILLED: &str = "no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.";
 /// 每个账户在 `POLYMARKET_AUTH_TTL_SECS` 上叠加 10–30 分钟抖动，步长为整分钟。
 const AUTH_TTL_JITTER_MIN_MINS: u64 = 10;
@@ -305,7 +306,9 @@ impl PolymarketVenue {
                 .clone()
         };
         let _guard = refresh.lock().await;
-        loop {
+        let started = Instant::now();
+        // 持续下单可能让每次刷新都失效；限制重试，但不能回退到已判旧的余额。
+        for _ in 0..USDC_BALANCE_MAX_REFRESH_ATTEMPTS {
             let generation = {
                 let cache = self.usdc_balance_cache.lock().await;
                 if let Some(balance) = cache
@@ -335,6 +338,19 @@ impl PolymarketVenue {
             tracing::debug!(funder = %key, ttl_secs = USDC_BALANCE_CACHE_TTL.as_secs(), "polymarket usdc balance cached");
             return Ok(balance);
         }
+        self.stats.pm_balance_refresh_fail();
+        tracing::error!(
+            service = "polymarket",
+            operation = "balance-allowance",
+            funder = %key,
+            attempts = USDC_BALANCE_MAX_REFRESH_ATTEMPTS,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            reason = "generation_conflict",
+            "polymarket usdc balance refresh exhausted"
+        );
+        Err(Error::msg(format!(
+            "polymarket usdc balance invalidated during all {USDC_BALANCE_MAX_REFRESH_ATTEMPTS} refresh attempts"
+        )))
     }
 
     async fn fetch_usdc_balance(&self, funder: &str) -> Result<Decimal> {
@@ -1585,10 +1601,21 @@ mod tests {
     #[tokio::test]
     async fn funder_balance_failures_are_not_cached_and_invalidation_wins() {
         let venue = cache_test_venue();
-        assert!(venue
-            .cached_usdc_balance("0xa", || async { Err(Error::msg("fail")) })
+        let failed_calls = AtomicUsize::new(0);
+        let error = venue
+            .cached_usdc_balance("0xa", || async {
+                failed_calls.fetch_add(1, Ordering::SeqCst);
+                Err(Error::msg("fail"))
+            })
             .await
-            .is_err());
+            .unwrap_err();
+        assert!(matches!(error, Error::Msg(message) if message == "fail"));
+        assert_eq!(failed_calls.load(Ordering::SeqCst), 1);
+        let failed = venue.stats.snapshot_and_reset();
+        assert_eq!(failed.pm_balance_refresh, 1);
+        assert_eq!(failed.pm_balance_refresh_fail, 1);
+        assert_eq!(failed.pm_balance_cache_hit, 0);
+        assert!(!venue.usdc_balance_cache.lock().await.contains_key("0xa"));
         let calls = Arc::new(AtomicUsize::new(0));
         let value = venue
             .cached_usdc_balance("0xa", || {
@@ -1607,6 +1634,95 @@ mod tests {
             .unwrap();
         assert_eq!(value, Decimal::from(15));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let recovered = venue.stats.snapshot_and_reset();
+        assert_eq!(recovered.pm_balance_refresh, 2);
+        assert_eq!(recovered.pm_balance_refresh_fail, 0);
+    }
+
+    #[tokio::test]
+    async fn funder_balance_generation_conflicts_exhaust_after_three_fetches() {
+        let venue = cache_test_venue();
+        let calls = AtomicUsize::new(0);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            venue.cached_usdc_balance("0xa", || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                venue.invalidate_usdc_balance("0xa").await;
+                tokio::task::yield_now().await;
+                Ok(Decimal::from(20))
+            }),
+        )
+        .await
+        .expect("generation conflicts must terminate without an unbounded retry");
+        let error = result.unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Msg(message)
+                if message == "polymarket usdc balance invalidated during all 3 refresh attempts"
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let stats = venue.stats.snapshot_and_reset();
+        assert_eq!(stats.pm_balance_refresh, 3);
+        assert_eq!(stats.pm_balance_refresh_fail, 1);
+        assert_eq!(stats.pm_balance_cache_hit, 0);
+        assert_eq!(stats.pm_balance_call, 0);
+        assert!(venue.usdc_balance_cache.lock().await["0xa"].value.is_none());
+        let refresh = venue.usdc_balance_refreshes.lock().await["0xa"].clone();
+        assert!(refresh.try_lock().is_ok());
+        let recovered = tokio::time::timeout(
+            Duration::from_secs(1),
+            venue.cached_usdc_balance("0xa", || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Decimal::from(15))
+            }),
+        )
+        .await
+        .expect("refresh lock must be released after exhausted attempts")
+        .unwrap();
+        assert_eq!(recovered, Decimal::from(15));
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn funder_balance_generation_conflicts_can_succeed_on_third_fetch() {
+        let venue = cache_test_venue();
+        let calls = AtomicUsize::new(0);
+        let value = tokio::time::timeout(
+            Duration::from_secs(1),
+            venue.cached_usdc_balance("0xa", || async {
+                let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                if attempt < 2 {
+                    venue.invalidate_usdc_balance("0xa").await;
+                    tokio::task::yield_now().await;
+                    Ok(Decimal::from(20))
+                } else {
+                    Ok(Decimal::from(15))
+                }
+            }),
+        )
+        .await
+        .expect("third fetch must complete")
+        .unwrap();
+        assert_eq!(value, Decimal::from(15));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let stats = venue.stats.snapshot_and_reset();
+        assert_eq!(stats.pm_balance_refresh, 3);
+        assert_eq!(stats.pm_balance_refresh_fail, 0);
+        assert_eq!(stats.pm_balance_cache_hit, 0);
+        assert_eq!(stats.pm_balance_call, 0);
+        let cached = venue
+            .cached_usdc_balance("0xa", || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Decimal::from(99))
+            })
+            .await
+            .unwrap();
+        assert_eq!(cached, Decimal::from(15));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let cached_stats = venue.stats.snapshot_and_reset();
+        assert_eq!(cached_stats.pm_balance_cache_hit, 1);
+        assert_eq!(cached_stats.pm_balance_refresh, 0);
+        assert_eq!(cached_stats.pm_balance_refresh_fail, 0);
     }
 
     #[test]

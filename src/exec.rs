@@ -46,6 +46,8 @@ pub struct Engine {
     pub notify: Option<NatsNotifier>,
     pub stats: Arc<MinuteStats>,
     pub position_scan_cursor: Mutex<i64>,
+    pub settlement_scan_cursor: Mutex<i64>,
+    pub last_settlement_sweep: Mutex<Option<Instant>>,
 }
 
 impl Engine {
@@ -1064,32 +1066,60 @@ impl Engine {
 
     pub async fn hedge_once(&self) -> Result<()> {
         let after_id = *self.position_scan_cursor.lock().await;
-        let orders = self
+        let watching = self
             .store
             .completed_unbalanced_orders(after_id, self.cfg.position_scan_batch)
             .await?;
-        if let Some(last) = orders.last() {
-            *self.position_scan_cursor.lock().await = last.id;
-        } else if after_id > 0 {
-            // The store already attempted a wraparound query; reset the persisted cursor state
-            // when the entire watching set is empty so later inserts start from the beginning.
-            *self.position_scan_cursor.lock().await = 0;
+        advance_scan_cursor(&self.position_scan_cursor, &watching, after_id).await;
+        let watching_batch = watching.len();
+        self.process_scan_batch(watching).await;
+        // 活跃批次已处理完才取 pending，避免 pending 查询失败时连带丢掉本轮的活跃订单。
+        let pending = self.due_settlement_pending_batch().await?;
+        if !pending.is_empty() {
+            tracing::info!(
+                watching_batch,
+                pending_batch = pending.len(),
+                interval_secs = self.cfg.settlement_pending_scan_interval.as_secs(),
+                "settlement pending sweep"
+            );
+            self.process_scan_batch(pending).await;
         }
+        Ok(())
+    }
+
+    async fn process_scan_batch(&self, orders: Vec<ArbOrderRow>) {
         for order in orders {
             if let Err(err) = self.hedge_order_once(&order).await {
                 self.stats.exec_err();
                 tracing::warn!(order_id = order.id, error = %err, "position order scan failed");
             }
         }
-        Ok(())
+    }
+
+    /// `settlement_pending` 只等对手方 payout，结算不会回退，因此按独立间隔清扫。
+    /// 未到期返回空集合，既不查库也不推进游标。
+    async fn due_settlement_pending_batch(&self) -> Result<Vec<ArbOrderRow>> {
+        let now = Instant::now();
+        let last_sweep = *self.last_settlement_sweep.lock().await;
+        if !settlement_sweep_due(last_sweep, now, self.cfg.settlement_pending_scan_interval) {
+            return Ok(Vec::new());
+        }
+        let after_id = *self.settlement_scan_cursor.lock().await;
+        let orders = self
+            .store
+            .settlement_pending_orders(after_id, self.cfg.settlement_pending_scan_batch)
+            .await?;
+        advance_scan_cursor(&self.settlement_scan_cursor, &orders, after_id).await;
+        *self.last_settlement_sweep.lock().await = Some(now);
+        Ok(orders)
     }
 
     async fn hedge_order_once(&self, order: &ArbOrderRow) -> Result<()> {
         if settlement_only_scan(&order.position_status) {
             self.stats.settlement_pending_scan();
-            let identity = self.store.market_identities_for_order(order.id).await?;
-            identity.require(POLYMARKET)?;
-            identity.require(OUTCOME)?;
+            let Some(identity) = self.settlement_identity_for_order(order).await? else {
+                return Ok(());
+            };
             self.settlement_gate(order.id, &order.title, &identity)
                 .await?;
             return Ok(());
@@ -1486,6 +1516,38 @@ impl Engine {
         Ok(identity)
     }
 
+    /// `settlement_pending` 只需要两平台的市场标识。按构造进入 pending 前必然已回填过，
+    /// 但 `order_market_identities` 一旦缺行（人工清理、部分回滚），必须能像活跃分支那样
+    /// 恢复历史 topic 并回填，否则该订单会每轮报错且永远无法推进。
+    /// 无法解析时 fail-closed：计入 `unavailable` 并返回 `None`，不阻断整轮扫描。
+    async fn settlement_identity_for_order(
+        &self,
+        order: &ArbOrderRow,
+    ) -> Result<Option<MarketIdentity>> {
+        let stored = self.store.market_identities_for_order(order.id).await?;
+        if stored.get(POLYMARKET).is_some() && stored.get(OUTCOME).is_some() {
+            return Ok(Some(stored));
+        }
+        let key = TopicKey::new(order.event_id, order.unified_index);
+        let topic = match self.topics.read().await.get(&key).cloned() {
+            Some(topic) => Some(topic),
+            None => self.restore_historical_topic(order.id, key).await?,
+        };
+        let Some(topic) = topic else {
+            self.stats.unavailable();
+            tracing::warn!(order_id = order.id, topic = %key.as_str(), "settlement pending topic unavailable; fail closed");
+            return Ok(None);
+        };
+        match self.market_identity_for_order(order.id, &topic).await {
+            Ok(identity) => Ok(Some(identity)),
+            Err(err) => {
+                self.stats.unavailable();
+                tracing::warn!(order_id = order.id, topic = %key.as_str(), error = %err, "settlement pending market identity unavailable; fail closed");
+                Ok(None)
+            }
+        }
+    }
+
     async fn settlement_gate(
         &self,
         order_id: i64,
@@ -1499,6 +1561,20 @@ impl Engine {
             self.pm.settlement(polymarket_market_id),
             self.outcome.settlement(outcome_market_id)
         );
+        // Polymarket 侧按 winner 构造，恒为 0/1；只有 Outcome 的 HIP-4 分数会打破 $1 假设。
+        // 计数口径是观测次数而非去重订单数：结算确认后本轮扫描只会走到这里一次，
+        // 但订单最终化前的后续轮次会重复计数。
+        if let Ok(status @ OutcomeSettlement::Settled { payouts }) = &outcome {
+            if status.is_fractional() {
+                self.stats.outcome_fractional_settlement();
+                tracing::warn!(
+                    order_id,
+                    outcome_market_id,
+                    payouts = ?payouts,
+                    "outcome settled with fractional payout; per-pair $1 valuation does not hold"
+                );
+            }
+        }
         let (access, settled_source) = settlement_decision(pm.as_ref(), outcome.as_ref());
         if let Some(source) = settled_source {
             let evidence = json!({
@@ -1506,7 +1582,7 @@ impl Engine {
                 "outcome": settlement_result_evidence(&outcome),
             });
             // One confirmed venue is enough to stop trading, but both payouts are required before
-            // terminal state and actuals are made durable. Until then the watching row is retried.
+            // terminal state and actuals are made durable. Until then the order is retried.
             if let (
                 Ok(SettlementStatus::Settled {
                     payouts: pm_payouts,
@@ -1529,7 +1605,8 @@ impl Engine {
                         payout.payout,
                     );
                 }
-                if let Some((_, _, actual_profit)) = self
+                let started = Instant::now();
+                let result = self
                     .store
                     .finalize_position_settlement(
                         order_id,
@@ -1537,9 +1614,15 @@ impl Engine {
                         &evidence,
                         &payouts,
                     )
-                    .await?
-                {
-                    self.stats.settled();
+                    .await;
+                if let Some((_, _, actual_profit)) = handle_settlement_finalization_result(
+                    result,
+                    &self.stats,
+                    order_id,
+                    polymarket_market_id,
+                    outcome_market_id,
+                    started.elapsed(),
+                )? {
                     if let Some(notify) = &self.notify {
                         notify.publish_settlement(SettlementNotice {
                             order_id,
@@ -1548,12 +1631,6 @@ impl Engine {
                             actual_profit: Some(actual_profit),
                         });
                     }
-                } else {
-                    tracing::warn!(
-                        order_id,
-                        source,
-                        "settlement confirmed but finalization deferred by active claim"
-                    );
                 }
             } else {
                 match self
@@ -1591,15 +1668,23 @@ impl Engine {
                             "settlement pending; waiting for both venue payouts"
                         );
                     }
-                    None => tracing::warn!(
-                        order_id,
-                        source,
-                        polymarket_error = ?pm.as_ref().err().map(ToString::to_string),
-                        outcome_error = ?outcome.as_ref().err().map(ToString::to_string),
-                        pm = pm.as_ref().ok().map(|status| status.kind()),
-                        outcome = outcome.as_ref().ok().map(|status| status.kind()),
-                        "settlement pending transition deferred by active claim"
-                    ),
+                    None => {
+                        // UPDATE 未命中且不在 pending：可能是活动 claim、被并发置为终态，
+                        // 也可能行已不存在。查一次真实状态，避免统一归因误导排查。
+                        let state = self.store.position_state(order_id).await?;
+                        tracing::warn!(
+                            order_id,
+                            source,
+                            current_status = ?state.as_ref().map(|(status, _, _)| status.as_str()),
+                            already_settled = ?state.as_ref().map(|(_, settled, _)| *settled),
+                            lifecycle_action = ?state.as_ref().and_then(|(_, _, action)| action.as_deref()),
+                            polymarket_error = ?pm.as_ref().err().map(ToString::to_string),
+                            outcome_error = ?outcome.as_ref().err().map(ToString::to_string),
+                            pm = pm.as_ref().ok().map(|status| status.kind()),
+                            outcome = outcome.as_ref().ok().map(|status| status.kind()),
+                            "settlement pending transition not applied; current order state is not eligible"
+                        );
+                    }
                 }
             }
             return Ok(SettlementAccess::Stop);
@@ -2266,12 +2351,64 @@ fn settlement_only_scan(position_status: &str) -> bool {
     position_status == "settlement_pending"
 }
 
+fn settlement_sweep_due(last_sweep: Option<Instant>, now: Instant, interval: Duration) -> bool {
+    match last_sweep {
+        // 首轮立即清扫，避免重启后 pending 订单要等满一个间隔才被看到。
+        None => true,
+        Some(last) => now.saturating_duration_since(last) >= interval,
+    }
+}
+
+/// 批次非空时游标推进到最后一行；整个扫描集合为空时归零，让后续新增订单从头被扫到。
+async fn advance_scan_cursor(cursor: &Mutex<i64>, rows: &[ArbOrderRow], after_id: i64) {
+    if let Some(last) = rows.last() {
+        *cursor.lock().await = last.id;
+    } else if after_id > 0 {
+        // The store already attempted a wraparound query; reset the persisted cursor state
+        // when the entire scan set is empty so later inserts start from the beginning.
+        *cursor.lock().await = 0;
+    }
+}
+
 fn record_take_profit_not_submitted(stats: &MinuteStats, disabled: bool) {
     if disabled {
         stats.take_profit_disabled();
     } else {
         stats.take_profit_cancelled();
     }
+}
+
+fn handle_settlement_finalization_result(
+    result: Result<Option<(Decimal, Decimal, Decimal)>>,
+    stats: &MinuteStats,
+    order_id: i64,
+    polymarket_market_id: &str,
+    outcome_market_id: &str,
+    elapsed: Duration,
+) -> Result<Option<(Decimal, Decimal, Decimal)>> {
+    match &result {
+        Ok(Some(_)) => stats.settled(),
+        Ok(None) => tracing::warn!(
+            order_id,
+            polymarket_market_id,
+            outcome_market_id,
+            "settlement finalization not applied; current order state is not finalizable"
+        ),
+        Err(err) => {
+            stats.settlement_finalize_fail();
+            tracing::error!(
+                service = "postgres",
+                operation = "finalize_position_settlement",
+                order_id,
+                polymarket_market_id,
+                outcome_market_id,
+                elapsed_ms = elapsed.as_millis() as u64,
+                error = %err,
+                "settlement finalization failed"
+            );
+        }
+    }
+    result
 }
 
 fn settlement_decision<E1, E2>(
@@ -3003,6 +3140,67 @@ mod tests {
     }
 
     #[test]
+    fn settlement_sweep_runs_first_then_only_after_the_full_interval() {
+        let interval = Duration::from_secs(60);
+        let start = Instant::now();
+        assert!(settlement_sweep_due(None, start, interval));
+        assert!(!settlement_sweep_due(Some(start), start, interval));
+        assert!(!settlement_sweep_due(
+            Some(start),
+            start + Duration::from_secs(59),
+            interval
+        ));
+        assert!(settlement_sweep_due(
+            Some(start),
+            start + interval,
+            interval
+        ));
+        // 时钟回拨不应把等待态订单变成每轮全速轮询。
+        assert!(!settlement_sweep_due(
+            Some(start + interval),
+            start,
+            interval
+        ));
+    }
+
+    #[tokio::test]
+    async fn scan_cursor_advances_to_last_row_and_resets_on_empty_set() {
+        let cursor = Mutex::new(0);
+        let rows = vec![scan_row(7), scan_row(19)];
+        advance_scan_cursor(&cursor, &rows, 0).await;
+        assert_eq!(*cursor.lock().await, 19);
+
+        // 空批次意味着 store 的回绕重查也没命中，游标必须归零。
+        advance_scan_cursor(&cursor, &[], 19).await;
+        assert_eq!(*cursor.lock().await, 0);
+
+        // 已经在起点时空批次不做无谓写入，也不会把游标推成负数。
+        advance_scan_cursor(&cursor, &[], 0).await;
+        assert_eq!(*cursor.lock().await, 0);
+    }
+
+    fn scan_row(id: i64) -> ArbOrderRow {
+        ArbOrderRow {
+            id,
+            title: "t".into(),
+            event_id: uuid::Uuid::nil(),
+            unified_index: 0,
+            status: "completed".into(),
+            rebalance_status: "completed".into(),
+            position_status: "watching".into(),
+            lifecycle_action: None,
+            lifecycle_claim_id: None,
+            lifecycle_claimed_at: None,
+            settlement_source: None,
+            settlement_result: None,
+            settled_at: None,
+            settlement_pending_since: None,
+            settlement_pending_source: None,
+            settlement_pending_result: None,
+        }
+    }
+
+    #[test]
     fn take_profit_disabled_and_cancelled_metrics_are_exclusive() {
         let stats = MinuteStats::new();
         record_take_profit_not_submitted(&stats, true);
@@ -3014,6 +3212,47 @@ mod tests {
         let cancelled = stats.snapshot_and_reset();
         assert_eq!(cancelled.take_profit_disabled, 0);
         assert_eq!(cancelled.take_profit_cancelled, 1);
+    }
+
+    #[test]
+    fn settlement_finalization_results_preserve_values_and_count_once() {
+        let stats = MinuteStats::new();
+        let actuals = (Decimal::new(95, 1), Decimal::from(10), Decimal::new(5, 1));
+        let observed = |result| {
+            handle_settlement_finalization_result(
+                result,
+                &stats,
+                42,
+                "pm-market",
+                "95",
+                Duration::from_millis(12),
+            )
+        };
+
+        assert_eq!(observed(Ok(Some(actuals))).unwrap(), Some(actuals));
+        let success = stats.snapshot_and_reset();
+        assert_eq!(success.settled, 1);
+        assert_eq!(success.settlement_finalize_fail, 0);
+        assert_eq!(success.exec_err, 0);
+
+        assert_eq!(observed(Ok(None)).unwrap(), None);
+        assert_eq!(stats.snapshot_and_reset(), Default::default());
+
+        let err = observed(Err(Error::Sqlx(sqlx::Error::PoolClosed))).unwrap_err();
+        assert!(matches!(err, Error::Sqlx(sqlx::Error::PoolClosed)));
+        let failure = stats.snapshot_and_reset();
+        assert_eq!(failure.settled, 0);
+        assert_eq!(failure.settlement_finalize_fail, 1);
+        assert_eq!(failure.exec_err, 0);
+
+        let err = observed(Err(Error::msg(
+            "missing settlement payout for outcome:#5160",
+        )))
+        .unwrap_err();
+        assert!(matches!(err, Error::Msg(ref message)
+            if message == "missing settlement payout for outcome:#5160"));
+        assert_eq!(stats.snapshot_and_reset().settlement_finalize_fail, 1);
+        assert_eq!(stats.snapshot_and_reset(), Default::default());
     }
 
     #[test]

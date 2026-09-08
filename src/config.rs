@@ -30,6 +30,9 @@ pub struct Config {
     pub book_resync: Duration,
     pub book_resync_batch: usize,
     pub position_scan_batch: usize,
+    /// `settlement_pending` 是等待态，用独立节奏和批量清扫，不占用活跃持仓的扫描配额。
+    pub settlement_pending_scan_interval: Duration,
+    pub settlement_pending_scan_batch: usize,
     pub arb_min_profit: Decimal,
     pub arb_min_apr: Decimal,
     pub arb_cost_limit: Decimal,
@@ -97,6 +100,12 @@ impl Config {
             book_resync: Duration::from_secs(env_u64("BOOK_RESYNC_SECS", 10)),
             book_resync_batch: env_u64("BOOK_RESYNC_BATCH", 80) as usize,
             position_scan_batch: env_u64("POSITION_SCAN_BATCH", 20).max(1) as usize,
+            settlement_pending_scan_interval: Duration::from_secs(env_u64(
+                "SETTLEMENT_PENDING_SCAN_INTERVAL_SECS",
+                60,
+            )),
+            settlement_pending_scan_batch: env_u64("SETTLEMENT_PENDING_SCAN_BATCH", 20).max(1)
+                as usize,
             arb_min_profit: env_decimal("ARB_MIN_PROFIT", "3")?,
             arb_min_apr: env_decimal("ARB_MIN_APR", "0")?,
             arb_cost_limit: env_decimal("ARB_COST_LIMIT", "100")?,

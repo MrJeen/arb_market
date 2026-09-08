@@ -28,11 +28,29 @@ cargo run --release
 
 自动交易由三个互相独立、默认关闭的执行开关控制：`ENABLE_ARB`（新套利）、`ENABLE_REBALANCE`（再平衡）、`ENABLE_TAKE_PROFIT`（止盈）。某项为 `false` 时仍扫描并计算对应机会，但不会 claim 生命周期动作、写入新订单/交易腿或提交真实交易；其他已开启流程不受影响。成交回填、结算处理也不受这些开关影响，显式人工入口 `place-test --confirm` 保持独立。旧 `ENABLE_TRADING`、`ENABLE_BUY`、`TAKE_PROFIT_ENABLED` 不再读取，升级时必须逐项配置。详见 `.env.example`。
 
+启动时会在业务初始化前自动执行嵌入二进制的数据库迁移，迁移失败不会进入业务流程。已应用的迁移文件不可原地修改；`0009_position_status_width.sql` 将 `position_status` 扩为 `VARCHAR(32)`，允许完整保存 `settlement_pending`。加宽 `varchar` 不重写表，但依赖该列的索引会重建、相关 CHECK 约束会重新校验，全程持 `ACCESS EXCLUSIVE` 锁，锁时长随 `arb_orders` 规模增长。部署时应为该锁预留窗口，并避免同时存在长事务。
+
+应用 0009 后，回退构建必须仍支持 pending 并嵌入相同内容的 0009；直接换回缺少该迁移的旧二进制会被 sqlx 版本校验拒绝。不要通过缩回列宽、删除迁移记录或绕过校验来回退。
+
 ## 市场与结算口径
 
 common 数据库提供给本服务的统一事件视为已经完成业务筛选的二元市场。Outcome 结算遵循 HIP-4 原始分数兑付：side 0 每股兑付 `settleFraction`，side 1 每股兑付 `1-settleFraction`，两侧合计为 1；`0.5` 时两侧各兑付 0.5。分数必须位于 `[0,1]`，缺字段、不可解析或越界值不会落为已结算。
 
 任一平台先确认结算时，订单进入 `settlement_pending`：该订单立即停止止盈、再平衡和所有新交易，只保留两平台结算查询。两平台 payout 都可信后才核算最终 `actual_cost`、`actual_rev`、`actual_profit` 并转为 `settled`；不会用单平台结果推算另一侧，也不会自动卖出另一平台持仓。
+
+`settlement_pending` 走独立的扫描游标和批量，默认每 `SETTLEMENT_PENDING_SCAN_INTERVAL_SECS`（60 秒）清扫一次、每次至多 `SETTLEMENT_PENDING_SCAN_BATCH` 条，不再占用 `POSITION_SCAN_BATCH` 给活跃订单的配额，因此 pending 积压不会拉长止盈响应。清扫在同一个循环内串行执行，同一订单不会被两条路径并发处理。pending 没有超时自动最终化，长期缺失对手方 payout 时会持续驻留并每轮重试。
+
+套利、补齐对冲和开放持仓账务中的每对 `$1` 估值，依赖跨平台事件定义与结算规则一致；“二元市场”本身不保证这一点。common 的配对规则及真实市场的分数、平局、取消／退款语义仍需独立核验。最终账务按各平台实际 payout 核算，不代表估值前提已被验证，也不消除跨平台判决分歧风险。
+
+Outcome 兑付落在 `(0,1)` 时会打 `warn` 并计入 `outcome_fractional_settlement`，用于发现上述估值前提失效。该指标按**观测次数**计数而非去重订单数：结算确认后当轮扫描只会计一次，但订单最终化前的后续清扫会重复计数。计数不改变入账口径，也不会拦截交易——分数结算仍按实际 payout 核算。Polymarket 侧按 winner 构造，恒为 0/1，不参与该判定。
+
+最终核算返回错误时，`settlement_finalize_fail` 记录该分类失败并输出订单、市场和错误上下文；上层仍计入 `exec_err`，两项不能相加作为失败总数。失败日志不保证事务一定未提交，重试仍依赖既有最终核算幂等性。
+
+## Polymarket 余额缓存
+
+USDC 余额按 funder 使用 10 秒缓存。TTL 从 fetch 完成写入本地缓存时计算，只限制本地复用时间，不保证服务端余额快照年龄或外部转账被发现的端到端时延。缓存不是资金预留，也不保证读余额到下单之间的原子性；本实例 `/order` 请求返回后会主动失效，外部或其他进程的余额变化不会主动触发该失效。
+
+刷新期间遇到下单失效，会丢弃对应 generation 的结果；每次缓存调用最多启动 3 次 fetch，持续冲突后返回错误，不退回已判旧的余额。这不是整条 HTTP、funder 选择流程的次数或总时限保证。`pm_balance_refresh` 按实际 fetch 尝试计数，`pm_balance_refresh_fail` 只在 fetch 返回错误或冲突耗尽时计一次，中间冲突及调用取消不计终止失败。
 
 ## 本地下单测试
 
