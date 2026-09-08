@@ -16,6 +16,15 @@ type ActualLegRow = (
     Option<Decimal>,
     Option<Decimal>,
 );
+type TerminalLegRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<Decimal>,
+    Option<Decimal>,
+    Option<Decimal>,
+);
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -112,7 +121,11 @@ impl Store {
         Ok(exists.is_some())
     }
 
-    pub async fn insert_order(
+    /// 父单、市场标识与初始交易腿必须一次落库并直接进入 `actived`。
+    /// 「`actived` 且没有任何腿」这个中间状态会被 `mark_orders_complete` 判为无成交并取消，
+    /// 此后父单永远回不到 `completed`，随后成交的真实持仓将脱离再平衡、止盈和结算管理。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_actived_order_with_legs(
         &self,
         key: TopicKey,
         market_identity: &MarketIdentity,
@@ -123,16 +136,20 @@ impl Store {
         profit: Decimal,
         cost: Decimal,
         fills: &Value,
-    ) -> Result<i64> {
+        legs: &[NewLeg<'_>],
+    ) -> Result<(i64, Vec<i64>)> {
         if market_identity.is_empty() {
             return Err(Error::msg("order market identity must not be empty"));
+        }
+        if legs.is_empty() {
+            return Err(Error::msg("actived order requires at least one leg"));
         }
         let mut tx = self.pool.begin().await?;
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO arb_orders (
                 event_id, unified_index, title, market_title, end_date, estimated_rev,
                 estimated_profit, estimated_cost, fills, status
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending')
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'actived')
              RETURNING id",
         )
         .bind(key.event_id)
@@ -157,8 +174,35 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         }
+        let mut leg_ids = Vec::with_capacity(legs.len());
+        for leg in legs {
+            let leg_id: i64 = sqlx::query_scalar(
+                "INSERT INTO legs (
+                    order_id, platform, token_id, label, side, intent,
+                    funder_address, wallet_address, service, req_price, req_shares, req_fee,
+                    client_order_id, status
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending')
+                 RETURNING id",
+            )
+            .bind(id)
+            .bind(leg.platform)
+            .bind(leg.token_id)
+            .bind(leg.label)
+            .bind(leg.side)
+            .bind(leg.intent)
+            .bind(leg.funder)
+            .bind(leg.wallet)
+            .bind(leg.service)
+            .bind(leg.req_price)
+            .bind(leg.req_shares)
+            .bind(leg.req_fee)
+            .bind(leg.client_order_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            leg_ids.push(leg_id);
+        }
         tx.commit().await?;
-        Ok(id)
+        Ok((id, leg_ids))
     }
 
     pub async fn market_identities_for_order(&self, order_id: i64) -> Result<MarketIdentity> {
@@ -233,48 +277,6 @@ impl Store {
         }
         tx.commit().await?;
         Ok(inserted)
-    }
-
-    pub async fn insert_leg(
-        &self,
-        order_id: i64,
-        platform: &str,
-        token_id: &str,
-        label: &str,
-        side: &str,
-        intent: &str,
-        funder: Option<&str>,
-        wallet: Option<&str>,
-        service: Option<&str>,
-        req_price: Decimal,
-        req_shares: Decimal,
-        req_fee: Decimal,
-        client_order_id: Option<&str>,
-    ) -> Result<i64> {
-        let id: i64 = sqlx::query_scalar(
-            "INSERT INTO legs (
-                order_id, platform, token_id, label, side, intent,
-                funder_address, wallet_address, service, req_price, req_shares, req_fee,
-                client_order_id, status
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending')
-             RETURNING id",
-        )
-        .bind(order_id)
-        .bind(platform)
-        .bind(token_id)
-        .bind(label)
-        .bind(side)
-        .bind(intent)
-        .bind(funder)
-        .bind(wallet)
-        .bind(service)
-        .bind(req_price)
-        .bind(req_shares)
-        .bind(req_fee)
-        .bind(client_order_id)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(id)
     }
 
     /// Inserts lifecycle legs only while the caller still owns the claim. The row lock keeps a
@@ -452,19 +454,6 @@ impl Store {
         .bind(shares)
         .bind(fee)
         .bind(info)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn mark_order_status(&self, order_id: i64, status: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE arb_orders SET status = $2, updated_at = NOW(),
-                    completed_at = CASE WHEN $2 = 'completed' THEN NOW() ELSE completed_at END
-             WHERE id = $1",
-        )
-        .bind(order_id)
-        .bind(status)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -841,19 +830,104 @@ impl Store {
         Ok(Some((cost, rev, profit)))
     }
 
-    pub async fn mark_position_closed(&self, order_id: i64) -> Result<bool> {
-        let result = sqlx::query(
-            "UPDATE arb_orders
-             SET position_status = 'closed', updated_at = NOW()
-             WHERE id = $1 AND settled_at IS NULL
+    /// 在同一事务里确认净仓位为零、刷新最终账务、完成再平衡并关闭持仓。
+    /// 父单行锁阻止新的 lifecycle claim；腿行锁避免回填在账务快照期间改写成交值。
+    pub async fn finalize_closed_position(
+        &self,
+        order_id: i64,
+    ) -> Result<Option<(Decimal, Decimal, Decimal)>> {
+        let mut tx = self.pool.begin().await?;
+        let eligible: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM arb_orders
+             WHERE id = $1 AND settled_at IS NULL AND position_status = 'watching'
                AND lifecycle_action IS NULL
                AND lifecycle_claim_id IS NULL
-               AND lifecycle_claimed_at IS NULL",
+               AND lifecycle_claimed_at IS NULL
+             FOR UPDATE",
         )
         .bind(order_id)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(result.rows_affected() == 1)
+        if eligible.is_none() {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+
+        let rows: Vec<TerminalLegRow> = sqlx::query_as(
+            "SELECT status, side, platform, label, actual_shares, actual_price, actual_fee
+                 FROM legs WHERE order_id = $1 FOR UPDATE",
+        )
+        .bind(order_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        if rows
+            .iter()
+            .any(|(status, ..)| matches!(status.as_str(), "pending" | "unknown" | "actived"))
+        {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let mut positions = Positions::new();
+        let mut actual_rows = Vec::new();
+        for (status, side, platform, label, shares, price, fee) in rows {
+            let shares = shares.unwrap_or(Decimal::ZERO);
+            if matches!(
+                status.as_str(),
+                "matched" | "completed" | "cancelled" | "failed"
+            ) {
+                let slot = positions
+                    .entry(platform.clone())
+                    .or_default()
+                    .entry(label.to_ascii_lowercase())
+                    .or_insert(Decimal::ZERO);
+                if side.eq_ignore_ascii_case("SELL") {
+                    *slot -= shares;
+                } else {
+                    *slot += shares;
+                }
+            }
+            if matches!(status.as_str(), "matched" | "completed") {
+                actual_rows.push((
+                    side,
+                    platform,
+                    label,
+                    shares,
+                    price.unwrap_or(Decimal::ZERO),
+                    fee.unwrap_or(Decimal::ZERO),
+                ));
+            }
+        }
+        if positions
+            .values()
+            .any(|labels| labels.values().any(|qty| !qty.is_zero()))
+        {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let (cost, rev, profit) = compute_actuals(&actual_rows);
+        let updated: Option<i64> = sqlx::query_scalar(
+            "UPDATE arb_orders
+             SET actual_cost = $2, actual_rev = $3, actual_profit = $4,
+                 rebalance_status = 'completed', rebalanced_at = COALESCE(rebalanced_at, NOW()),
+                 position_status = 'closed', updated_at = NOW()
+             WHERE id = $1 AND settled_at IS NULL AND position_status = 'watching'
+               AND lifecycle_action IS NULL
+               AND lifecycle_claim_id IS NULL
+               AND lifecycle_claimed_at IS NULL
+             RETURNING id",
+        )
+        .bind(order_id)
+        .bind(cost)
+        .bind(rev)
+        .bind(profit)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if updated.is_none() {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        tx.commit().await?;
+        Ok(Some((cost, rev, profit)))
     }
 
     pub async fn lifecycle_leg_counts(
@@ -929,24 +1003,23 @@ impl Store {
         Ok(result.rows_affected())
     }
 
-    pub async fn cancel_stale_unknown_without_fills(
-        &self,
-        timeout: Duration,
-    ) -> Result<Vec<ClosedLegRef>> {
+    /// 只读上报超时未定的 unknown 腿。**不得**把超时当成零成交证据：本地没有成交记录
+    /// 只说明回填还没成功，交易所可能已经成交。写入 cancelled + 零成交会让这条腿离开
+    /// `open_legs` 的回填集合，真实持仓再也追不回来。这些腿保持 `unknown`，
+    /// 由 `reconcile_leg` 按 third_order_id 或 client_order_id 继续比对远端成交，
+    /// 只能在拿到可信远端终态后才转终态。
+    pub async fn stale_unknown_legs(&self, timeout: Duration) -> Result<Vec<ClosedLegRef>> {
         let secs = timeout.as_secs() as i64;
         let rows = sqlx::query_as::<_, ClosedLegRef>(
-            "UPDATE legs SET status = 'cancelled',
-                    actual_price = 0, actual_shares = 0, actual_fee = 0,
-                    last_order_info = COALESCE(last_order_info, '{}'::jsonb)
-                        || jsonb_build_object('reason','unknown_timeout_no_fill'),
-                    updated_at = NOW()
+            "SELECT id, order_id, platform
+             FROM legs
              WHERE status = 'unknown'
                AND updated_at < NOW() - make_interval(secs => $1)
                AND NOT EXISTS (
                  SELECT 1 FROM fills f
                  WHERE f.leg_id = legs.id AND COALESCE(f.shares, 0) > 0
                )
-             RETURNING id, order_id, platform",
+             ORDER BY id",
         )
         .bind(secs)
         .fetch_all(&self.pool)

@@ -405,11 +405,21 @@ pub fn classify_http_submit(
     cloid: &str,
 ) -> SubmitResult {
     if status >= 400 {
+        let message: String = body.to_string().chars().take(300).collect();
+        // 只有明确拒单才能记零成交；5xx / 408 / 425 / 429 未证明订单没执行，交给 unknown 继续核对。
+        if !crate::platforms::http_status_proves_reject(status) {
+            return SubmitResult::Unknown {
+                order_id: None,
+                order_hash: hash,
+                envelope,
+                message: format!("http {status} does not prove rejection: {message}"),
+            };
+        }
         return SubmitResult::Failed {
             order_hash: hash,
             envelope,
             status,
-            message: body.to_string().chars().take(300).collect(),
+            message,
         };
     }
     parse_exchange_submit(body, hash, envelope, cloid)
@@ -533,10 +543,7 @@ pub fn parse_user_fills(raw: &Value) -> Vec<TradeFill> {
                     .map(str::to_string),
                 shares: item.get("sz").and_then(parse_decimal)?,
                 price: item.get("px").and_then(parse_decimal)?,
-                fee: item
-                    .get("fee")
-                    .and_then(parse_decimal)
-                    .unwrap_or(Decimal::ZERO),
+                fee: item.get("fee").and_then(parse_decimal),
                 fee_rate_bps: None,
                 raw: item,
             })
@@ -896,6 +903,8 @@ mod tests {
         assert_eq!(fills.len(), 2);
         assert_eq!(fills[0].coin.as_deref(), Some("#5160"));
         assert!(fills[0].matches(Some("99"), Some("0xabc")));
+        assert_eq!(fills[0].fee, Some("0.01".parse().unwrap()));
+        assert_eq!(fills[1].fee, Some(Decimal::ZERO));
         assert!(!fills[1].matches(Some("99"), None));
     }
 
@@ -1000,15 +1009,21 @@ mod tests {
     }
 
     #[test]
-    fn http_400_and_500_are_failed() {
+    fn explicit_reject_is_failed_but_ambiguous_http_statuses_stay_unknown() {
         let body = json!({"error": "unauthorized"});
         match classify_http_submit(400, &body, "0x1".into(), json!({}), "cloid") {
             SubmitResult::Failed { status, .. } => assert_eq!(status, 400),
             other => panic!("expected Failed, got {other:?}"),
         }
-        match classify_http_submit(500, &body, "0x1".into(), json!({}), "cloid") {
-            SubmitResult::Failed { status, .. } => assert_eq!(status, 500),
-            other => panic!("expected Failed, got {other:?}"),
+        // 5xx / 408 / 425 / 429 未证明订单没被撮合，记零成交会漏记真实持仓。
+        for status in [408u16, 425, 429, 500, 502, 503, 504] {
+            match classify_http_submit(status, &body, "0x1".into(), json!({}), "cloid") {
+                SubmitResult::Unknown { message, .. } => assert!(
+                    message.contains(&status.to_string()),
+                    "status {status}: {message}"
+                ),
+                other => panic!("expected Unknown for {status}, got {other:?}"),
+            }
         }
     }
 

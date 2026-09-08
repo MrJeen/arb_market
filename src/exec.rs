@@ -48,6 +48,8 @@ pub struct Engine {
     pub position_scan_cursor: Mutex<i64>,
     pub settlement_scan_cursor: Mutex<i64>,
     pub last_settlement_sweep: Mutex<Option<Instant>>,
+    /// 已告警过的超时 unknown 腿；超时腿留在库里持续重试，告警只推一次。
+    pub reported_stale_unknown: Mutex<HashSet<i64>>,
 }
 
 impl Engine {
@@ -354,9 +356,42 @@ impl Engine {
             {"platform": POLYMARKET, "token": plan.pm.token_id, "label": plan.pm.label, "shares": plan.pm.shares, "price": plan.pm.cap_price},
             {"platform": OUTCOME, "token": plan.outcome.token_id, "label": plan.outcome.label, "shares": plan.outcome.shares, "price": plan.outcome.cap_price}
         ]);
-        let order_id = match self
+        let pm_token = topic.token(POLYMARKET, &plan.pm.label);
+        let out_token = topic.token(OUTCOME, &plan.outcome.label);
+        // 建档必须原子：`actived` 且没有腿的父单会被回填判为无成交并取消。
+        let initial_legs = [
+            NewLeg {
+                platform: POLYMARKET,
+                token_id: &plan.pm.token_id,
+                label: &plan.pm.label,
+                side: "BUY",
+                intent: "arb_buy",
+                funder: Some(funder.as_str()),
+                wallet: Some(funder.as_str()),
+                service: self.polymarket_service(&funder),
+                req_price: plan.pm.cap_price,
+                req_shares: plan.pm.shares,
+                req_fee: plan.pm.fee,
+                client_order_id: None,
+            },
+            NewLeg {
+                platform: OUTCOME,
+                token_id: &plan.outcome.token_id,
+                label: &plan.outcome.label,
+                side: "BUY",
+                intent: "arb_buy",
+                funder: None,
+                wallet: self.outcome.account_address(),
+                service: None,
+                req_price: plan.outcome.cap_price,
+                req_shares: plan.outcome.shares,
+                req_fee: plan.outcome.fee,
+                client_order_id: None,
+            },
+        ];
+        let (order_id, leg_ids) = match self
             .store
-            .insert_order(
+            .insert_actived_order_with_legs(
                 topic.key,
                 &topic.market_identity()?,
                 &topic.title,
@@ -366,10 +401,11 @@ impl Engine {
                 plan.profit,
                 plan.total_cost,
                 &fills,
+                &initial_legs,
             )
             .await
         {
-            Ok(id) => id,
+            Ok(created) => created,
             Err(Error::Sqlx(sqlx::Error::Database(db)))
                 if db.code().as_deref() == Some("23505") =>
             {
@@ -379,10 +415,9 @@ impl Engine {
             }
             Err(err) => return Err(err),
         };
+        let [pm_leg, out_leg] = <[i64; 2]>::try_from(leg_ids)
+            .map_err(|_| Error::msg("arb order must be created with both initial legs"))?;
         self.stats.orders();
-        self.store.mark_order_status(order_id, "actived").await?;
-        let pm_token = topic.token(POLYMARKET, &plan.pm.label);
-        let out_token = topic.token(OUTCOME, &plan.outcome.label);
         let pm_tick = self.ensure_pm_tick(&plan.pm.token_id).await;
         let pm_req = MarketOrderRequest {
             token_id: plan.pm.token_id.clone(),
@@ -404,42 +439,6 @@ impl Engine {
             asset_id: out_token.and_then(|t| t.asset_id),
             funder_address: None,
         };
-        let pm_leg = self
-            .store
-            .insert_leg(
-                order_id,
-                POLYMARKET,
-                &plan.pm.token_id,
-                &plan.pm.label,
-                "BUY",
-                "arb_buy",
-                Some(&funder),
-                Some(&funder),
-                self.polymarket_service(&funder),
-                plan.pm.cap_price,
-                plan.pm.shares,
-                plan.pm.fee,
-                None,
-            )
-            .await?;
-        let out_leg = self
-            .store
-            .insert_leg(
-                order_id,
-                OUTCOME,
-                &plan.outcome.token_id,
-                &plan.outcome.label,
-                "BUY",
-                "arb_buy",
-                None,
-                self.outcome.account_address(),
-                None,
-                plan.outcome.cap_price,
-                plan.outcome.shares,
-                plan.outcome.fee,
-                None,
-            )
-            .await?;
         let (pm_res, out_res) = tokio::join!(
             self.submit_pm(pm_leg, &funder, &pm_req, &fees, TradingIntent::Arbitrage),
             self.submit_outcome(out_leg, &out_req, &fees, TradingIntent::Arbitrage)
@@ -953,17 +952,21 @@ impl Engine {
         }
         let timed_out = self
             .store
-            .cancel_stale_unknown_without_fills(self.cfg.unknown_leg_timeout)
+            .stale_unknown_legs(self.cfg.unknown_leg_timeout)
             .await?;
-        if !timed_out.is_empty() {
+        // 超时不是零成交证据，这些腿留在 unknown 继续回填；告警按腿去重，避免每轮重复推送。
+        let newly_stale = self.take_unreported_stale_unknown(&timed_out).await;
+        if !newly_stale.is_empty() {
             tracing::error!(
-                count = timed_out.len(),
-                "stale unknown legs cancelled as no-fill timeout"
+                count = newly_stale.len(),
+                still_stale = timed_out.len(),
+                timeout_secs = self.cfg.unknown_leg_timeout.as_secs(),
+                "stale unknown legs retained for reconciliation; manual verification required"
             );
             if let Some(notify) = &self.notify {
                 notify.publish_alert(notify::format_unknown_timeout_notice(
                     &notify::format_notify_tag(&self.cfg.cat),
-                    &timed_out,
+                    &newly_stale,
                 ));
             }
         }
@@ -975,6 +978,22 @@ impl Engine {
         }
         mark_orders_complete(&self.store).await?;
         Ok(())
+    }
+
+    /// 只返回本进程尚未告警过的超时腿，并回收已经不再超时（已回填或人工处理）的记录，
+    /// 使同一条腿再次超时时能重新告警。
+    async fn take_unreported_stale_unknown(
+        &self,
+        stale: &[crate::store::ClosedLegRef],
+    ) -> Vec<crate::store::ClosedLegRef> {
+        let current: HashSet<i64> = stale.iter().map(|leg| leg.id).collect();
+        let mut reported = self.reported_stale_unknown.lock().await;
+        reported.retain(|id| current.contains(id));
+        stale
+            .iter()
+            .filter(|leg| reported.insert(leg.id))
+            .cloned()
+            .collect()
     }
 
     async fn reconcile_leg(&self, leg: &crate::store::LegRow) -> Result<()> {
@@ -1036,8 +1055,13 @@ impl Engine {
                     return Ok(());
                 }
                 let price = poll.and_then(|p| p.price).unwrap_or(Decimal::ZERO);
-                let fees = self.fee_context_for_order(leg.order_id).await;
-                let fee = estimate_taker_fee(&leg.platform, shares, price, &fees);
+                let fee = match poll.and_then(|item| item.fee) {
+                    Some(actual) => actual,
+                    None => {
+                        let fees = self.fee_context_for_order(leg.order_id).await;
+                        estimate_taker_fee(&leg.platform, shares, price, &fees)
+                    }
+                };
                 close_leg_matched(
                     &self.store,
                     leg.id,
@@ -1134,8 +1158,24 @@ impl Engine {
         }
         let positions = self.store.positions_for_order(order.id).await?;
         if !has_position(&positions) {
-            let closed = self.store.mark_position_closed(order.id).await?;
-            tracing::info!(order_id = order.id, closed, "position close attempted");
+            match self.store.finalize_closed_position(order.id).await? {
+                Some((actual_cost, actual_rev, actual_profit)) => {
+                    tracing::info!(
+                        order_id = order.id,
+                        %actual_cost,
+                        %actual_rev,
+                        %actual_profit,
+                        "position actuals refreshed and position closed"
+                    );
+                    if let Some(notify) = &self.notify {
+                        notify.publish_order_actuals(order.id, actual_profit, actual_cost);
+                    }
+                }
+                None => tracing::debug!(
+                    order_id = order.id,
+                    "position close deferred because state or exposure changed"
+                ),
+            }
             return Ok(());
         }
 
@@ -2488,7 +2528,7 @@ async fn persist_submit(
                     coin: None,
                     shares,
                     price,
-                    fee,
+                    fee: Some(fee),
                     fee_rate_bps: None,
                     raw: json!({
                         "source": "submit_ack",
@@ -2642,7 +2682,7 @@ async fn upsert_fill_rows(store: &Store, leg_id: i64, fills: &[&TradeFill]) -> R
                 },
                 fill.shares,
                 fill.price,
-                fill.fee,
+                fill.fee.unwrap_or(Decimal::ZERO),
                 fill.fee_rate_bps,
                 &fill.raw,
             )
@@ -2658,7 +2698,7 @@ fn fill_price_and_fee(fills: &[&TradeFill], fallback_price: Option<Decimal>) -> 
     for fill in fills {
         shares += fill.shares;
         notional += fill.shares * fill.price;
-        fee += fill.fee;
+        fee += fill.fee.unwrap_or(Decimal::ZERO);
     }
     let price = if shares > Decimal::ZERO {
         notional / shares
@@ -2696,6 +2736,16 @@ async fn close_leg_matched(
         .await
 }
 
+fn actual_fee_or_estimate(
+    actual_fee: Option<Decimal>,
+    platform: &str,
+    shares: Decimal,
+    price: Decimal,
+    fees: &FeeContext,
+) -> Decimal {
+    actual_fee.unwrap_or_else(|| estimate_taker_fee(platform, shares, price, fees))
+}
+
 async fn apply_fills(
     store: &Store,
     leg_id: i64,
@@ -2707,7 +2757,9 @@ async fn apply_fills(
         .iter()
         .map(|fill| {
             let mut row = (*fill).clone();
-            row.fee = estimate_taker_fee(platform, row.shares, row.price, fees);
+            row.fee = Some(actual_fee_or_estimate(
+                row.fee, platform, row.shares, row.price, fees,
+            ));
             row
         })
         .collect();
@@ -2857,7 +2909,7 @@ mod tests {
             coin: None,
             shares: d(shares),
             price: d("0.4"),
-            fee: d("0.01"),
+            fee: Some(d("0.01")),
             fee_rate_bps: None,
             raw: json!({"oid": order_id}),
         }
@@ -2947,6 +2999,28 @@ mod tests {
         let trade = fill("t1", "taker-1", "3", &["maker-9"]);
         assert!(trade.matches(Some("maker-9"), None));
         assert!(!trade.matches(Some("taker"), None));
+    }
+
+    #[test]
+    fn actual_fill_fee_wins_and_only_missing_fee_is_estimated() {
+        let fees = FeeContext {
+            polymarket_fee_rate: d("0.07"),
+            outcome_taker_rate: d("0.00035"),
+            extra_cost_multiplier: d("1.3"),
+        };
+        assert_eq!(
+            actual_fee_or_estimate(Some(d("0.01")), OUTCOME, d("100"), d("0.5"), &fees),
+            d("0.01")
+        );
+        assert_eq!(
+            actual_fee_or_estimate(Some(Decimal::ZERO), OUTCOME, d("100"), d("0.5"), &fees),
+            Decimal::ZERO,
+            "a reported zero fee is actual data, not a missing value"
+        );
+        assert_eq!(
+            actual_fee_or_estimate(None, OUTCOME, d("100"), d("0.5"), &fees),
+            d("0.02275")
+        );
     }
 
     #[test]

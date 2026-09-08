@@ -213,7 +213,7 @@ pub fn format_balance_insufficient_notice(
 
 pub fn format_unknown_timeout_notice(tag: &str, legs: &[crate::store::ClosedLegRef]) -> String {
     let mut lines = vec![
-        format!("⚠️ {tag}unknown 腿超时无成交，已标 cancelled"),
+        format!("⚠️ {tag}unknown 腿超时未定，需人工核对远端成交（新套利已暂停）"),
         format!("📋 count: {}", legs.len()),
     ];
     for leg in legs.iter().take(8) {
@@ -510,7 +510,7 @@ mod tests {
                 platform: "outcome".into(),
             }],
         );
-        assert!(text.contains("unknown 腿超时无成交"));
+        assert!(text.contains("unknown 腿超时未定"));
         assert!(text.contains("orderId=3 legId=9 platform=outcome"));
     }
 }

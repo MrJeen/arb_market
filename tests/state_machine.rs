@@ -322,6 +322,135 @@ fn scan_ids(rows: Vec<ArbOrderRow>) -> Vec<i64> {
     rows.into_iter().map(|row| row.id).collect()
 }
 
+fn identity_probe_leg() -> NewLeg<'static> {
+    NewLeg {
+        platform: "polymarket",
+        token_id: "probe-token",
+        label: "yes",
+        side: "BUY",
+        intent: "arb_buy",
+        funder: None,
+        wallet: None,
+        service: None,
+        req_price: Decimal::ONE,
+        req_shares: Decimal::ONE,
+        req_fee: Decimal::ZERO,
+        client_order_id: None,
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn actived_order_and_initial_legs_are_never_visible_without_each_other() {
+    // `mark_orders_complete` 扫全表，必须在私有 schema 里跑，避免碰到真实订单。
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let identity = MarketIdentity::new("polymarket", "condition-atomic").unwrap();
+    let exercised: Result<_> = async {
+        fixture.store.migrate().await?;
+        let legs = [
+            NewLeg {
+                platform: "polymarket",
+                token_id: "pm-yes",
+                label: "yes",
+                side: "BUY",
+                intent: "arb_buy",
+                funder: Some("0xfunder"),
+                wallet: Some("0xfunder"),
+                service: None,
+                req_price: Decimal::new(4, 1),
+                req_shares: Decimal::from(10),
+                req_fee: Decimal::ZERO,
+                client_order_id: None,
+            },
+            NewLeg {
+                platform: "outcome",
+                token_id: "#5161",
+                label: "no",
+                side: "BUY",
+                intent: "arb_buy",
+                funder: None,
+                wallet: Some("0xwallet"),
+                service: None,
+                req_price: Decimal::new(55, 2),
+                req_shares: Decimal::from(10),
+                req_fee: Decimal::ZERO,
+                client_order_id: None,
+            },
+        ];
+        let (order_id, leg_ids) = fixture
+            .store
+            .insert_actived_order_with_legs(
+                TopicKey::new(Uuid::new_v4(), 0),
+                &identity,
+                "atomic creation",
+                "atomic creation",
+                None,
+                Decimal::from(10),
+                Decimal::new(5, 1),
+                Decimal::new(95, 1),
+                &json!([]),
+                &legs,
+            )
+            .await?;
+        let created = order_snapshot(&fixture.store.pool, order_id).await?;
+        // 回填任务在建档后立刻跑一轮：新单必须因为持有未完成腿而不被取消。
+        market_arb::exec::mark_orders_complete(&fixture.store).await?;
+        let after_reconcile = order_snapshot(&fixture.store.pool, order_id).await?;
+        let leg_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM legs WHERE order_id = $1 AND status = 'pending'",
+        )
+        .bind(order_id)
+        .fetch_one(&fixture.store.pool)
+        .await?;
+        let rejected_without_legs = fixture
+            .store
+            .insert_actived_order_with_legs(
+                TopicKey::new(Uuid::new_v4(), 0),
+                &identity,
+                "atomic creation",
+                "atomic creation",
+                None,
+                Decimal::ZERO,
+                Decimal::ZERO,
+                Decimal::ZERO,
+                &json!([]),
+                &[],
+            )
+            .await;
+        let orphan_actived: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM arb_orders o
+             WHERE o.status = 'actived'
+               AND NOT EXISTS (SELECT 1 FROM legs l WHERE l.order_id = o.id)",
+        )
+        .fetch_one(&fixture.store.pool)
+        .await?;
+        Ok((
+            leg_ids,
+            created,
+            after_reconcile,
+            leg_count,
+            rejected_without_legs,
+            orphan_actived,
+        ))
+    }
+    .await;
+    fixture.cleanup().await.expect("clean up migration schema");
+    let (leg_ids, created, after_reconcile, leg_count, rejected_without_legs, orphan_actived) =
+        exercised.expect("atomic order creation");
+    assert_eq!(leg_ids.len(), 2);
+    assert_eq!(created["status"], "actived");
+    assert_eq!(leg_count, 2);
+    assert_eq!(
+        after_reconcile, created,
+        "a freshly created order must survive an immediate reconcile pass"
+    );
+    assert!(
+        rejected_without_legs.is_err(),
+        "an actived order without legs must not be creatable"
+    );
+    assert_eq!(orphan_actived, 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
 async fn concurrent_lifecycle_claim_has_exactly_one_token() {
@@ -858,7 +987,10 @@ async fn closing_a_position_does_not_clear_an_active_claim() {
             .try_claim_lifecycle(fixture.order_id, "rebalance")
             .await?
             .expect("claim");
-        let refused = fixture.store.mark_position_closed(fixture.order_id).await?;
+        let refused = fixture
+            .store
+            .finalize_closed_position(fixture.order_id)
+            .await?;
         let retained: Option<Uuid> =
             sqlx::query_scalar("SELECT lifecycle_claim_id FROM arb_orders WHERE id = $1")
                 .bind(fixture.order_id)
@@ -868,15 +1000,84 @@ async fn closing_a_position_does_not_clear_an_active_claim() {
             .store
             .release_lifecycle(fixture.order_id, "rebalance", claim_id)
             .await?;
-        let closed = fixture.store.mark_position_closed(fixture.order_id).await?;
+        let closed = fixture
+            .store
+            .finalize_closed_position(fixture.order_id)
+            .await?;
         Ok((refused, retained, claim_id, closed))
     }
     .await;
     fixture.cleanup().await.expect("clean up test order");
     let (refused, retained, claim_id, closed) = exercised.expect("exercise close claim exclusion");
-    assert!(!refused);
+    assert_eq!(refused, None);
     assert_eq!(retained, Some(claim_id));
-    assert!(closed);
+    assert_eq!(closed, Some((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO)));
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn closing_after_rebalance_sell_refreshes_actuals_and_completes_rebalance() {
+    let fixture = Fixture::new().await.expect(POSTGRES_REQUIRED);
+    let exercised: Result<_> = async {
+        sqlx::query(
+            "INSERT INTO legs
+             (order_id, platform, token_id, label, side, intent, status,
+              actual_shares, actual_price, actual_fee)
+             VALUES
+             ($1, 'outcome', '#5160', 'yes', 'BUY', 'arb_buy', 'matched', 10, 0.4, 0),
+             ($1, 'outcome', '#5160', 'yes', 'SELL', 'rebalance', 'matched', 10, 0.5, 0)",
+        )
+        .bind(fixture.order_id)
+        .execute(&fixture.store.pool)
+        .await?;
+        fixture
+            .store
+            .update_actuals(
+                fixture.order_id,
+                Decimal::from(4),
+                Decimal::ZERO,
+                Decimal::from(-4),
+            )
+            .await?;
+        fixture
+            .store
+            .mark_rebalance(fixture.order_id, "actived")
+            .await?;
+        let finalized = fixture
+            .store
+            .finalize_closed_position(fixture.order_id)
+            .await?;
+        let row: (
+            String,
+            String,
+            Decimal,
+            Decimal,
+            Decimal,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ) = sqlx::query_as(
+            "SELECT position_status, rebalance_status, actual_cost, actual_rev,
+                        actual_profit, rebalanced_at
+                 FROM arb_orders WHERE id = $1",
+        )
+        .bind(fixture.order_id)
+        .fetch_one(&fixture.store.pool)
+        .await?;
+        Ok((finalized, row))
+    }
+    .await;
+    fixture.cleanup().await.expect("clean up test order");
+    let (finalized, row) = exercised.expect("finalize zero position after rebalance sell");
+    assert_eq!(
+        finalized,
+        Some((Decimal::from(4), Decimal::from(5), Decimal::ONE))
+    );
+    assert_eq!(row.0, "closed");
+    assert_eq!(row.1, "completed");
+    assert_eq!(
+        (row.2, row.3, row.4),
+        (Decimal::from(4), Decimal::from(5), Decimal::ONE)
+    );
+    assert!(row.5.is_some());
 }
 
 #[tokio::test]
@@ -933,8 +1134,8 @@ async fn order_market_identities_insert_read_backfill_and_conflict() {
 
     let mut identity = MarketIdentity::new("polymarket", "condition-1").unwrap();
     identity.insert("outcome", "516").unwrap();
-    let order_id = store
-        .insert_order(
+    let (order_id, _) = store
+        .insert_actived_order_with_legs(
             TopicKey::new(Uuid::new_v4(), 0),
             &identity,
             "identity integration test",
@@ -944,6 +1145,7 @@ async fn order_market_identities_insert_read_backfill_and_conflict() {
             Decimal::ZERO,
             Decimal::ZERO,
             &json!([]),
+            &[identity_probe_leg()],
         )
         .await
         .expect("insert order and identities");
@@ -962,6 +1164,11 @@ async fn order_market_identities_insert_read_backfill_and_conflict() {
     }
     .await;
 
+    sqlx::query("DELETE FROM legs WHERE order_id = $1")
+        .bind(order_id)
+        .execute(&store.pool)
+        .await
+        .expect("clean up test legs");
     sqlx::query("DELETE FROM arb_orders WHERE id = $1")
         .bind(order_id)
         .execute(&store.pool)

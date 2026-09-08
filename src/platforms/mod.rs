@@ -87,7 +87,9 @@ pub struct TradeFill {
     pub coin: Option<String>,
     pub shares: Decimal,
     pub price: Decimal,
-    pub fee: Decimal,
+    /// 交易所返回的实际手续费；`None` 表示响应未提供，此时调用方才可用策略估算兜底。
+    /// `Some(0)` 是可信的零手续费，不能与缺失混淆。
+    pub fee: Option<Decimal>,
     pub fee_rate_bps: Option<Decimal>,
     pub raw: Value,
 }
@@ -167,6 +169,16 @@ pub fn parse_decimal(value: &Value) -> Option<Decimal> {
     }
 }
 
+/// HTTP 错误状态码是否足以证明订单没有被交易所执行。
+///
+/// 5xx 与 408 只说明服务端或响应链路出了问题，订单可能已经撮合成交；把它们记成零成交失败
+/// 会让这条腿离开回填集合，造成漏记持仓并可能重复补仓。这类响应必须按 `Unknown` 处理，
+/// 继续用 third_order_id 或 client_order_id 核对远端成交。408、425、429 同样可能由
+/// 网关或限流层返回，不能证明请求未到达撮合系统；其余 4xx 按明确请求拒绝处理。
+pub fn http_status_proves_reject(status: u16) -> bool {
+    (400..500).contains(&status) && !matches!(status, 408 | 425 | 429)
+}
+
 pub fn require_positive(shares: Decimal, price: Decimal) -> Result<()> {
     if shares <= Decimal::ZERO || price <= Decimal::ZERO {
         return Err(crate::error::Error::msg(
@@ -211,6 +223,16 @@ mod tests {
         );
         assert!(ioc_fill(Some(d("0")), Some(d("0.4"))).is_none());
         assert!(ioc_fill(Some(d("5")), None).is_none());
+    }
+
+    #[test]
+    fn only_definitive_http_client_errors_prove_rejection() {
+        for status in [400, 401, 403, 404, 409, 422] {
+            assert!(http_status_proves_reject(status), "{status}");
+        }
+        for status in [408, 425, 429, 500, 502, 503, 504] {
+            assert!(!http_status_proves_reject(status), "{status}");
+        }
     }
 
     #[test]

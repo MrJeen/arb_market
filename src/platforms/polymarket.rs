@@ -1014,12 +1014,16 @@ fn signed_envelope(
 
 pub fn classify_submit_error(err: &Error, order_hash: String, envelope: Value) -> SubmitResult {
     match err {
-        Error::Http { status, message } if *status >= 400 => SubmitResult::Failed {
-            order_hash,
-            envelope,
-            status: *status,
-            message: message.clone(),
-        },
+        Error::Http { status, message }
+            if *status >= 400 && crate::platforms::http_status_proves_reject(*status) =>
+        {
+            SubmitResult::Failed {
+                order_hash,
+                envelope,
+                status: *status,
+                message: message.clone(),
+            }
+        }
         _ => SubmitResult::Unknown {
             order_id: None,
             order_hash,
@@ -1188,8 +1192,7 @@ pub fn parse_trades(raw: &Value) -> Vec<TradeFill> {
                 fee: item
                     .get("fee_amount")
                     .or_else(|| item.get("fee"))
-                    .and_then(parse_decimal)
-                    .unwrap_or(Decimal::ZERO),
+                    .and_then(parse_decimal),
                 fee_rate_bps: item.get("fee_rate_bps").and_then(parse_decimal),
                 raw: item,
             })
@@ -1767,7 +1770,7 @@ mod tests {
     }
 
     #[test]
-    fn http_400_fak_and_503_are_failed() {
+    fn explicit_reject_is_failed_but_ambiguous_http_statuses_stay_unknown() {
         let fak = Error::Http {
             status: 400,
             message: FAK_UNFILLED.into(),
@@ -1776,13 +1779,21 @@ mod tests {
             SubmitResult::Failed { status, .. } => assert_eq!(status, 400),
             other => panic!("expected Failed, got {other:?}"),
         }
-        let five = Error::Http {
-            status: 503,
-            message: "bad gateway".into(),
-        };
-        match classify_submit_error(&five, "0x1".into(), json!({})) {
-            SubmitResult::Failed { status, .. } => assert_eq!(status, 503),
-            other => panic!("expected Failed, got {other:?}"),
+        // 5xx / 408 / 425 / 429 未证明订单没被撮合，记零成交会漏记真实持仓。
+        for status in [408u16, 425, 429, 500, 502, 503, 504] {
+            let err = Error::Http {
+                status,
+                message: "bad gateway".into(),
+            };
+            match classify_submit_error(&err, "0x1".into(), json!({})) {
+                SubmitResult::Unknown { message, .. } => {
+                    assert!(
+                        message.contains("bad gateway"),
+                        "status {status}: {message}"
+                    )
+                }
+                other => panic!("expected Unknown for {status}, got {other:?}"),
+            }
         }
     }
 
@@ -1927,6 +1938,7 @@ mod tests {
         assert_eq!(trades[0].order_id.as_deref(), Some("taker-1"));
         assert!(trades[0].matches(Some("maker-9"), None));
         assert!(trades[0].matches(Some("taker-1"), None));
+        assert_eq!(trades[0].fee, Some("0.01".parse().unwrap()));
         assert!(!trades[0].matches(Some("other"), None));
     }
 
