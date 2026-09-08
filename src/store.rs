@@ -2,6 +2,8 @@ use crate::config::{OUTCOME, POLYMARKET};
 use crate::domain::{MarketIdentity, TopicKey};
 use crate::error::{Error, Result};
 use crate::hedge::Positions;
+use crate::platforms::{OrderPoll, TradeFill};
+use crate::reconcile::{merge_observation, resolve_leg, FillEvidence, LegResolution};
 use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -68,6 +70,9 @@ pub struct LegRow {
     pub client_order_id: Option<String>,
     pub third_order_id: Option<String>,
     pub status: String,
+    pub submitted_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_order_info: Option<Value>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -371,6 +376,13 @@ impl Store {
             .and_then(|v| v.as_str())
             .unwrap_or(order_hash);
         let mut tx = self.pool.begin().await?;
+        let (_, parent_open) = lock_leg_parent(&mut tx, leg_id).await?;
+        let current = read_locked_leg(&mut tx, leg_id).await?;
+        if !parent_open || current.status != "pending" || current.submitted_at.is_some() {
+            return Err(Error::msg(
+                "leg is no longer eligible for initial submission",
+            ));
+        }
         sqlx::query(
             "INSERT INTO signed_envelopes (leg_id, order_hash, payload, book_snapshot)
              VALUES ($1,$2,$3,$4)",
@@ -394,68 +406,267 @@ impl Store {
         Ok(())
     }
 
-    pub async fn save_submit_response(&self, leg_id: i64, response: &Value) -> Result<()> {
+    /// 网络提交的迟到响应只能增加审计证据，不能撤销已确认的成交。
+    pub async fn record_submission(
+        &self,
+        leg_id: i64,
+        status: &str,
+        order_id: Option<&str>,
+        evidence: &Value,
+        response: &Value,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let (parent_id, parent_open) = lock_leg_parent(&mut tx, leg_id).await?;
+        let current = read_locked_leg(&mut tx, leg_id).await?;
         sqlx::query(
-            "UPDATE signed_envelopes SET submit_response = $2
-             WHERE id = (
-                 SELECT id FROM signed_envelopes WHERE leg_id = $1 ORDER BY id DESC LIMIT 1
-             )",
+            "UPDATE signed_envelopes SET submit_response = $2 WHERE id =
+             (SELECT id FROM signed_envelopes WHERE leg_id = $1 ORDER BY id DESC LIMIT 1)",
         )
         .bind(leg_id)
         .bind(response)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if !parent_open || !leg_open(&current.status) {
+            tx.commit().await?;
+            return Ok(());
+        }
+        let known = current.third_order_id.as_deref();
+        if let (Some(known), Some(incoming)) = (known, order_id) {
+            if known != incoming && Some(known) != current.client_order_id.as_deref() {
+                return Err(Error::msg(
+                    "submit response conflicts with recovered order id",
+                ));
+            }
+        }
+        let terminal = status == "cancelled" || status == "failed";
+        let has_observation: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM fills WHERE leg_id = $1)")
+                .bind(leg_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        // 找到订单或已有撮合证据后，晚到的拒单不能证明零成交。
+        let next_status = if terminal && (has_observation || current.status == "actived") {
+            current.status.as_str()
+        } else if status == "unknown" && current.status == "actived" {
+            "actived"
+        } else {
+            status
+        };
+        let mut info = current
+            .last_order_info
+            .unwrap_or_else(|| serde_json::json!({}));
+        if info.pointer("/submission/kind").and_then(Value::as_str) != Some("ack")
+            || evidence.get("kind").and_then(Value::as_str) == Some("ack")
+        {
+            info["submission"] = evidence.clone();
+        }
+        sqlx::query(
+            "UPDATE legs SET status = $2, third_order_id = COALESCE($3,third_order_id),
+                 last_order_info = $4, updated_at = clock_timestamp(),
+                 actual_shares = CASE WHEN $2 IN ('cancelled','failed') THEN 0 ELSE actual_shares END,
+                 actual_price = CASE WHEN $2 IN ('cancelled','failed') THEN 0 ELSE actual_price END,
+                 actual_fee = CASE WHEN $2 IN ('cancelled','failed') THEN 0 ELSE actual_fee END
+             WHERE id = $1",
+        ).bind(leg_id).bind(next_status).bind(order_id).bind(info).execute(&mut *tx).await?;
+        refresh_parent_in_tx(&mut tx, parent_id).await?;
+        tx.commit().await?;
         Ok(())
     }
 
-    pub async fn update_leg_submitted(
+    /// 查单恢复身份先落库；后续 HTTP 失败不会丢掉 oid。返回新快照用作回填的并发令牌。
+    pub async fn record_order_poll(
         &self,
-        leg_id: i64,
-        status: &str,
-        third_order_id: Option<&str>,
-        info: &Value,
-    ) -> Result<()> {
+        leg: &LegRow,
+        poll: &OrderPoll,
+    ) -> Result<Option<LegRow>> {
+        let mut tx = self.pool.begin().await?;
+        let (_, parent_open) = lock_leg_parent(&mut tx, leg.id).await?;
+        let current = read_locked_leg(&mut tx, leg.id).await?;
+        if !parent_open || !leg_open(&current.status) || current.updated_at != leg.updated_at {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        if let Some(incoming) = poll.order_id.as_deref() {
+            if current.third_order_id.as_deref().is_some_and(|known| {
+                known != incoming && Some(known) != current.client_order_id.as_deref()
+            }) {
+                return Err(Error::msg(
+                    "order lookup conflicts with durable order identity",
+                ));
+            }
+        }
+        if poll
+            .coin
+            .as_deref()
+            .is_some_and(|coin| coin != current.token_id)
+            || poll.client_order_id.as_deref().is_some_and(|id| {
+                current
+                    .client_order_id
+                    .as_deref()
+                    .is_some_and(|known| id != known)
+            })
+        {
+            return Err(Error::msg(
+                "order lookup belongs to a different token or client id",
+            ));
+        }
+        let mut info = current
+            .last_order_info
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        info["order_poll"] = serde_json::to_value(poll)?;
         sqlx::query(
-            "UPDATE legs SET status = $2, third_order_id = COALESCE($3, third_order_id),
-                    last_order_info = $4, submitted_at = COALESCE(submitted_at, NOW()),
-                    updated_at = NOW()
-             WHERE id = $1",
+            "UPDATE legs SET third_order_id = COALESCE($2,third_order_id),
+                 status = CASE WHEN $3 THEN 'actived' ELSE status END,
+                 last_order_info = $4, updated_at = clock_timestamp() WHERE id = $1",
         )
-        .bind(leg_id)
-        .bind(status)
-        .bind(third_order_id)
+        .bind(leg.id)
+        .bind(poll.order_id.as_deref())
+        .bind(poll.found)
         .bind(info)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(())
+        let updated = read_locked_leg(&mut tx, leg.id).await?;
+        tx.commit().await?;
+        Ok(Some(updated))
     }
 
-    pub async fn update_leg_fill(
+    /// 明细、分页进度、腿最终账务和父单完成在同一事务提交。
+    pub async fn record_reconciliation(
         &self,
-        leg_id: i64,
-        status: &str,
-        third_order_id: Option<&str>,
-        price: Decimal,
-        shares: Decimal,
-        fee: Decimal,
-        info: &Value,
-    ) -> Result<()> {
-        sqlx::query(
-            "UPDATE legs SET status = $2, third_order_id = COALESCE($3, third_order_id),
-                    actual_price = $4, actual_shares = $5, actual_fee = $6,
-                    last_order_info = $7, submitted_at = COALESCE(submitted_at, NOW()),
-                    updated_at = NOW()
-             WHERE id = $1",
+        leg: &LegRow,
+        observations: &[TradeFill],
+        evidence: &FillEvidence,
+        progress: &Value,
+    ) -> Result<LegResolution> {
+        let mut tx = self.pool.begin().await?;
+        let (parent_id, parent_open) = lock_leg_parent(&mut tx, leg.id).await?;
+        let current = read_locked_leg(&mut tx, leg.id).await?;
+        if !parent_open || !leg_open(&current.status) || current.updated_at != leg.updated_at {
+            tx.rollback().await?;
+            return Ok(LegResolution::Pending("stale_leg_snapshot"));
+        }
+        let oid = current
+            .third_order_id
+            .as_deref()
+            .ok_or_else(|| Error::msg("reconciliation requires recovered order id"))?;
+        if evidence.poll.order_id.as_deref() != Some(oid) {
+            return Err(Error::msg("reconciliation evidence order id mismatch"));
+        }
+        for incoming in observations {
+            if incoming.trade_id.is_empty()
+                || incoming.trade_id.starts_with("ack:")
+                || incoming.order_id.as_deref() != Some(oid)
+            {
+                return Err(Error::msg("invalid reconciliation trade identity"));
+            }
+            let existing: Option<Value> = sqlx::query_scalar(
+                "SELECT raw FROM fills WHERE leg_id=$1 AND trade_id=$2 AND third_order_id=$3",
+            )
+            .bind(leg.id)
+            .bind(&incoming.trade_id)
+            .bind(oid)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let merged = match existing
+                .as_ref()
+                .and_then(|raw| raw.get("reconciliation_v1"))
+            {
+                Some(previous) => {
+                    merge_observation(&serde_json::from_value(previous.clone())?, incoming)?
+                }
+                None => incoming.clone(),
+            };
+            let accounting = if merged.finality == crate::platforms::FillFinality::Confirmed {
+                crate::reconcile::accounting_fee(&current.platform, &merged)?.map(
+                    |(fee, source)| serde_json::json!({"fee":fee,"source":source,"currency":"USD"}),
+                )
+            } else {
+                None
+            };
+            let raw = serde_json::json!({"reconciliation_v1": merged,"accounting":accounting});
+            sqlx::query(
+                "INSERT INTO fills(leg_id,third_order_id,trade_id,shares,price,fee,fee_rate_bps,raw)
+                 VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+                 ON CONFLICT(leg_id,trade_id,third_order_id) DO UPDATE SET
+                    shares=EXCLUDED.shares,price=EXCLUDED.price,fee=EXCLUDED.fee,
+                    fee_rate_bps=EXCLUDED.fee_rate_bps,raw=EXCLUDED.raw,updated_at=NOW()",
+            ).bind(leg.id).bind(oid).bind(&merged.trade_id).bind(merged.shares).bind(merged.price)
+                .bind(merged.fee).bind(merged.fee_rate_bps).bind(raw).execute(&mut *tx).await?;
+        }
+        // 老版本占位／未确认费来源不能通过直接 SUM 混入新账务。
+        let stored: Vec<Value> = sqlx::query_scalar(
+            "SELECT raw->'reconciliation_v1' FROM fills
+             WHERE leg_id=$1 AND third_order_id=$2 AND raw ? 'reconciliation_v1'
+               AND trade_id NOT LIKE 'ack:%' ORDER BY trade_id",
         )
-        .bind(leg_id)
-        .bind(status)
-        .bind(third_order_id)
-        .bind(price)
-        .bind(shares)
-        .bind(fee)
-        .bind(info)
-        .execute(&self.pool)
+        .bind(leg.id)
+        .bind(oid)
+        .fetch_all(&mut *tx)
         .await?;
+        let fills: Vec<TradeFill> = stored
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<std::result::Result<_, _>>()?;
+        let resolution = resolve_leg(&current.platform, &fills, evidence)?;
+        let mut info = current
+            .last_order_info
+            .unwrap_or_else(|| serde_json::json!({}));
+        info["fill_progress"] = progress.clone();
+        info["fill_evidence"] = serde_json::to_value(evidence)?;
+        match &resolution {
+            LegResolution::Pending(reason) => {
+                info["waiting_reason"] = serde_json::json!(reason);
+                sqlx::query(
+                    "UPDATE legs SET last_order_info=$2,updated_at=clock_timestamp() WHERE id=$1",
+                )
+                .bind(leg.id)
+                .bind(info)
+                .execute(&mut *tx)
+                .await?;
+            }
+            LegResolution::Terminal {
+                status,
+                shares,
+                price,
+                fee,
+                fee_sources,
+            } => {
+                info["fee_sources"] = serde_json::json!(fee_sources);
+                info["waiting_reason"] = Value::Null;
+                sqlx::query(
+                    "UPDATE legs SET status=$2,actual_shares=$3,actual_price=$4,actual_fee=$5,
+                     last_order_info=$6,updated_at=clock_timestamp() WHERE id=$1",
+                )
+                .bind(leg.id)
+                .bind(status)
+                .bind(shares)
+                .bind(price)
+                .bind(fee)
+                .bind(info)
+                .execute(&mut *tx)
+                .await?;
+                refresh_parent_in_tx(&mut tx, parent_id).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(resolution)
+    }
+
+    pub async fn complete_orders(&self) -> Result<()> {
+        let ids: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM arb_orders WHERE status='actived' ORDER BY id")
+                .fetch_all(&self.pool)
+                .await?;
+        for id in ids {
+            let mut tx = self.pool.begin().await?;
+            sqlx::query("SELECT id FROM arb_orders WHERE id=$1 FOR UPDATE")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            refresh_parent_in_tx(&mut tx, id).await?;
+            tx.commit().await?;
+        }
         Ok(())
     }
 
@@ -463,7 +674,7 @@ impl Store {
         let rows = sqlx::query_as::<_, LegRow>(
             "SELECT id, order_id, platform, token_id, label, side, intent,
                     funder_address, wallet_address, service, req_price, req_shares,
-                    client_order_id, third_order_id, status
+                    client_order_id, third_order_id, status, submitted_at, last_order_info, updated_at
              FROM legs
              WHERE status IN ('pending','unknown','actived')
              ORDER BY id",
@@ -534,37 +745,6 @@ impl Store {
                 .fetch_one(&self.pool)
                 .await?;
         Ok(TopicKey::new(event_id, unified_index))
-    }
-
-    pub async fn upsert_fill(
-        &self,
-        leg_id: i64,
-        third_order_id: Option<&str>,
-        trade_id: Option<&str>,
-        shares: Decimal,
-        price: Decimal,
-        fee: Decimal,
-        fee_rate_bps: Option<Decimal>,
-        raw: &Value,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO fills (leg_id, third_order_id, trade_id, shares, price, fee, fee_rate_bps, raw)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-             ON CONFLICT (leg_id, trade_id, third_order_id)
-             DO UPDATE SET shares = EXCLUDED.shares, price = EXCLUDED.price, fee = EXCLUDED.fee,
-                           fee_rate_bps = EXCLUDED.fee_rate_bps, raw = EXCLUDED.raw, updated_at = NOW()",
-        )
-        .bind(leg_id)
-        .bind(third_order_id.unwrap_or(""))
-        .bind(trade_id.unwrap_or(""))
-        .bind(shares)
-        .bind(price)
-        .bind(fee)
-        .bind(fee_rate_bps)
-        .bind(raw)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
     }
 
     pub async fn positions_for_order(&self, order_id: i64) -> Result<Positions> {
@@ -1003,22 +1183,15 @@ impl Store {
         Ok(result.rows_affected())
     }
 
-    /// 只读上报超时未定的 unknown 腿。**不得**把超时当成零成交证据：本地没有成交记录
-    /// 只说明回填还没成功，交易所可能已经成交。写入 cancelled + 零成交会让这条腿离开
-    /// `open_legs` 的回填集合，真实持仓再也追不回来。这些腿保持 `unknown`，
-    /// 由 `reconcile_leg` 按 third_order_id 或 client_order_id 继续比对远端成交，
-    /// 只能在拿到可信远端终态后才转终态。
+    /// 提交不明和已受理但未确认的腿均按首次提交时间告警。
+    /// 已有部分成交也不能掩盖剩余确认故障；重试不会推迟超时或清零成交。
     pub async fn stale_unknown_legs(&self, timeout: Duration) -> Result<Vec<ClosedLegRef>> {
         let secs = timeout.as_secs() as i64;
         let rows = sqlx::query_as::<_, ClosedLegRef>(
             "SELECT id, order_id, platform
              FROM legs
-             WHERE status = 'unknown'
-               AND updated_at < NOW() - make_interval(secs => $1)
-               AND NOT EXISTS (
-                 SELECT 1 FROM fills f
-                 WHERE f.leg_id = legs.id AND COALESCE(f.shares, 0) > 0
-               )
+             WHERE status IN ('unknown','actived')
+               AND COALESCE(submitted_at,created_at) < NOW() - make_interval(secs => $1)
              ORDER BY id",
         )
         .bind(secs)
@@ -1062,8 +1235,8 @@ impl Store {
         let secs = timeout.as_secs() as i64;
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM legs
-             WHERE status = 'unknown'
-               AND updated_at < NOW() - make_interval(secs => $1)",
+             WHERE status IN ('unknown','actived')
+               AND COALESCE(submitted_at,created_at) < NOW() - make_interval(secs => $1)",
         )
         .bind(secs)
         .fetch_one(&self.pool)
@@ -1136,6 +1309,85 @@ impl Store {
         self.update_actuals(order_id, cost, rev, profit).await?;
         Ok((cost, rev, profit))
     }
+}
+
+fn leg_open(status: &str) -> bool {
+    matches!(status, "pending" | "unknown" | "actived")
+}
+
+async fn lock_leg_parent(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    leg_id: i64,
+) -> Result<(i64, bool)> {
+    let row: (i64, String, bool) = sqlx::query_as(
+        "SELECT o.id,o.position_status,o.settled_at IS NOT NULL FROM arb_orders o
+         WHERE o.id=(SELECT order_id FROM legs WHERE id=$1) FOR UPDATE",
+    )
+    .bind(leg_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok((row.0, !row.2 && row.1 == "watching"))
+}
+
+async fn read_locked_leg(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    leg_id: i64,
+) -> Result<LegRow> {
+    Ok(sqlx::query_as::<_, LegRow>(
+        "SELECT id,order_id,platform,token_id,label,side,intent,funder_address,wallet_address,
+         service,req_price,req_shares,client_order_id,third_order_id,status,submitted_at,
+         last_order_info,updated_at FROM legs WHERE id=$1 FOR UPDATE",
+    )
+    .bind(leg_id)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
+async fn refresh_parent_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    order_id: i64,
+) -> Result<()> {
+    let rows: Vec<TerminalLegRow> = sqlx::query_as(
+        "SELECT status,side,platform,label,actual_shares,actual_price,actual_fee
+         FROM legs WHERE order_id=$1 ORDER BY id FOR UPDATE",
+    )
+    .bind(order_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if rows.is_empty() || rows.iter().any(|(status, ..)| leg_open(status)) {
+        return Ok(());
+    }
+    let positive = rows.iter().any(|(status, _, _, _, shares, _, _)| {
+        matches!(status.as_str(), "matched" | "completed")
+            && shares.is_some_and(|qty| qty > Decimal::ZERO)
+    });
+    let actual_rows: Vec<_> = rows
+        .into_iter()
+        .filter(|(status, ..)| matches!(status.as_str(), "matched" | "completed"))
+        .map(|(_, side, platform, label, shares, price, fee)| {
+            (
+                side,
+                platform,
+                label,
+                shares.unwrap_or_default(),
+                price.unwrap_or_default(),
+                fee.unwrap_or_default(),
+            )
+        })
+        .collect();
+    let (cost, rev, profit) = compute_actuals(&actual_rows);
+    sqlx::query(
+        "UPDATE arb_orders SET actual_cost=$2,actual_rev=$3,actual_profit=$4,
+             status=CASE WHEN status='actived' THEN $5 ELSE status END,
+             completed_at=CASE WHEN status='actived' THEN NOW() ELSE completed_at END,
+             rebalance_status=CASE WHEN status='actived' AND $5='cancelled' THEN 'completed' ELSE rebalance_status END,
+             rebalanced_at=CASE WHEN status='actived' AND $5='cancelled' THEN NOW() ELSE rebalanced_at END,
+             updated_at=NOW()
+         WHERE id=$1 AND settled_at IS NULL AND position_status='watching'",
+    ).bind(order_id).bind(cost).bind(rev).bind(profit)
+        .bind(if positive { "completed" } else { "cancelled" })
+        .execute(&mut **tx).await?;
+    Ok(())
 }
 
 fn validate_lifecycle_action(action: &str) -> Result<()> {

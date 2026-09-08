@@ -1,8 +1,8 @@
 use crate::book::{BookStore, DirtyCoalescer, OrderBook};
 use crate::calc::{
     below_venue_mins, best_plan, confirm_plan, confirm_plan_reason, diagnose_books,
-    estimate_taker_fee, first_usable_ask, inspect_calc, min_trade_amount, min_trade_cost,
-    ArbLimits, ArbPlan, CalcMissSnapshot, FeeContext,
+    first_usable_ask, inspect_calc, min_trade_amount, min_trade_cost, ArbLimits, ArbPlan,
+    CalcMissSnapshot, FeeContext,
 };
 use crate::config::{Config, OUTCOME, POLYMARKET};
 use crate::discovery::{load_active_topics, load_topic};
@@ -18,8 +18,10 @@ use crate::notify::{
 use crate::platforms::outcome::OutcomeVenue;
 use crate::platforms::polymarket::PolymarketVenue;
 use crate::platforms::{
-    ioc_fill, pm_fak_fill, MarketOrderRequest, OrderPoll, OrderSide, SubmitResult, TradeFill,
+    ioc_fill, pm_fak_fill, FillPage, MarketOrderRequest, OrderPoll, OrderSide, SubmitResult,
+    TradeFill,
 };
+use crate::reconcile::{FillEvidence, LegResolution};
 use crate::settlement::{OutcomeSettlement, SettlementStatus};
 use crate::stats::MinuteStats;
 use crate::store::{ArbOrderRow, NewLeg, Store};
@@ -144,14 +146,6 @@ impl Engine {
         }
     }
 
-    async fn fee_context_for_order(&self, order_id: i64) -> FeeContext {
-        let Ok(key) = self.store.order_topic_key(order_id).await else {
-            return self.fee_context_from(None);
-        };
-        let topic = self.topics.read().await.get(&key).cloned();
-        self.fee_context_from(topic.as_ref())
-    }
-
     async fn evaluate_topic(&self, topic_key: TopicKey) -> Result<()> {
         let topic = {
             let topics = self.topics.read().await;
@@ -171,7 +165,7 @@ impl Engine {
             .await?
             > 0
         {
-            tracing::error!("stale unknown legs present; skip new arb");
+            tracing::error!("stale unconfirmed legs present; skip new arb");
             self.stats.stale_unknown();
             return Ok(());
         }
@@ -961,7 +955,7 @@ impl Engine {
                 count = newly_stale.len(),
                 still_stale = timed_out.len(),
                 timeout_secs = self.cfg.unknown_leg_timeout.as_secs(),
-                "stale unknown legs retained for reconciliation; manual verification required"
+                "stale unconfirmed legs retained for reconciliation; manual verification required"
             );
             if let Some(notify) = &self.notify {
                 notify.publish_alert(notify::format_unknown_timeout_notice(
@@ -1009,83 +1003,132 @@ impl Engine {
             .funder_address
             .as_deref()
             .ok_or_else(|| Error::msg("missing funder"))?;
-        let poll = if let Some(oid) = &leg.third_order_id {
-            Some(self.pm.poll_order(funder, oid).await?)
-        } else {
-            None
+        let Some(selector) = leg
+            .third_order_id
+            .as_deref()
+            .or(leg.client_order_id.as_deref())
+        else {
+            return Ok(());
         };
-        let trades = self.pm.poll_trades(funder, &leg.token_id).await?;
-        let matched = filter_trades(
-            &trades,
-            leg.third_order_id.as_deref(),
-            leg.client_order_id.as_deref(),
-        );
-        self.apply_remote_leg(leg, poll.as_ref(), &matched).await
+        let poll = self.pm.poll_order(funder, selector).await?;
+        if !poll.found {
+            return Ok(());
+        }
+        let Some(current) = self.store.record_order_poll(leg, &poll).await? else {
+            return Ok(());
+        };
+        let progress = current
+            .last_order_info
+            .as_ref()
+            .and_then(|info| info.get("fill_progress"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let page = self
+            .pm
+            .poll_trade_page(funder, &leg.token_id, &progress)
+            .await?;
+        self.apply_fill_page(&current, poll, page).await
     }
 
     async fn reconcile_outcome(&self, leg: &crate::store::LegRow) -> Result<()> {
-        let poll = if let Some(oid) = &leg.third_order_id {
-            Some(self.outcome.poll_order(oid, &leg.token_id).await?)
-        } else {
-            None
+        let Some(selector) = leg
+            .third_order_id
+            .as_deref()
+            .or(leg.client_order_id.as_deref())
+        else {
+            return Ok(());
         };
-        let fills = self.outcome.poll_fills(Some(&leg.token_id)).await?;
-        let matched = filter_trades(
-            &fills,
-            leg.third_order_id.as_deref(),
-            leg.client_order_id.as_deref(),
-        );
-        self.apply_remote_leg(leg, poll.as_ref(), &matched).await
+        let poll = self.outcome.poll_order(selector, &leg.token_id).await?;
+        if !poll.found {
+            return Ok(());
+        }
+        let Some(current) = self.store.record_order_poll(leg, &poll).await? else {
+            return Ok(());
+        };
+        let submitted = current
+            .submitted_at
+            .ok_or_else(|| Error::msg("missing submission time for fill history"))?;
+        let progress = current
+            .last_order_info
+            .as_ref()
+            .and_then(|info| info.get("fill_progress"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        // 与平台时钟留重叠；精确 oid 匹配会排除窗口中其他订单的成交。
+        let page = self
+            .outcome
+            .poll_fill_page(
+                &current.token_id,
+                submitted.timestamp_millis().saturating_sub(30_000).max(0),
+                &progress,
+            )
+            .await?;
+        self.apply_fill_page(&current, poll, page).await
     }
 
-    async fn apply_remote_leg(
+    async fn apply_fill_page(
         &self,
         leg: &crate::store::LegRow,
-        poll: Option<&OrderPoll>,
-        matched: &[&TradeFill],
+        poll: OrderPoll,
+        page: FillPage,
     ) -> Result<()> {
-        if !matched.is_empty() {
-            let fees = self.fee_context_for_order(leg.order_id).await;
-            return apply_fills(&self.store, leg.id, &leg.platform, matched, &fees).await;
+        let mut matched: Vec<TradeFill> =
+            filter_trades(&page.fills, poll.order_id.as_deref(), None)
+                .into_iter()
+                .map(Clone::clone)
+                .collect();
+        if matched.iter().any(|fill| {
+            fill.coin
+                .as_deref()
+                .is_some_and(|coin| coin != leg.token_id)
+        }) {
+            return Err(Error::msg("matched trade token does not match leg"));
         }
-        match remote_leg_terminal(poll, false) {
-            Some(RemoteLegTerminal::Matched) => {
-                let shares = poll.and_then(|p| p.shares).unwrap_or(Decimal::ZERO);
-                if shares <= Decimal::ZERO {
-                    return Ok(());
-                }
-                let price = poll.and_then(|p| p.price).unwrap_or(Decimal::ZERO);
-                let fee = match poll.and_then(|item| item.fee) {
-                    Some(actual) => actual,
-                    None => {
-                        let fees = self.fee_context_for_order(leg.order_id).await;
-                        estimate_taker_fee(&leg.platform, shares, price, &fees)
-                    }
-                };
-                close_leg_matched(
-                    &self.store,
-                    leg.id,
-                    leg.third_order_id.as_deref(),
-                    shares,
-                    price,
-                    fee,
-                    poll.map(|p| &p.raw).unwrap_or(&json!({"source": "poll"})),
-                )
-                .await
+        if leg.platform == POLYMARKET && matched.iter().any(needs_pm_fee_snapshot) {
+            let identities = self.store.market_identities_for_order(leg.order_id).await?;
+            let market_id = identities.require(POLYMARKET)?;
+            // 估算政策经用户明确选择；快照保存在每条成交中，不以策略先验冒充实收。
+            let schedule = self.pm.fee_schedule(market_id).await?;
+            for fill in matched
+                .iter_mut()
+                .filter(|fill| needs_pm_fee_snapshot(fill))
+            {
+                fill.raw["fee_calculation"] = schedule.clone();
             }
-            Some(RemoteLegTerminal::Cancelled) => {
-                close_leg_cancelled(
-                    &self.store,
-                    leg.id,
-                    &json!({
-                        "reason": "remote_terminal_no_fill",
-                        "poll": poll.map(|p| p.raw.clone())
-                    }),
-                )
-                .await
-            }
-            None => Ok(()),
         }
+        let expected_shares = leg
+            .last_order_info
+            .as_ref()
+            .and_then(|info| info.pointer("/submission/expected_shares"))
+            .and_then(crate::platforms::parse_decimal);
+        let evidence = FillEvidence {
+            poll,
+            page_complete: page.complete,
+            history_complete: page.history_complete,
+            expected_shares,
+        };
+        let started = Instant::now();
+        let resolution = self
+            .store
+            .record_reconciliation(leg, &matched, &evidence, &page.progress)
+            .await?;
+        match resolution {
+            LegResolution::Pending(reason) => tracing::debug!(
+                platform=%leg.platform,leg_id=leg.id,order_id=leg.order_id,reason,
+                elapsed_ms=started.elapsed().as_millis() as u64,"trade reconciliation pending"
+            ),
+            LegResolution::Terminal {
+                status,
+                shares,
+                fee,
+                fee_sources,
+                ..
+            } => tracing::info!(
+                platform=%leg.platform,leg_id=leg.id,order_id=leg.order_id,status,%shares,%fee,
+                ?fee_sources,elapsed_ms=started.elapsed().as_millis() as u64,"trade reconciliation finalized"
+            ),
+        }
+        Ok(())
     }
 
     pub async fn hedge_once(&self) -> Result<()> {
@@ -2504,11 +2547,10 @@ async fn persist_submit(
     platform: &str,
     side: OrderSide,
     result: &SubmitResult,
-    fees: &FeeContext,
+    _fees: &FeeContext,
     response: &serde_json::Value,
 ) -> Result<()> {
-    store.save_submit_response(leg_id, response).await?;
-    match result {
+    let (status, oid, evidence) = match result {
         SubmitResult::Ack {
             order_id,
             envelope,
@@ -2517,89 +2559,37 @@ async fn persist_submit(
             avg_px,
             ..
         } => {
-            let fill = ack_fill(platform, side, *making, *taking, *avg_px, envelope);
-            if let Some((shares, price)) = fill {
-                let fee = estimate_taker_fee(platform, shares, price, fees);
-                let trade_id = format!("ack:{order_id}");
-                let trade = TradeFill {
-                    trade_id: trade_id.clone(),
-                    order_id: Some(order_id.clone()),
-                    order_ids: vec![order_id.clone()],
-                    coin: None,
-                    shares,
-                    price,
-                    fee: Some(fee),
-                    fee_rate_bps: None,
-                    raw: json!({
-                        "source": "submit_ack",
-                        "avg_px": if platform == POLYMARKET { Some(price) } else { *avg_px }
-                    }),
-                };
-                upsert_fill_rows(store, leg_id, &[&trade]).await?;
-                close_leg_matched(store, leg_id, Some(order_id), shares, price, fee, response)
-                    .await?;
-            } else {
-                store
-                    .update_leg_submitted(leg_id, "actived", Some(order_id), response)
-                    .await?;
-            }
+            let expected = ack_fill(platform, side, *making, *taking, *avg_px, envelope)
+                .map(|(shares, _)| shares);
+            (
+                "actived",
+                Some(order_id.as_str()),
+                json!({"kind":"ack","expected_shares":expected}),
+            )
         }
-        SubmitResult::NoMatch {
-            envelope, message, ..
-        } => {
-            store
-                .update_leg_fill(
-                    leg_id,
-                    "cancelled",
-                    None,
-                    Decimal::ZERO,
-                    Decimal::ZERO,
-                    Decimal::ZERO,
-                    &json!({"message": message, "response": response, "envelope": envelope}),
-                )
-                .await?;
-        }
+        SubmitResult::NoMatch { message, .. } => (
+            "cancelled",
+            None,
+            json!({"kind":"no_match","message":message}),
+        ),
         SubmitResult::Unknown {
-            order_id,
-            envelope,
-            message,
-            ..
-        } => {
-            store
-                .update_leg_submitted(
-                    leg_id,
-                    "unknown",
-                    order_id.as_deref(),
-                    &json!({"message": message, "response": response, "envelope": envelope}),
-                )
-                .await?;
-        }
+            order_id, message, ..
+        } => (
+            "unknown",
+            order_id.as_deref(),
+            json!({"kind":"unknown","message":message}),
+        ),
         SubmitResult::Failed {
-            envelope,
-            status,
-            message,
-            ..
-        } => {
-            store
-                .update_leg_fill(
-                    leg_id,
-                    "failed",
-                    None,
-                    Decimal::ZERO,
-                    Decimal::ZERO,
-                    Decimal::ZERO,
-                    &json!({
-                        "reason": "http_status",
-                        "status": status,
-                        "message": message,
-                        "response": response,
-                        "envelope": envelope
-                    }),
-                )
-                .await?;
-        }
-    }
-    Ok(())
+            status, message, ..
+        } => (
+            "failed",
+            None,
+            json!({"kind":"rejected","http_status":status,"message":message}),
+        ),
+    };
+    store
+        .record_submission(leg_id, status, oid, &evidence, response)
+        .await
 }
 
 pub fn ack_fill(
@@ -2658,6 +2648,13 @@ fn format_place_error(err: &Error) -> String {
     }
 }
 
+fn needs_pm_fee_snapshot(fill: &TradeFill) -> bool {
+    fill.finality == crate::platforms::FillFinality::Confirmed
+        && fill.fee.is_none()
+        && fill.raw.get("role").and_then(Value::as_str) != Some("maker")
+        && fill.raw.get("fee_calculation").is_none()
+}
+
 fn filter_trades<'a>(
     trades: &'a [TradeFill],
     order_id: Option<&str>,
@@ -2667,164 +2664,6 @@ fn filter_trades<'a>(
         .iter()
         .filter(|t| t.matches(order_id, client_id))
         .collect()
-}
-
-async fn upsert_fill_rows(store: &Store, leg_id: i64, fills: &[&TradeFill]) -> Result<()> {
-    for fill in fills {
-        store
-            .upsert_fill(
-                leg_id,
-                fill.order_id.as_deref(),
-                if fill.trade_id.is_empty() {
-                    None
-                } else {
-                    Some(&fill.trade_id)
-                },
-                fill.shares,
-                fill.price,
-                fill.fee.unwrap_or(Decimal::ZERO),
-                fill.fee_rate_bps,
-                &fill.raw,
-            )
-            .await?;
-    }
-    Ok(())
-}
-
-fn fill_price_and_fee(fills: &[&TradeFill], fallback_price: Option<Decimal>) -> (Decimal, Decimal) {
-    let mut shares = Decimal::ZERO;
-    let mut notional = Decimal::ZERO;
-    let mut fee = Decimal::ZERO;
-    for fill in fills {
-        shares += fill.shares;
-        notional += fill.shares * fill.price;
-        fee += fill.fee.unwrap_or(Decimal::ZERO);
-    }
-    let price = if shares > Decimal::ZERO {
-        notional / shares
-    } else {
-        fallback_price.unwrap_or(Decimal::ZERO)
-    };
-    (price, fee)
-}
-
-async fn close_leg_cancelled(store: &Store, leg_id: i64, info: &serde_json::Value) -> Result<()> {
-    store
-        .update_leg_fill(
-            leg_id,
-            "cancelled",
-            None,
-            Decimal::ZERO,
-            Decimal::ZERO,
-            Decimal::ZERO,
-            info,
-        )
-        .await
-}
-
-async fn close_leg_matched(
-    store: &Store,
-    leg_id: i64,
-    third_order_id: Option<&str>,
-    shares: Decimal,
-    price: Decimal,
-    fee: Decimal,
-    info: &serde_json::Value,
-) -> Result<()> {
-    store
-        .update_leg_fill(leg_id, "matched", third_order_id, price, shares, fee, info)
-        .await
-}
-
-fn actual_fee_or_estimate(
-    actual_fee: Option<Decimal>,
-    platform: &str,
-    shares: Decimal,
-    price: Decimal,
-    fees: &FeeContext,
-) -> Decimal {
-    actual_fee.unwrap_or_else(|| estimate_taker_fee(platform, shares, price, fees))
-}
-
-async fn apply_fills(
-    store: &Store,
-    leg_id: i64,
-    platform: &str,
-    fills: &[&TradeFill],
-    fees: &FeeContext,
-) -> Result<()> {
-    let priced: Vec<TradeFill> = fills
-        .iter()
-        .map(|fill| {
-            let mut row = (*fill).clone();
-            row.fee = Some(actual_fee_or_estimate(
-                row.fee, platform, row.shares, row.price, fees,
-            ));
-            row
-        })
-        .collect();
-    let refs: Vec<&TradeFill> = priced.iter().collect();
-    upsert_fill_rows(store, leg_id, &refs).await?;
-    let (price, fee) = fill_price_and_fee(&refs, None);
-    let shares: Decimal = priced.iter().map(|f| f.shares).sum();
-    if shares <= Decimal::ZERO {
-        return Ok(());
-    }
-    close_leg_matched(
-        store,
-        leg_id,
-        priced.last().and_then(|f| f.order_id.as_deref()),
-        shares,
-        price,
-        fee,
-        &json!({
-            "source": "venue_fills",
-            "fills": priced.iter().map(|f| f.raw.clone()).collect::<Vec<_>>(),
-        }),
-    )
-    .await
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RemoteLegTerminal {
-    Matched,
-    Cancelled,
-}
-
-pub fn remote_leg_terminal(
-    poll: Option<&OrderPoll>,
-    has_positive_fills: bool,
-) -> Option<RemoteLegTerminal> {
-    if has_positive_fills {
-        return Some(RemoteLegTerminal::Matched);
-    }
-    let poll = poll?;
-    if !poll.found {
-        return None;
-    }
-    if poll.shares.filter(|v| *v > Decimal::ZERO).is_some() {
-        return Some(RemoteLegTerminal::Matched);
-    }
-    if is_terminal_no_fill_status(&poll.status) {
-        return Some(RemoteLegTerminal::Cancelled);
-    }
-    None
-}
-
-fn is_terminal_no_fill_status(status: &str) -> bool {
-    let s = status.to_ascii_lowercase().replace(['_', '-', ' '], "");
-    matches!(
-        s.as_str(),
-        "cancelled"
-            | "canceled"
-            | "expired"
-            | "unmatched"
-            | "rejected"
-            | "ioccancelrejected"
-            | "mintradentlrejected"
-            | "tickrejected"
-            | "marketordernoliquidityrejected"
-    ) || s.contains("ioccancel")
 }
 
 pub fn parent_terminal_status(has_open_legs: bool, positive_matched: bool) -> Option<&'static str> {
@@ -2838,42 +2677,7 @@ pub fn parent_terminal_status(has_open_legs: bool, positive_matched: bool) -> Op
 }
 
 pub async fn mark_orders_complete(store: &Store) -> Result<()> {
-    let completed: Vec<(i64,)> = sqlx::query_as(
-        "UPDATE arb_orders o SET status = 'completed', updated_at = NOW(), completed_at = NOW()
-         WHERE o.status = 'actived'
-           AND NOT EXISTS (
-             SELECT 1 FROM legs l
-             WHERE l.order_id = o.id AND l.status IN ('pending','unknown','actived')
-           )
-           AND EXISTS (
-             SELECT 1 FROM legs l
-             WHERE l.order_id = o.id AND l.status = 'matched' AND COALESCE(l.actual_shares, 0) > 0
-           )
-         RETURNING o.id",
-    )
-    .fetch_all(&store.pool)
-    .await?;
-    sqlx::query(
-        "UPDATE arb_orders o SET status = 'cancelled', rebalance_status = 'completed',
-                updated_at = NOW(), completed_at = NOW(), rebalanced_at = NOW()
-         WHERE o.status = 'actived'
-           AND NOT EXISTS (
-             SELECT 1 FROM legs l
-             WHERE l.order_id = o.id AND l.status IN ('pending','unknown','actived')
-           )
-           AND NOT EXISTS (
-             SELECT 1 FROM legs l
-             WHERE l.order_id = o.id AND l.status = 'matched' AND COALESCE(l.actual_shares, 0) > 0
-           )",
-    )
-    .execute(&store.pool)
-    .await?;
-    for (id,) in completed {
-        if let Err(err) = store.refresh_order_actuals(id).await {
-            tracing::warn!(order_id = id, error = %err, "refresh actuals failed");
-        }
-    }
-    Ok(())
+    store.complete_orders().await
 }
 
 fn resolve_hedge_pm_funder(
@@ -2892,6 +2696,7 @@ fn resolve_hedge_pm_funder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::calc::estimate_taker_fee;
     use rust_decimal::prelude::FromStr;
     use serde_json::json;
 
@@ -2911,6 +2716,8 @@ mod tests {
             price: d("0.4"),
             fee: Some(d("0.01")),
             fee_rate_bps: None,
+            fee_token: Some("USDC".into()),
+            finality: crate::platforms::FillFinality::Confirmed,
             raw: json!({"oid": order_id}),
         }
     }
@@ -3002,83 +2809,12 @@ mod tests {
     }
 
     #[test]
-    fn actual_fill_fee_wins_and_only_missing_fee_is_estimated() {
-        let fees = FeeContext {
-            polymarket_fee_rate: d("0.07"),
-            outcome_taker_rate: d("0.00035"),
-            extra_cost_multiplier: d("1.3"),
-        };
-        assert_eq!(
-            actual_fee_or_estimate(Some(d("0.01")), OUTCOME, d("100"), d("0.5"), &fees),
-            d("0.01")
-        );
-        assert_eq!(
-            actual_fee_or_estimate(Some(Decimal::ZERO), OUTCOME, d("100"), d("0.5"), &fees),
-            Decimal::ZERO,
-            "a reported zero fee is actual data, not a missing value"
-        );
-        assert_eq!(
-            actual_fee_or_estimate(None, OUTCOME, d("100"), d("0.5"), &fees),
-            d("0.02275")
-        );
-    }
-
-    #[test]
     fn parent_status_requires_positive_matched() {
         assert_eq!(parent_terminal_status(true, true), None);
         assert_eq!(parent_terminal_status(false, true), Some("completed"));
         assert_eq!(parent_terminal_status(false, false), Some("cancelled"));
         // 单腿 matched + 另一腿 cancelled：无 open 腿且有正成交 → completed
         assert_eq!(parent_terminal_status(false, true), Some("completed"));
-    }
-
-    fn poll(status: &str, found: bool, shares: Option<&str>) -> OrderPoll {
-        OrderPoll {
-            found,
-            status: status.into(),
-            order_id: Some("1".into()),
-            shares: shares.map(d),
-            price: Some(d("0.4")),
-            fee: None,
-            raw: json!({"status": status}),
-        }
-    }
-
-    #[test]
-    fn remote_terminal_cancelled_zero_fill() {
-        let p = poll("iocCancelRejected", true, None);
-        assert_eq!(
-            remote_leg_terminal(Some(&p), false),
-            Some(RemoteLegTerminal::Cancelled)
-        );
-        let p = poll("CANCELLED", true, None);
-        assert_eq!(
-            remote_leg_terminal(Some(&p), false),
-            Some(RemoteLegTerminal::Cancelled)
-        );
-        let p = poll("unmatched", true, Some("0"));
-        assert_eq!(
-            remote_leg_terminal(Some(&p), false),
-            Some(RemoteLegTerminal::Cancelled)
-        );
-    }
-
-    #[test]
-    fn remote_terminal_matched_on_fills_or_shares() {
-        let p = poll("open", true, None);
-        assert_eq!(
-            remote_leg_terminal(Some(&p), true),
-            Some(RemoteLegTerminal::Matched)
-        );
-        let p = poll("matched", true, Some("3"));
-        assert_eq!(
-            remote_leg_terminal(Some(&p), false),
-            Some(RemoteLegTerminal::Matched)
-        );
-        let p = poll("live", true, None);
-        assert_eq!(remote_leg_terminal(Some(&p), false), None);
-        let missing = poll("cancelled", false, None);
-        assert_eq!(remote_leg_terminal(Some(&missing), false), None);
     }
 
     #[test]

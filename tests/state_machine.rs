@@ -9,7 +9,9 @@
 
 use anyhow::{ensure, Result};
 use market_arb::domain::{MarketIdentity, TopicKey};
-use market_arb::store::{ArbOrderRow, NewLeg, Store};
+use market_arb::platforms::{FillFinality, OrderPoll, TradeFill};
+use market_arb::reconcile::{FillEvidence, LegResolution};
+use market_arb::store::{ArbOrderRow, LegRow, NewLeg, Store};
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
 use sqlx::{migrate::Migrator, postgres::PgPoolOptions, PgPool, Row};
@@ -136,6 +138,659 @@ impl MigrationFixture {
         result?;
         Ok(())
     }
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn reconciliation_pm_calculated_fee_retains_snapshot_without_fabricating_reported_fee() {
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let exercised: Result<()> = async {
+        let store = &fixture.store;
+        store.migrate().await?;
+        let (order_id, legs) = submitted_reconciliation_order(store, &["polymarket"]).await?;
+        let mut evidence = reconciliation_evidence("pm-fee-oid", "matched");
+        evidence.poll.associated_trades = vec!["fee-trade".into()];
+        evidence.poll.raw = json!({"associate_trades":["fee-trade"]});
+        let current = store
+            .record_order_poll(&legs[0], &evidence.poll)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("fee fixture lookup rejected"))?;
+        let mut fill = reconciliation_trade("pm-fee-oid", "fee-trade", 10, Decimal::ZERO);
+        fill.fee = None;
+        fill.fee_token = None;
+        fill.raw = json!({"role":"taker","fee_calculation":{
+            "source":"clob-markets","condition_id":"reconciliation-market","rate":"0.07",
+            "observed_at_ms":123,"currency":"pUSD","valuation":"1 USD",
+            "rounding":"midpoint_away_from_zero_5dp"
+        }});
+        let result = store
+            .record_reconciliation(&current, &[fill], &evidence, &json!({}))
+            .await?;
+        ensure!(matches!(result,LegResolution::Terminal{fee,..} if fee==Decimal::new(168,3)));
+        let stored = fill_snapshots(&store.pool, current.id).await?;
+        ensure!(stored.len() == 1 && stored[0]["fee"].is_null());
+        ensure!(stored[0].pointer("/raw/accounting/source") == Some(&json!("calculated")));
+        ensure!(
+            stored[0].pointer("/raw/reconciliation_v1/raw/fee_calculation/rate")
+                == Some(&json!("0.07"))
+        );
+        let parent = order_snapshot(&store.pool, order_id).await?;
+        ensure!(parent["status"] == "completed" && parent["actual_cost"] == json!(4.168));
+        Ok(())
+    }
+    .await;
+    fixture.cleanup().await.expect("clean up fee schema");
+    exercised.expect("calculated fee uses documented rate-only formula and preserves provenance");
+}
+
+// Reconciliation fixtures always use MigrationFixture's private schema, including fault injection.
+async fn submitted_reconciliation_order(
+    store: &Store,
+    platforms: &[&str],
+) -> Result<(i64, Vec<LegRow>)> {
+    let mut identity = MarketIdentity::new(platforms[0], "reconciliation-market")?;
+    for platform in &platforms[1..] {
+        identity.insert(*platform, "reconciliation-market")?;
+    }
+    let legs: Vec<_> = platforms
+        .iter()
+        .enumerate()
+        .map(|(index, platform)| NewLeg {
+            platform,
+            token_id: if index == 0 { "test-yes" } else { "test-no" },
+            label: if index == 0 { "yes" } else { "no" },
+            req_price: Decimal::new(4, 1),
+            req_shares: Decimal::from(10),
+            // Deliberately unrelated to actual trade fees: request estimates must not enter accounting.
+            req_fee: Decimal::from(99),
+            ..identity_probe_leg()
+        })
+        .collect();
+    let (order_id, ids) = store
+        .insert_actived_order_with_legs(
+            TopicKey::new(Uuid::new_v4(), 0),
+            &identity,
+            "reconciliation integration test",
+            "reconciliation integration test",
+            None,
+            Decimal::from(10),
+            Decimal::ONE,
+            Decimal::from(9),
+            &json!([]),
+            &legs,
+        )
+        .await?;
+    for id in &ids {
+        let client_id = format!("reconciliation-client-{id}");
+        store
+            .insert_envelope(
+                *id,
+                &client_id,
+                &json!({"cloid": client_id}),
+                &json!({"test": "unsigned fixture"}),
+                None,
+            )
+            .await?;
+    }
+    let rows = store
+        .open_legs()
+        .await?
+        .into_iter()
+        .filter(|leg| ids.contains(&leg.id))
+        .collect();
+    Ok((order_id, rows))
+}
+
+async fn reconciliation_open_leg(store: &Store, id: i64) -> Result<LegRow> {
+    store
+        .open_legs()
+        .await?
+        .into_iter()
+        .find(|leg| leg.id == id)
+        .ok_or_else(|| anyhow::anyhow!("expected open leg {id}"))
+}
+
+async fn leg_snapshot(pool: &PgPool, leg_id: i64) -> Result<Value> {
+    Ok(
+        sqlx::query_scalar("SELECT to_jsonb(l) FROM legs l WHERE id = $1")
+            .bind(leg_id)
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+async fn fill_snapshots(pool: &PgPool, leg_id: i64) -> Result<Vec<Value>> {
+    Ok(
+        sqlx::query_scalar("SELECT to_jsonb(f) FROM fills f WHERE leg_id = $1 ORDER BY trade_id")
+            .bind(leg_id)
+            .fetch_all(pool)
+            .await?,
+    )
+}
+
+fn reconciliation_trade(oid: &str, trade_id: &str, shares: i64, fee: Decimal) -> TradeFill {
+    TradeFill {
+        trade_id: trade_id.into(),
+        order_id: Some(oid.into()),
+        order_ids: vec![oid.into()],
+        coin: None,
+        shares: Decimal::from(shares),
+        price: Decimal::new(4, 1),
+        fee: Some(fee),
+        fee_rate_bps: None,
+        fee_token: Some("USDC".into()),
+        finality: FillFinality::Confirmed,
+        raw: json!({"oid": oid, "tid": trade_id}),
+    }
+}
+
+fn reconciliation_evidence(oid: &str, status: &str) -> FillEvidence {
+    FillEvidence {
+        poll: OrderPoll {
+            found: true,
+            status: status.into(),
+            order_id: Some(oid.into()),
+            shares: Some(Decimal::from(10)),
+            original_shares: Some(Decimal::from(10)),
+            raw: json!({"status": status}),
+            ..OrderPoll::default()
+        },
+        page_complete: true,
+        history_complete: true,
+        expected_shares: None,
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn reconciliation_ack_waits_for_real_outcome_fills_and_actual_fees() {
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let exercised: Result<()> = async {
+        let store = &fixture.store;
+        store.migrate().await?;
+        let (order_id, legs) =
+            submitted_reconciliation_order(store, &["outcome", "polymarket"]).await?;
+        for leg in &legs {
+            store
+                .record_submission(
+                    leg.id,
+                    "actived",
+                    Some(&format!("oid-{}", leg.id)),
+                    &json!({"kind":"ack","expected_shares":"10"}),
+                    &json!({"filled":{"totalSz":"10","avgPx":"0.4"}}),
+                )
+                .await?;
+            let ack = leg_snapshot(&store.pool, leg.id).await?;
+            ensure!(ack["status"] == "actived" && ack["actual_shares"].is_null());
+            ensure!(!ack["submitted_at"].is_null());
+            ensure!(
+                fill_snapshots(&store.pool, leg.id).await?.is_empty(),
+                "ACK must not create a fill"
+            );
+        }
+        store.complete_orders().await?;
+        ensure!(store.open_legs().await?.len() == 2);
+        ensure!(order_snapshot(&store.pool, order_id).await?["status"] == "actived");
+
+        // Emulate an old release's placeholder only inside the private test schema.
+        sqlx::query(
+            "INSERT INTO fills(leg_id,third_order_id,trade_id,shares,price,fee,raw)
+                     VALUES($1,$2,'ack:legacy',999,0.99,99,'{}')",
+        )
+        .bind(legs[0].id)
+        .bind(format!("oid-{}", legs[0].id))
+        .execute(&store.pool)
+        .await?;
+        for (index, leg) in legs.iter().enumerate() {
+            let oid = format!("oid-{}", leg.id);
+            let mut evidence = reconciliation_evidence(&oid, "filled");
+            if leg.platform == "polymarket" {
+                evidence.poll.status = "matched".into();
+                evidence.poll.associated_trades = vec!["real-trade".into()];
+                evidence.poll.raw = json!({"associate_trades":["real-trade"]});
+            }
+            let current = reconciliation_open_leg(store, leg.id).await?;
+            let mut current = store
+                .record_order_poll(&current, &evidence.poll)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("fresh order poll rejected"))?;
+            let fee = if index == 0 {
+                Decimal::new(17, 2)
+            } else {
+                Decimal::new(3, 2)
+            };
+            let mut fill = reconciliation_trade(&oid, "real-trade", 10, fee);
+            if index == 0 {
+                fill.fee = None;
+                fill.fee_rate_bps = Some(Decimal::from(500));
+                let missing_fee = store
+                    .record_reconciliation(
+                        &current,
+                        &[fill.clone()],
+                        &evidence,
+                        &json!({"cursor":"fees-pending"}),
+                    )
+                    .await?;
+                ensure!(missing_fee == LegResolution::Pending("fee_evidence_missing"));
+                ensure!(leg_snapshot(&store.pool, leg.id).await?["actual_shares"].is_null());
+                current = reconciliation_open_leg(store, leg.id).await?;
+                fill.fee = Some(fee);
+            } else {
+                fill.price = Decimal::new(55, 2);
+            }
+            let resolved = store
+                .record_reconciliation(&current, &[fill], &evidence, &json!({"complete":true}))
+                .await?;
+            ensure!(matches!(resolved, LegResolution::Terminal {
+                status: "matched", shares, fee: actual_fee, ref fee_sources, ..
+            } if shares == Decimal::from(10) && actual_fee == fee && fee_sources == &["actual"]));
+            if index == 0 {
+                ensure!(
+                    order_snapshot(&store.pool, order_id).await?["status"] == "actived",
+                    "parent must wait for its second leg"
+                );
+            }
+        }
+        let parent = order_snapshot(&store.pool, order_id).await?;
+        ensure!(parent["status"] == "completed" && !parent["completed_at"].is_null());
+        ensure!(
+            parent["actual_cost"] == json!(9.7)
+                && parent["actual_rev"] == json!(10.0)
+                && parent["actual_profit"] == json!(0.3),
+            "actual accounting: {parent}"
+        );
+        ensure!(store.open_legs().await?.is_empty());
+        let fills = fill_snapshots(&store.pool, legs[0].id).await?;
+        ensure!(fills.len() == 2 && fills[0]["trade_id"] == "ack:legacy");
+        let terminal = leg_snapshot(&store.pool, legs[0].id).await?;
+        ensure!(terminal["actual_shares"] == json!(10.0) && terminal["actual_fee"] == json!(0.17));
+        store.complete_orders().await?;
+        ensure!(order_snapshot(&store.pool, order_id).await? == parent);
+        Ok(())
+    }
+    .await;
+    fixture
+        .cleanup()
+        .await
+        .expect("clean up reconciliation schema");
+    exercised.expect("ACK remains open until real fills and actual fees close both legs");
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn reconciliation_pm_accumulates_pages_and_only_accounts_confirmed_trades() {
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let exercised: Result<()> = async {
+        let store = &fixture.store;
+        store.migrate().await?;
+        let (order_id, legs) = submitted_reconciliation_order(store, &["polymarket"]).await?;
+        let id = legs[0].id;
+        store.record_submission(id, "actived", Some("pm-oid"), &json!({"kind":"ack"}), &json!({"ack":true})).await?;
+        let mut evidence = reconciliation_evidence("pm-oid", "matched");
+        evidence.poll.associated_trades = vec!["a".into(), "b".into(), "c".into()];
+        evidence.poll.raw = json!({"associate_trades":["a","b","c"]});
+        evidence.page_complete = false;
+        let current = reconciliation_open_leg(store, id).await?;
+        let current = store.record_order_poll(&current, &evidence.poll).await?
+            .ok_or_else(|| anyhow::anyhow!("fresh PM poll rejected"))?;
+        let mut a = reconciliation_trade("pm-oid", "a", 4, Decimal::new(2, 2));
+        let mut b = reconciliation_trade("pm-oid", "b", 3, Decimal::from(99));
+        let mut c = reconciliation_trade("pm-oid", "c", 3, Decimal::from(99));
+        a.finality = FillFinality::Pending;
+        b.finality = FillFinality::Pending;
+        let pending_a = a.clone();
+        ensure!(matches!(store.record_reconciliation(&current, &[a.clone(), b.clone()], &evidence,
+            &json!({"cursor":"page-2"})).await?, LegResolution::Pending(_)));
+        ensure!(leg_snapshot(&store.pool, id).await?["actual_shares"].is_null());
+        a.finality = FillFinality::Confirmed;
+        let current = reconciliation_open_leg(store, id).await?;
+        ensure!(current.last_order_info.as_ref().unwrap()["fill_progress"]["cursor"] == "page-2");
+        ensure!(matches!(store.record_reconciliation(&current, &[a.clone(), a.clone(), b.clone()], &evidence,
+            &json!({"cursor":"page-3"})).await?, LegResolution::Pending(_)));
+        ensure!(fill_snapshots(&store.pool, id).await?.len() == 2, "repeated page/trade must upsert once");
+        c.finality = FillFinality::Failed;
+        evidence.page_complete = true;
+        let current = reconciliation_open_leg(store, id).await?;
+        ensure!(matches!(store.record_reconciliation(&current, &[c], &evidence,
+            &json!({"complete":true})).await?, LegResolution::Pending(_)));
+        ensure!(order_snapshot(&store.pool, order_id).await?["status"] == "actived");
+        b.finality = FillFinality::Failed;
+        let current = reconciliation_open_leg(store, id).await?;
+        let resolved = store.record_reconciliation(&current, &[b, pending_a], &evidence,
+            &json!({"complete":true})).await?;
+        ensure!(matches!(resolved, LegResolution::Terminal {status:"matched", shares, fee, ..}
+            if shares == Decimal::from(4) && fee == Decimal::new(2, 2)));
+        let fills = fill_snapshots(&store.pool, id).await?;
+        ensure!(fills.len() == 3);
+        ensure!(fills[0]["raw"]["reconciliation_v1"]["finality"] == "confirmed",
+            "late pending observation must not downgrade confirmed trade");
+        ensure!(fills[1]["raw"]["reconciliation_v1"]["finality"] == "failed"
+            && fills[2]["raw"]["reconciliation_v1"]["finality"] == "failed");
+        let parent = order_snapshot(&store.pool, order_id).await?;
+        ensure!(parent["status"] == "completed" && parent["actual_cost"] == json!(1.62));
+
+        let (failed_parent, failed_legs) = submitted_reconciliation_order(store, &["polymarket"]).await?;
+        let mut evidence = reconciliation_evidence("pm-failed", "matched");
+        evidence.poll.associated_trades = vec!["failed".into()];
+        evidence.poll.raw = json!({"associate_trades":["failed"]});
+        let leg = store.record_order_poll(&failed_legs[0], &evidence.poll).await?
+            .ok_or_else(|| anyhow::anyhow!("all-failed poll rejected"))?;
+        let mut fill = reconciliation_trade("pm-failed", "failed", 10, Decimal::from(99));
+        fill.finality = FillFinality::Failed;
+        ensure!(matches!(store.record_reconciliation(&leg, &[fill], &evidence, &json!({})).await?,
+            LegResolution::Terminal {status:"failed", shares, fee, ..} if shares.is_zero() && fee.is_zero()));
+        let parent = order_snapshot(&store.pool, failed_parent).await?;
+        ensure!(parent["status"] == "cancelled" && parent["actual_cost"] == json!(0.0));
+        Ok(())
+    }.await;
+    fixture
+        .cleanup()
+        .await
+        .expect("clean up reconciliation schema");
+    exercised.expect(
+        "PM observations accumulate monotonically without counting failed or duplicate fills",
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn reconciliation_rejects_stale_snapshots_and_audits_late_submission_responses() {
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let exercised: Result<()> = async {
+        let store = &fixture.store;
+        store.migrate().await?;
+        let (order_id, legs) = submitted_reconciliation_order(store, &["outcome"]).await?;
+        let stale = &legs[0];
+        let evidence = reconciliation_evidence("durable-oid", "filled");
+        let current = store
+            .record_order_poll(stale, &evidence.poll)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("fresh poll rejected"))?;
+        let before = leg_snapshot(&store.pool, stale.id).await?;
+        ensure!(current.updated_at != stale.updated_at);
+        let mut old_poll = evidence.poll.clone();
+        old_poll.status = "open".into();
+        ensure!(store.record_order_poll(stale, &old_poll).await?.is_none());
+        let old_fill =
+            reconciliation_trade("durable-oid", "old-observation", 10, Decimal::from(99));
+        ensure!(
+            store
+                .record_reconciliation(stale, &[old_fill], &evidence, &json!({"cursor":"old"}))
+                .await?
+                == LegResolution::Pending("stale_leg_snapshot")
+        );
+        ensure!(leg_snapshot(&store.pool, stale.id).await? == before);
+        ensure!(fill_snapshots(&store.pool, stale.id).await?.is_empty());
+        let fill = reconciliation_trade("durable-oid", "confirmed", 10, Decimal::new(5, 2));
+        ensure!(matches!(
+            store
+                .record_reconciliation(&current, &[fill], &evidence, &json!({"complete":true}))
+                .await?,
+            LegResolution::Terminal {
+                status: "matched",
+                ..
+            }
+        ));
+        let terminal = leg_snapshot(&store.pool, stale.id).await?;
+        let parent = order_snapshot(&store.pool, order_id).await?;
+        let fills = fill_snapshots(&store.pool, stale.id).await?;
+        for (status, kind) in [
+            ("actived", "ack"),
+            ("unknown", "unknown"),
+            ("cancelled", "no_match"),
+            ("failed", "rejected"),
+        ] {
+            let response = json!({"late":kind,"raw_response":"retained"});
+            store
+                .record_submission(
+                    stale.id,
+                    status,
+                    Some("durable-oid"),
+                    &json!({"kind":kind}),
+                    &response,
+                )
+                .await?;
+            let audited: Value =
+                sqlx::query_scalar("SELECT submit_response FROM signed_envelopes WHERE leg_id=$1")
+                    .bind(stale.id)
+                    .fetch_one(&store.pool)
+                    .await?;
+            ensure!(
+                audited == response,
+                "late {kind} response must remain auditable"
+            );
+            ensure!(
+                leg_snapshot(&store.pool, stale.id).await? == terminal,
+                "late {kind} changed terminal leg"
+            );
+            ensure!(order_snapshot(&store.pool, order_id).await? == parent);
+            ensure!(fill_snapshots(&store.pool, stale.id).await? == fills);
+        }
+        Ok(())
+    }
+    .await;
+    fixture
+        .cleanup()
+        .await
+        .expect("clean up reconciliation schema");
+    exercised
+        .expect("stale workers and late submission responses cannot overwrite terminal accounting");
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn reconciliation_recovered_oid_is_durable_and_matches_same_round_fills_without_cloid() {
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let exercised: Result<()> = async {
+        let store = &fixture.store;
+        store.migrate().await?;
+        let (order_id, legs) = submitted_reconciliation_order(store, &["outcome"]).await?;
+        let id = legs[0].id;
+        store
+            .record_submission(
+                id,
+                "unknown",
+                None,
+                &json!({"kind":"unknown"}),
+                &json!({"timeout":true}),
+            )
+            .await?;
+        let before = reconciliation_open_leg(store, id).await?;
+        ensure!(before.third_order_id.is_none());
+        let mut evidence = reconciliation_evidence("recovered-oid", "filled");
+        evidence.poll.client_order_id = before.client_order_id.clone();
+        evidence.poll.coin = Some(before.token_id.clone());
+        let recovered = store
+            .record_order_poll(&before, &evidence.poll)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("recovery poll rejected"))?;
+        // A later fill HTTP failure cannot roll back the already committed order lookup.
+        let reloaded = reconciliation_open_leg(
+            &Store {
+                pool: store.pool.clone(),
+            },
+            id,
+        )
+        .await?;
+        ensure!(reloaded.third_order_id.as_deref() == Some("recovered-oid"));
+        ensure!(reloaded.submitted_at == before.submitted_at && reloaded.status == "actived");
+        ensure!(
+            reloaded.last_order_info.as_ref().unwrap()["order_poll"]["order_id"] == "recovered-oid"
+        );
+        let fill = reconciliation_trade("recovered-oid", "oid-only-trade", 10, Decimal::new(7, 2));
+        ensure!(fill.raw.get("cloid").is_none());
+        ensure!(!fill.matches(
+            before.third_order_id.as_deref(),
+            before.client_order_id.as_deref()
+        ));
+        let matched: Vec<_> = [fill]
+            .into_iter()
+            .filter(|fill| {
+                fill.matches(
+                    recovered.third_order_id.as_deref(),
+                    recovered.client_order_id.as_deref(),
+                )
+            })
+            .collect();
+        ensure!(
+            matched.len() == 1,
+            "same round must use recovered oid, not its pre-poll snapshot"
+        );
+        ensure!(matches!(
+            store
+                .record_reconciliation(&recovered, &matched, &evidence, &json!({"complete":true}))
+                .await?,
+            LegResolution::Terminal {
+                status: "matched",
+                ..
+            }
+        ));
+        ensure!(order_snapshot(&store.pool, order_id).await?["status"] == "completed");
+        ensure!(fill_snapshots(&store.pool, id).await?.len() == 1);
+        Ok(())
+    }
+    .await;
+    fixture
+        .cleanup()
+        .await
+        .expect("clean up reconciliation schema");
+    exercised.expect("recovered order id survives and associates oid-only fills in the same round");
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn reconciliation_sql_failures_roll_back_fills_leg_and_parent_before_retry() {
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let exercised: Result<()> = async {
+        let store = &fixture.store;
+        store.migrate().await?;
+        for table in ["legs", "arb_orders"] {
+            let (order_id, legs) = submitted_reconciliation_order(store, &["outcome"]).await?;
+            let id = legs[0].id;
+            let evidence = reconciliation_evidence(&format!("fault-oid-{id}"), "filled");
+            let current = store.record_order_poll(&legs[0], &evidence.poll).await?
+                .ok_or_else(|| anyhow::anyhow!("fault fixture poll rejected"))?;
+            let fill = reconciliation_trade(evidence.poll.order_id.as_deref().unwrap(), "real", 10, Decimal::new(7, 2));
+            let leg_before = leg_snapshot(&store.pool, id).await?;
+            let parent_before = order_snapshot(&store.pool, order_id).await?;
+            let fills_before = fill_snapshots(&store.pool, id).await?;
+            // These generated identifiers and row ids belong exclusively to this private schema.
+            // First fail after fill insertion; then fail after the leg's actuals were updated.
+            let constraint = format!("reconciliation_fault_{table}");
+            let check = if table == "legs" {
+                format!("id <> {id} OR status <> 'matched'")
+            } else {
+                format!("id <> {order_id} OR actual_cost = 0")
+            };
+            sqlx::query(&format!("ALTER TABLE {table} ADD CONSTRAINT {constraint} CHECK ({check})"))
+                .execute(&store.pool).await?;
+            let rejected = store.record_reconciliation(&current, &[fill.clone()], &evidence, &json!({"cursor":"must-roll-back"})).await;
+            ensure!(matches!(&rejected, Err(market_arb::error::Error::Sqlx(sqlx::Error::Database(err)))
+                if err.code().as_deref() == Some("23514") && err.constraint() == Some(constraint.as_str())),
+                "expected injected {table} constraint failure, got {rejected:?}");
+            ensure!(fill_snapshots(&store.pool, id).await? == fills_before, "{table} failure leaked fill");
+            ensure!(leg_snapshot(&store.pool, id).await? == leg_before, "{table} failure leaked leg/progress update");
+            ensure!(order_snapshot(&store.pool, order_id).await? == parent_before, "{table} failure leaked parent actuals");
+            sqlx::query(&format!("ALTER TABLE {table} DROP CONSTRAINT {constraint}"))
+                .execute(&store.pool).await?;
+            // The original snapshot must still be valid because every preceding write rolled back.
+            ensure!(matches!(store.record_reconciliation(&current, &[fill], &evidence, &json!({"complete":true})).await?,
+                LegResolution::Terminal {status:"matched", ..}));
+            ensure!(fill_snapshots(&store.pool, id).await?.len() == 1);
+            let parent = order_snapshot(&store.pool, order_id).await?;
+            ensure!(parent["status"] == "completed" && parent["actual_cost"] == json!(4.07));
+            store.complete_orders().await?;
+            ensure!(order_snapshot(&store.pool, order_id).await? == parent);
+        }
+        Ok(())
+    }.await;
+    fixture
+        .cleanup()
+        .await
+        .expect("clean up reconciliation schema");
+    exercised.expect("SQL faults at both accounting stages roll back and permit exact retry");
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn reconciliation_timeouts_use_first_submission_and_history_stays_frozen() {
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let exercised: Result<()> = async {
+        let store = &fixture.store;
+        store.migrate().await?;
+        let (order_id, legs) = submitted_reconciliation_order(store, &["outcome", "outcome"]).await?;
+        // Time travel only this fixture's rows; recent creation/updates must not reset submission age.
+        sqlx::query("UPDATE legs SET submitted_at=NOW()-INTERVAL '2 hours', created_at=NOW(), updated_at=NOW() WHERE order_id=$1")
+            .bind(order_id).execute(&store.pool).await?;
+        let first = reconciliation_open_leg(store, legs[0].id).await?.submitted_at;
+        store.record_submission(legs[0].id, "unknown", None, &json!({"kind":"unknown"}), &json!({"timeout":true})).await?;
+        store.record_submission(legs[1].id, "actived", Some("partial-oid"), &json!({"kind":"ack"}), &json!({"ack":true})).await?;
+        let evidence = reconciliation_evidence("partial-oid", "filled");
+        let current = reconciliation_open_leg(store, legs[1].id).await?;
+        let current = store.record_order_poll(&current, &evidence.poll).await?
+            .ok_or_else(|| anyhow::anyhow!("partial fill poll rejected"))?;
+        let partial = reconciliation_trade("partial-oid", "partial", 2, Decimal::new(1, 2));
+        ensure!(matches!(store.record_reconciliation(&current, &[partial], &evidence, &json!({"cursor":"remaining"})).await?,
+            LegResolution::Pending(_)));
+        for leg in &legs {
+            store.record_submission(leg.id, "unknown", None, &json!({"kind":"unknown","retry":true}), &json!({"retry":true})).await?;
+            ensure!(reconciliation_open_leg(store, leg.id).await?.submitted_at == first);
+        }
+        ensure!(store.insert_envelope(legs[0].id, "retry-must-not-reset", &json!({}), &json!({}), None).await.is_err());
+        let (recent_id, _) = submitted_reconciliation_order(store, &["outcome"]).await?;
+        sqlx::query("UPDATE legs SET created_at=NOW()-INTERVAL '2 hours' WHERE order_id=$1")
+            .bind(recent_id).execute(&store.pool).await?;
+        ensure!(store.fail_stale_pending_unsubmitted(std::time::Duration::from_secs(60)).await? == 0);
+        ensure!(store.promote_submitted_pending_to_unknown().await? == 1);
+        let before: Vec<_> = store.open_legs().await?;
+        let timeout = std::time::Duration::from_secs(60);
+        let stale = store.stale_unknown_legs(timeout).await?;
+        ensure!(stale.iter().map(|leg| leg.id).collect::<Vec<_>>() == legs.iter().map(|leg| leg.id).collect::<Vec<_>>());
+        ensure!(store.count_stale_unknown_legs(timeout).await? == 2);
+        ensure!(before[0].status == "unknown" && before[1].status == "actived");
+        ensure!(fill_snapshots(&store.pool, legs[1].id).await?.len() == 1, "partial observation must survive timeout");
+        let parent = order_snapshot(&store.pool, order_id).await?;
+        store.complete_orders().await?;
+        ensure!(order_snapshot(&store.pool, order_id).await? == parent && parent["status"] == "actived");
+
+        for position in ["closed", "settled"] {
+            let (historical_id, historical_legs) = submitted_reconciliation_order(store, &["outcome"]).await?;
+            let leg = &historical_legs[0];
+            // Historical settlement evidence must satisfy the same all-or-none constraint as production.
+            sqlx::query("UPDATE arb_orders SET position_status=$2, settled_at=CASE WHEN $2='settled' THEN NOW() ELSE NULL END,
+                         settlement_source=CASE WHEN $2='settled' THEN 'historical-fixture' ELSE NULL END,
+                         settlement_result=CASE WHEN $2='settled' THEN '{\"settled\":true}'::jsonb ELSE NULL END,
+                         actual_cost=123, actual_rev=456, actual_profit=333 WHERE id=$1")
+                .bind(historical_id).bind(position).execute(&store.pool).await?;
+            sqlx::query("INSERT INTO fills(leg_id,third_order_id,trade_id,shares,price,fee) VALUES($1,'historical-oid','ack:historical',999,0.9,99)")
+                .bind(leg.id).execute(&store.pool).await?;
+            let historical_parent = order_snapshot(&store.pool, historical_id).await?;
+            let historical_leg = leg_snapshot(&store.pool, leg.id).await?;
+            let historical_fills = fill_snapshots(&store.pool, leg.id).await?;
+            let evidence = reconciliation_evidence("historical-oid", "filled");
+            store.record_submission(leg.id, "actived", Some("historical-oid"), &json!({"kind":"ack"}), &json!({"late":true})).await?;
+            ensure!(store.record_order_poll(leg, &evidence.poll).await?.is_none());
+            ensure!(matches!(store.record_reconciliation(leg, &[reconciliation_trade("historical-oid", "late-trade", 10, Decimal::ZERO)],
+                &evidence, &json!({})).await?, LegResolution::Pending(_)));
+            store.migrate().await?;
+            store.complete_orders().await?;
+            ensure!(leg_snapshot(&store.pool, leg.id).await? == historical_leg);
+            ensure!(order_snapshot(&store.pool, historical_id).await? == historical_parent);
+            ensure!(fill_snapshots(&store.pool, leg.id).await? == historical_fills);
+            // Also force the completion scanner's all-terminal path over a historical parent.
+            sqlx::query("UPDATE legs SET status='matched',actual_shares=10,actual_price=0.4,actual_fee=0.1 WHERE id=$1")
+                .bind(leg.id).execute(&store.pool).await?;
+            store.complete_orders().await?;
+            ensure!(order_snapshot(&store.pool, historical_id).await? == historical_parent,
+                "{position} historical actuals must never be recomputed");
+        }
+        Ok(())
+    }.await;
+    fixture
+        .cleanup()
+        .await
+        .expect("clean up reconciliation schema");
+    exercised.expect("submission age controls alerts including partial fills, without rewriting closed/settled history");
 }
 
 async fn position_status_width(pool: &PgPool) -> Result<i32> {

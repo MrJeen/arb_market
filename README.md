@@ -32,6 +32,18 @@ cargo run --release
 
 应用 0009 后，回退构建必须仍支持 pending 并嵌入相同内容的 0009；直接换回缺少该迁移的旧二进制会被 sqlx 版本校验拒绝。不要通过缩回列宽、删除迁移记录或绕过校验来回退。
 
+## 成交确认与恢复
+
+ACK 仅记录已受理及预期撮合量，交易腿保留 `actived`，不生成 `ack:` 伪成交或暂估实际费用。Polymarket 必须取齐订单关联的成交并等待 `CONFIRMED`／`FAILED` 最终状态；只有 `CONFIRMED` 部分计入仓位，`MATCHED`、`MINED`、`RETRYING` 和未知状态继续等待。订单查询中的正撮合量不替代成交确认。
+
+Outcome 丢失 ACK 时使用已持久化的 cloid 查询真实 oid；数字 oid 以 JSON 整数发送，cloid 以字符串发送。成交历史使用首次提交前 30 秒到本轮固定终点的时间窗口查询，每次最多读一页，已成功页面和下一游标一起落库。同毫秒饱和、历史保留窗口不足或无法证明零成交时继续核对，不把查询不到／空页／超时解释成零成交。
+
+真实成交、分页进度、交易腿最终账务及父单完成通过事务落库；重复页和重启重放按真实成交 ID 去重。迟到 ACK／Unknown 不覆盖终态，旧 `ack:` 行保留但不参与新汇总。此次逻辑仅处理开放腿与新订单，历史终态订单不会自动重开或重算。
+
+`UNKNOWN_LEG_TIMEOUT_SECS` 同时覆盖 `unknown` 和确认中的 `actived`，按首次提交时间计时，已有部分成交或持续重试不会推迟告警。超时仅告警、暂停新套利并继续回填，不清零成交。等待 PM 链上确认也会延后父单完成和生命周期 claim 释放。
+
+**费用口径：** 明确提供金额且币种为 USDC（PM 也接受 pUSD）的费用按原值入账，包含显式 0；Outcome `fee` 已含 builderFee，不重复叠加。PM maker 的官方零费规则记录为 `calculated_maker_zero`。PM taker 未返回实扣金额时，查询 `/clob-markets/{condition_id}` 的 `fd.r`，按[官方费用公式](https://docs.polymarket.com/trading/fees) `shares × rate × price × (1-price)` 逐笔计算，不读取或使用指数参数，五位小数四舍五入，不乘策略 1.3 安全倍率，来源记录为 `calculated`。该政策明确假设所查 schedule 适用于该成交、pUSD 按 1 美元计价；计算金额不是交易所实扣证明。费率、查询时点及币种／舍入政策保存在成交证据中，`fills.fee` 没有实扣值时保持 NULL；终态后不自动重新估费。缺少／畸形 schedule、非支持币种等仍保留 `fee_evidence_missing` 或查询错误并告警，不用缺字段推断零费。
+
 ## 市场与结算口径
 
 common 数据库提供给本服务的统一事件视为已经完成业务筛选的二元市场。Outcome 结算遵循 HIP-4 原始分数兑付：side 0 每股兑付 `settleFraction`，side 1 每股兑付 `1-settleFraction`，两侧合计为 1；`0.5` 时两侧各兑付 0.5。分数必须位于 `[0,1]`，缺字段、不可解析或越界值不会落为已结算。

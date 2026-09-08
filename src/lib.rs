@@ -8,6 +8,7 @@ pub mod exec;
 pub mod hedge;
 pub mod notify;
 pub mod platforms;
+pub mod reconcile;
 pub mod settlement;
 pub mod signing;
 pub mod stats;

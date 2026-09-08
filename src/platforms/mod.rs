@@ -79,7 +79,15 @@ pub fn submit_http_error_response(err: &crate::error::Error) -> Value {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FillFinality {
+    Pending,
+    Confirmed,
+    Failed,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TradeFill {
     pub trade_id: String,
     pub order_id: Option<String>,
@@ -91,7 +99,18 @@ pub struct TradeFill {
     /// `Some(0)` 是可信的零手续费，不能与缺失混淆。
     pub fee: Option<Decimal>,
     pub fee_rate_bps: Option<Decimal>,
+    pub fee_token: Option<String>,
+    pub finality: FillFinality,
     pub raw: Value,
+}
+
+/// 一次有界查询的结果。complete 只表示分页完成，不能替代订单终态或历史覆盖证据。
+#[derive(Debug, Clone)]
+pub struct FillPage {
+    pub fills: Vec<TradeFill>,
+    pub progress: Value,
+    pub complete: bool,
+    pub history_complete: bool,
 }
 
 impl TradeFill {
@@ -142,14 +161,20 @@ pub fn ioc_fill(shares: Option<Decimal>, price: Option<Decimal>) -> Option<(Deci
     Some((shares, price))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OrderPoll {
     pub found: bool,
     pub status: String,
     pub order_id: Option<String>,
+    /// 平台明确提供的已撮合量，不代表链上最终成交量。
     pub shares: Option<Decimal>,
     pub price: Option<Decimal>,
     pub fee: Option<Decimal>,
+    pub original_shares: Option<Decimal>,
+    pub remaining_shares: Option<Decimal>,
+    pub client_order_id: Option<String>,
+    pub coin: Option<String>,
+    pub associated_trades: Vec<String>,
     pub raw: Value,
 }
 

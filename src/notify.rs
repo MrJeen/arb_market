@@ -161,7 +161,7 @@ pub fn format_take_profit_completed_notice(
     notice: &TakeProfitCompletedNotice,
 ) -> String {
     format!(
-        "✅ {tag}止盈完成\n📋 orderId: {}\n📋 title: {}\n💰 actual profit: {}\n💰 actual cost: {}",
+        "✅ {tag}止盈完成\n📋 orderId: {}\n📋 title: {}\n💰 actual profit: {}\n💰 actual cost: {}\nℹ️ 入账口径可能含标记的手续费估算",
         notice.order_id,
         escape_markdown(&notice.title),
         notice.actual_profit.normalize(),
@@ -178,6 +178,7 @@ pub fn format_settlement_notice(tag: &str, notice: &SettlementNotice) -> String 
     ];
     if let Some(actual_profit) = notice.actual_profit {
         lines.push(format!("💰 actual profit: {}", actual_profit.normalize()));
+        lines.push("ℹ️ 入账口径可能含标记的手续费估算".into());
     }
     lines.join("\n")
 }
@@ -189,7 +190,7 @@ pub fn format_order_actuals_notice(
     actual_cost: Decimal,
 ) -> String {
     format!(
-        "{tag}订单 {order_id} 实际收益 {}，实际成本 {}",
+        "{tag}订单 {order_id} 入账收益 {}，入账成本 {}（可能含标记的手续费估算）",
         actual_profit.normalize(),
         actual_cost.normalize(),
     )
@@ -213,7 +214,7 @@ pub fn format_balance_insufficient_notice(
 
 pub fn format_unknown_timeout_notice(tag: &str, legs: &[crate::store::ClosedLegRef]) -> String {
     let mut lines = vec![
-        format!("⚠️ {tag}unknown 腿超时未定，需人工核对远端成交（新套利已暂停）"),
+        format!("⚠️ {tag}交易腿超时未确认，需人工核对远端成交（新套利已暂停）"),
         format!("📋 count: {}", legs.len()),
     ];
     for leg in legs.iter().take(8) {
@@ -480,7 +481,7 @@ mod tests {
     fn order_actuals_notice_contains_profit_and_cost() {
         assert_eq!(
             format_order_actuals_notice("【cat】", 8353, Decimal::new(-29, 2), Decimal::new(29, 2),),
-            "【cat】订单 8353 实际收益 -0.29，实际成本 0.29"
+            "【cat】订单 8353 入账收益 -0.29，入账成本 0.29（可能含标记的手续费估算）"
         );
     }
 
@@ -510,7 +511,7 @@ mod tests {
                 platform: "outcome".into(),
             }],
         );
-        assert!(text.contains("unknown 腿超时未定"));
+        assert!(text.contains("交易腿超时未确认"));
         assert!(text.contains("orderId=3 legId=9 platform=outcome"));
     }
 }
