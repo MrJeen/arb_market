@@ -248,7 +248,6 @@ mod tests {
         FeeContext {
             polymarket_fee_rate: Decimal::ZERO,
             outcome_taker_rate: Decimal::ZERO,
-            extra_cost_multiplier: Decimal::ONE,
         }
     }
 
@@ -361,7 +360,6 @@ mod tests {
         let fees = FeeContext {
             polymarket_fee_rate: d("0.07"),
             outcome_taker_rate: d("0.01"),
-            extra_cost_multiplier: Decimal::ONE,
         };
         let plan = plan_take_profit(
             &topic(),

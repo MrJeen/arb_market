@@ -142,7 +142,6 @@ impl Engine {
         FeeContext {
             polymarket_fee_rate: rate,
             outcome_taker_rate: self.cfg.outcome_taker_fee_rate,
-            extra_cost_multiplier: self.cfg.extra_cost_multiplier,
         }
     }
 
@@ -2847,7 +2846,6 @@ mod tests {
         let fees = FeeContext {
             polymarket_fee_rate: d("0.07"),
             outcome_taker_rate: d("0.00035"),
-            extra_cost_multiplier: Decimal::ONE,
         };
         let (shares, price) = ack_fill(
             OUTCOME,

@@ -11,7 +11,6 @@ pub struct FeeContext {
     /// Polymarket `feeSchedule.rate` (0.07 crypto, not 700 bps).
     pub polymarket_fee_rate: Decimal,
     pub outcome_taker_rate: Decimal,
-    pub extra_cost_multiplier: Decimal,
 }
 
 #[derive(Debug, Clone)]
@@ -822,11 +821,11 @@ pub fn estimate_polymarket_fee(shares: Decimal, price: Decimal, fees: &FeeContex
     }
     let one_minus = Decimal::ONE - price;
     // Official: fee = C × feeRate × p × (1 - p)
-    shares * fees.polymarket_fee_rate * price * one_minus * fees.extra_cost_multiplier
+    shares * fees.polymarket_fee_rate * price * one_minus
 }
 
 pub fn estimate_outcome_fee(notional: Decimal, fees: &FeeContext) -> Decimal {
-    notional * fees.outcome_taker_rate * fees.extra_cost_multiplier
+    notional * fees.outcome_taker_rate
 }
 
 pub fn estimate_taker_fee(
@@ -955,7 +954,6 @@ mod tests {
         FeeContext {
             polymarket_fee_rate: Decimal::ZERO,
             outcome_taker_rate: Decimal::ZERO,
-            extra_cost_multiplier: d("1.3"),
         }
     }
 
@@ -1230,21 +1228,31 @@ mod tests {
         let fees = FeeContext {
             polymarket_fee_rate: d("0.07"),
             outcome_taker_rate: Decimal::ZERO,
-            extra_cost_multiplier: Decimal::ONE,
         };
         // Official crypto table: 100 shares @ $0.50 → $1.75
         assert_eq!(
             estimate_polymarket_fee(d("100"), d("0.50"), &fees),
             d("1.75")
         );
-        let conservative = FeeContext {
-            extra_cost_multiplier: d("1.3"),
-            ..fees.clone()
-        };
         assert_eq!(
-            estimate_polymarket_fee(d("100"), d("0.50"), &conservative),
-            d("2.275")
+            estimate_polymarket_fee(d("100"), d("0.20"), &fees),
+            d("1.12")
         );
+        assert_eq!(
+            estimate_polymarket_fee(d("100"), d("0.50"), &fees_zero()),
+            Decimal::ZERO
+        );
+    }
+
+    #[test]
+    fn outcome_fee_uses_taker_rate() {
+        let fees = FeeContext {
+            polymarket_fee_rate: Decimal::ZERO,
+            outcome_taker_rate: d("0.00035"),
+        };
+        assert_eq!(estimate_outcome_fee(d("100"), &fees), d("0.035"));
+        assert_eq!(estimate_outcome_fee(Decimal::ZERO, &fees), Decimal::ZERO);
+        assert_eq!(estimate_outcome_fee(d("100"), &fees_zero()), Decimal::ZERO);
     }
 
     #[test]

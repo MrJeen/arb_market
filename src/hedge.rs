@@ -480,7 +480,6 @@ mod tests {
         FeeContext {
             polymarket_fee_rate: Decimal::ZERO,
             outcome_taker_rate: Decimal::ZERO,
-            extra_cost_multiplier: d("1.3"),
         }
     }
 
@@ -669,7 +668,6 @@ mod tests {
         let fees = FeeContext {
             polymarket_fee_rate: d("0.07"),
             outcome_taker_rate: d("0.00035"),
-            extra_cost_multiplier: Decimal::ONE,
         };
         let mut books = BookStore::default();
         let now = Instant::now();
