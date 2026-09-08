@@ -21,7 +21,7 @@ use crate::platforms::{
     ioc_fill, pm_fak_fill, FillPage, MarketOrderRequest, OrderPoll, OrderSide, SubmitResult,
     TradeFill,
 };
-use crate::reconcile::{FillEvidence, LegResolution};
+use crate::reconcile::{FillEvidence, LegResolution, PmTradeScan};
 use crate::settlement::{OutcomeSettlement, SettlementStatus};
 use crate::stats::MinuteStats;
 use crate::store::{ArbOrderRow, NewLeg, Store};
@@ -998,34 +998,10 @@ impl Engine {
     }
 
     async fn reconcile_pm(&self, leg: &crate::store::LegRow) -> Result<()> {
-        let funder = leg
-            .funder_address
-            .as_deref()
-            .ok_or_else(|| Error::msg("missing funder"))?;
-        let Some(selector) = leg
-            .third_order_id
-            .as_deref()
-            .or(leg.client_order_id.as_deref())
+        let Some((current, poll, page)) = reconcile_pm_page(&self.pm, &self.store, leg).await?
         else {
             return Ok(());
         };
-        let poll = self.pm.poll_order(funder, selector).await?;
-        if !poll.found {
-            return Ok(());
-        }
-        let Some(current) = self.store.record_order_poll(leg, &poll).await? else {
-            return Ok(());
-        };
-        let progress = current
-            .last_order_info
-            .as_ref()
-            .and_then(|info| info.get("fill_progress"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        let page = self
-            .pm
-            .poll_trade_page(funder, &leg.token_id, &progress)
-            .await?;
         self.apply_fill_page(&current, poll, page).await
     }
 
@@ -1100,11 +1076,20 @@ impl Engine {
             .as_ref()
             .and_then(|info| info.pointer("/submission/expected_shares"))
             .and_then(crate::platforms::parse_decimal);
+        let pm_scan = if leg.platform == POLYMARKET {
+            Some(serde_json::from_value::<PmTradeScan>(
+                page.progress.clone(),
+            )?)
+        } else {
+            None
+        };
+        let trades_only = leg.platform == POLYMARKET && !poll.found;
         let evidence = FillEvidence {
             poll,
             page_complete: page.complete,
             history_complete: page.history_complete,
             expected_shares,
+            pm_scan,
         };
         let started = Instant::now();
         let resolution = self
@@ -1124,7 +1109,7 @@ impl Engine {
                 ..
             } => tracing::info!(
                 platform=%leg.platform,leg_id=leg.id,order_id=leg.order_id,status,%shares,%fee,
-                ?fee_sources,elapsed_ms=started.elapsed().as_millis() as u64,"trade reconciliation finalized"
+                trades_only,?fee_sources,elapsed_ms=started.elapsed().as_millis() as u64,"trade reconciliation finalized"
             ),
         }
         Ok(())
@@ -2540,6 +2525,59 @@ pub fn book_recv_skew_ok(a: Instant, b: Instant, max: Duration) -> bool {
     book_recv_skew(a, b) <= max
 }
 
+async fn reconcile_pm_page(
+    pm: &PolymarketVenue,
+    store: &Store,
+    leg: &crate::store::LegRow,
+) -> Result<Option<(crate::store::LegRow, OrderPoll, FillPage)>> {
+    let funder = leg
+        .funder_address
+        .as_deref()
+        .ok_or_else(|| Error::msg("missing funder"))?;
+    let Some(selector) = leg
+        .third_order_id
+        .as_deref()
+        .or(leg.client_order_id.as_deref())
+    else {
+        return Ok(None);
+    };
+    let poll = pm.poll_order(funder, selector).await?;
+    let Some(current) = store.record_order_poll(leg, &poll).await? else {
+        return Ok(None);
+    };
+    let Some(submitted) = current.submitted_at else {
+        store
+            .record_reconciliation_wait(&current, "submission_time_missing")
+            .await?;
+        tracing::debug!(
+            service = "polymarket",
+            operation = "reconcile",
+            leg_id = leg.id,
+            "missing submission time for fixed trade window"
+        );
+        return Ok(None);
+    };
+    let after = submitted.timestamp();
+    let before = after
+        .checked_add(300)
+        .ok_or_else(|| Error::msg("polymarket trade window overflow"))?;
+    let oid = poll
+        .order_id
+        .as_deref()
+        .ok_or_else(|| Error::msg("missing order selector"))?;
+    let progress = current
+        .last_order_info
+        .as_ref()
+        .and_then(|info| info.get("fill_progress"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    // 缺失 order 不等于零成交；固定五分钟只限定检索范围，不限制确认等待时长。
+    let page = pm
+        .poll_trade_page(funder, &leg.token_id, oid, after, before, &progress)
+        .await?;
+    Ok(Some((current, poll, page)))
+}
+
 async fn persist_submit(
     store: &Store,
     leg_id: i64,
@@ -2719,6 +2757,99 @@ mod tests {
             finality: crate::platforms::FillFinality::Confirmed,
             raw: json!({"oid": order_id}),
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+    async fn pm_missing_order_execution_fetches_window_and_finalizes_trades() {
+        use crate::platforms::polymarket::tests::poll_stub;
+        use sqlx::postgres::PgPoolOptions;
+        let uri = std::env::var("APP_POSTGRES_URI").expect("requires a test database");
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&uri)
+            .await
+            .unwrap();
+        let schema = format!("pm_window_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let search_path = schema.clone();
+        let exercised: anyhow::Result<()> = async {
+            let pool = PgPoolOptions::new().max_connections(2).after_connect(move |conn, _| {
+                let path = search_path.clone();
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('search_path', $1, false)").bind(path).execute(conn).await?;
+                    Ok(())
+                })
+            }).connect(&uri).await?;
+            let store = Store { pool };
+            store.migrate().await?;
+            for (http_status, body, missing_time) in [(404, json!({}), false), (200, Value::Null, false), (404, json!({}), true)] {
+                let identity = MarketIdentity::new(POLYMARKET, "test-condition")?;
+                let (_, ids) = store.insert_actived_order_with_legs(
+                    TopicKey::new(uuid::Uuid::new_v4(), 0), &identity, "PM window test", "PM window test", None,
+                    d("10"), d("1"), d("9"), &json!([]), &[NewLeg {
+                        platform: POLYMARKET, token_id: "yes", label: "yes", side: "BUY", intent: "arb_buy",
+                        funder: Some("test-funder"), wallet: None, service: None,
+                        req_price: d("0.5"), req_shares: d("10"), req_fee: Decimal::ZERO, client_order_id: None,
+                    }],
+                ).await?;
+                let oid = format!("taker-{}", ids[0]);
+                store.insert_envelope(ids[0], &oid, &json!({}), &json!({"test":true}), None).await?;
+                if missing_time {
+                    sqlx::query("UPDATE legs SET submitted_at=NULL WHERE id=$1").bind(ids[0]).execute(&store.pool).await?;
+                }
+                let leg = store.open_legs().await?.into_iter().find(|leg| leg.id == ids[0]).unwrap();
+                let mut responses = vec![(http_status, body)];
+                if !missing_time {
+                    responses.push((200, json!({"data":[{
+                        "id":"confirmed-trade","taker_order_id":oid,"asset_id":"yes",
+                        "size":"6","price":"0.5","status":"CONFIRMED",
+                        "fee_amount":"0.01","fee_token":"USDC","maker_orders":[]
+                    }], "next_cursor":"LTE="})));
+                }
+                let (pm, server) = poll_stub(responses).await;
+                let page_result = reconcile_pm_page(&pm, &store, &leg).await?;
+                let requests = tokio::time::timeout(Duration::from_secs(5), server).await??;
+                if missing_time {
+                    assert!(page_result.is_none());
+                    assert_eq!(requests.len(), 1);
+                    let info: Value = sqlx::query_scalar("SELECT last_order_info FROM legs WHERE id=$1")
+                        .bind(leg.id).fetch_one(&store.pool).await?;
+                    assert_eq!(info["waiting_reason"], "submission_time_missing");
+                    continue;
+                }
+                assert_eq!(requests.len(), 2);
+                assert!(requests[0].starts_with(&format!("GET /data/order/{oid} ")));
+                let after = leg.submitted_at.unwrap().timestamp();
+                let url = url::Url::parse(&format!("http://localhost{}", requests[1].split_whitespace().nth(1).unwrap()))?;
+                let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+                assert_eq!(query.get("after"), Some(&after.to_string()));
+                assert_eq!(query.get("before"), Some(&(after + 300).to_string()));
+                let (current, poll, page) = page_result.unwrap();
+                assert!(!poll.found);
+                assert_eq!(current.submitted_at, leg.submitted_at);
+                assert_eq!(current.third_order_id.as_deref(), Some(oid.as_str()));
+                let evidence = FillEvidence {
+                    poll, page_complete: page.complete, history_complete: page.history_complete,
+                    expected_shares: None,
+                    pm_scan: Some(serde_json::from_value(page.progress.clone())?),
+                };
+                let matched: Vec<_> = filter_trades(&page.fills, Some(&oid), None).into_iter().cloned().collect();
+                assert!(matches!(store.record_reconciliation(&current, &matched, &evidence, &page.progress).await?,
+                    LegResolution::Terminal { status:"matched", shares, .. } if shares == d("6")));
+            }
+            store.pool.close().await;
+            Ok(())
+        }.await;
+        let cleanup = sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&admin)
+            .await;
+        admin.close().await;
+        cleanup.unwrap();
+        exercised.unwrap();
     }
 
     #[test]

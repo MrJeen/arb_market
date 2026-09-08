@@ -10,7 +10,7 @@
 use anyhow::{ensure, Result};
 use market_arb::domain::{MarketIdentity, TopicKey};
 use market_arb::platforms::{FillFinality, OrderPoll, TradeFill};
-use market_arb::reconcile::{FillEvidence, LegResolution};
+use market_arb::reconcile::{FillEvidence, LegResolution, PmTradeScan};
 use market_arb::store::{ArbOrderRow, LegRow, NewLeg, Store};
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
@@ -203,6 +203,8 @@ async fn submitted_reconciliation_order(
             req_shares: Decimal::from(10),
             // Deliberately unrelated to actual trade fees: request estimates must not enter accounting.
             req_fee: Decimal::from(99),
+            funder: (*platform == "polymarket")
+                .then_some("0x0000000000000000000000000000000000000001"),
             ..identity_probe_leg()
         })
         .collect();
@@ -220,8 +222,12 @@ async fn submitted_reconciliation_order(
             &legs,
         )
         .await?;
-    for id in &ids {
-        let client_id = format!("reconciliation-client-{id}");
+    for (id, platform) in ids.iter().zip(platforms) {
+        let client_id = if *platform == "polymarket" {
+            format!("0x{id:064x}")
+        } else {
+            format!("reconciliation-client-{id}")
+        };
         store
             .insert_envelope(
                 *id,
@@ -298,6 +304,43 @@ fn reconciliation_evidence(oid: &str, status: &str) -> FillEvidence {
         page_complete: true,
         history_complete: true,
         expected_shares: None,
+        pm_scan: None,
+    }
+}
+
+fn pm_missing_evidence(
+    leg: &LegRow,
+    missing: &str,
+    cursor: &str,
+    trade_ids: &[&str],
+) -> FillEvidence {
+    let oid = leg
+        .third_order_id
+        .as_ref()
+        .or(leg.client_order_id.as_ref())
+        .unwrap();
+    let after = leg.submitted_at.unwrap().timestamp();
+    FillEvidence {
+        poll: OrderPoll {
+            found: false,
+            status: "not_found".into(),
+            order_id: Some(oid.clone()),
+            raw: json!({"lookup_missing": missing}),
+            ..OrderPoll::default()
+        },
+        page_complete: cursor == "LTE=",
+        history_complete: cursor == "LTE=",
+        expected_shares: None,
+        pm_scan: Some(PmTradeScan {
+            version: 2,
+            funder: leg.funder_address.clone().unwrap(),
+            asset_id: leg.token_id.clone(),
+            order_id: oid.clone(),
+            after,
+            before: after + 300,
+            next_cursor: cursor.into(),
+            trade_ids: trade_ids.iter().map(|id| (*id).into()).collect(),
+        }),
     }
 }
 
@@ -494,6 +537,395 @@ async fn reconciliation_pm_accumulates_pages_and_only_accounts_confirmed_trades(
 
 #[tokio::test]
 #[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn reconciliation_pm_missing_order_pages_reload_with_fixed_window_and_exact_accounting() {
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let exercised: Result<()> = async {
+        let store = &fixture.store;
+        store.migrate().await?;
+        // Cover both missing responses and selectors, with mixed and all-failed terminal sets.
+        for (missing, ack, all_failed) in [
+            ("http_404", false, false),
+            ("http_404", true, true),
+            ("null_body", false, true),
+            ("null_body", true, false),
+        ] {
+            let (order_id, legs) = submitted_reconciliation_order(store, &["polymarket"]).await?;
+            let id = legs[0].id;
+            sqlx::query("UPDATE legs SET submitted_at=to_timestamp(1700000000), updated_at=clock_timestamp() WHERE id=$1")
+                .bind(id).execute(&store.pool).await?;
+            let ack_oid = format!("pm-ack-{id}");
+            store.record_submission(id, if ack { "actived" } else { "unknown" },
+                ack.then_some(ack_oid.as_str()), &json!({"kind": if ack { "ack" } else { "unknown" }}),
+                &json!({"test":true})).await?;
+            let before = reconciliation_open_leg(store, id).await?;
+            let first = pm_missing_evidence(&before, missing, "page-2", &["a"]);
+            let oid = first.poll.order_id.as_deref().unwrap();
+            ensure!(oid == if ack { ack_oid.as_str() } else { before.client_order_id.as_deref().unwrap() });
+            let current = store.record_order_poll(&before, &first.poll).await?
+                .ok_or_else(|| anyhow::anyhow!("missing {missing} poll rejected"))?;
+            ensure!(current.third_order_id.as_deref() == Some(oid));
+            ensure!(current.status == before.status && current.submitted_at == before.submitted_at);
+            let mut a = reconciliation_trade(oid, "a", 4, Decimal::new(2, 2));
+            a.coin = Some(current.token_id.clone());
+            a.finality = FillFinality::Pending;
+            let first_progress = serde_json::to_value(first.pm_scan.as_ref().unwrap())?;
+            ensure!(matches!(store.record_reconciliation(&current, &[a.clone()], &first, &first_progress).await?,
+                LegResolution::Pending(_)));
+
+            // A new Store handle must resume entirely from the persisted scan, not local page state.
+            let reopened = Store { pool: store.pool.clone() };
+            let reloaded = reconciliation_open_leg(&reopened, id).await?;
+            let info = reloaded.last_order_info.as_ref().unwrap();
+            let mut scan: PmTradeScan = serde_json::from_value(info["fill_progress"].clone())?;
+            ensure!(Some(&scan) == first.pm_scan.as_ref());
+            ensure!(scan.after == 1_700_000_000 && scan.before == scan.after + 300);
+            ensure!(reloaded.third_order_id.as_deref() == Some(oid) && reloaded.status == before.status);
+            ensure!(info["order_poll"]["raw"] == json!({"lookup_missing":missing}));
+            scan.next_cursor = "LTE=".into();
+            scan.trade_ids.push("b".into());
+            let mut complete = first.clone();
+            complete.page_complete = true;
+            complete.history_complete = true;
+            complete.pm_scan = Some(scan);
+            let complete_progress = serde_json::to_value(complete.pm_scan.as_ref().unwrap())?;
+            a.finality = if all_failed { FillFinality::Failed } else { FillFinality::Confirmed };
+            let mut b = reconciliation_trade(oid, "b", 6, Decimal::from(99));
+            b.coin = Some(reloaded.token_id.clone());
+            b.finality = FillFinality::Failed;
+            let final_fills = [a.clone(), b, a];
+            let leg_before = leg_snapshot(&store.pool, id).await?;
+            let fills_before = fill_snapshots(&store.pool, id).await?;
+            let parent_before = order_snapshot(&store.pool, order_id).await?;
+            ensure!(reopened.record_reconciliation(&current, &final_fills, &complete, &complete_progress).await?
+                == LegResolution::Pending("stale_leg_snapshot"));
+            ensure!(leg_snapshot(&store.pool, id).await? == leg_before, "stale page advanced cursor");
+            ensure!(fill_snapshots(&store.pool, id).await? == fills_before);
+            ensure!(order_snapshot(&store.pool, order_id).await? == parent_before);
+
+            let current = reopened.record_order_poll(&reloaded, &complete.poll).await?
+                .ok_or_else(|| anyhow::anyhow!("resumed missing poll rejected"))?;
+            ensure!(current.submitted_at == before.submitted_at && current.status == before.status);
+            ensure!(current.last_order_info.as_ref().unwrap()["fill_progress"] == first_progress,
+                "poll must neither reset the fixed after nor advance the scan");
+            let resolved = reopened.record_reconciliation(&current, &final_fills, &complete, &complete_progress).await?;
+            let (status, shares, price, fee, fee_sources) = if all_failed {
+                ("failed", Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, vec![])
+            } else {
+                ("matched", Decimal::from(4), Decimal::new(4, 1), Decimal::new(2, 2), vec!["actual"])
+            };
+            ensure!(resolved == LegResolution::Terminal { status, shares, price, fee, fee_sources });
+            let terminal = leg_snapshot(&store.pool, id).await?;
+            let fills = fill_snapshots(&store.pool, id).await?;
+            let parent = order_snapshot(&store.pool, order_id).await?;
+            ensure!(terminal["status"] == status && terminal["actual_shares"] == json!(if all_failed { 0.0 } else { 4.0 }));
+            ensure!(terminal["actual_fee"] == json!(if all_failed { 0.0 } else { 0.02 }));
+            ensure!(terminal["submitted_at"] == leg_before["submitted_at"]);
+            ensure!(terminal["last_order_info"]["fill_progress"] == complete_progress);
+            ensure!(terminal["last_order_info"]["fill_evidence"]["pm_scan"] == complete_progress);
+            ensure!(fills.len() == 2 && fills.iter().all(|fill| fill["third_order_id"] == oid));
+            ensure!(fills[0]["raw"]["reconciliation_v1"]["finality"] == if all_failed { "failed" } else { "confirmed" });
+            ensure!(fills[1]["raw"]["reconciliation_v1"]["finality"] == "failed");
+            ensure!(parent["status"] == if all_failed { "cancelled" } else { "completed" });
+            ensure!(parent["actual_cost"] == json!(if all_failed { 0.0 } else { 1.62 }));
+            ensure!(reopened.record_reconciliation(&current, &final_fills, &complete, &complete_progress).await?
+                == LegResolution::Pending("stale_leg_snapshot"));
+            reopened.complete_orders().await?;
+            ensure!(leg_snapshot(&store.pool, id).await? == terminal);
+            ensure!(fill_snapshots(&store.pool, id).await? == fills);
+            ensure!(order_snapshot(&store.pool, order_id).await? == parent, "terminal retry recounted fills");
+        }
+        Ok(())
+    }.await;
+    fixture
+        .cleanup()
+        .await
+        .expect("clean up missing-order page schema");
+    exercised
+        .expect("missing PM orders resume fixed scans and account terminal trades exactly once");
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn reconciliation_pm_missing_order_does_not_finish_from_cached_confirmed_fills_alone() {
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let exercised: Result<()> = async {
+        let store = &fixture.store;
+        store.migrate().await?;
+        let (order_id, legs) = submitted_reconciliation_order(store, &["polymarket"]).await?;
+        let id = legs[0].id;
+        let evidence = pm_missing_evidence(&legs[0], "null_body", "page-2", &["cached"]);
+        let current = store
+            .record_order_poll(&legs[0], &evidence.poll)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("cache fixture poll rejected"))?;
+        let mut fill = reconciliation_trade(
+            evidence.poll.order_id.as_deref().unwrap(),
+            "cached",
+            4,
+            Decimal::new(2, 2),
+        );
+        fill.coin = Some(current.token_id.clone());
+        let progress = serde_json::to_value(evidence.pm_scan.as_ref().unwrap())?;
+        ensure!(
+            store
+                .record_reconciliation(&current, &[fill], &evidence, &progress)
+                .await?
+                == LegResolution::Pending("trade_pages_incomplete")
+        );
+        let fills = fill_snapshots(&store.pool, id).await?;
+        let parent = order_snapshot(&store.pool, order_id).await?;
+        ensure!(
+            fills.len() == 1 && fills[0]["raw"]["reconciliation_v1"]["finality"] == "confirmed"
+        );
+        for (case, reason) in [
+            ("empty", "zero_fill_not_proven"),
+            ("different_ids", "trade_scan_snapshot_mismatch"),
+            ("legacy", "trade_scan_evidence_missing"),
+        ] {
+            let current = reconciliation_open_leg(store, id).await?;
+            let ids: &[&str] = if case == "different_ids" {
+                &["not-cached"]
+            } else {
+                &[]
+            };
+            let mut complete = pm_missing_evidence(&current, "null_body", "LTE=", ids);
+            let progress = serde_json::to_value(complete.pm_scan.as_ref().unwrap())?;
+            if case == "legacy" {
+                complete.pm_scan = None;
+            }
+            ensure!(
+                store
+                    .record_reconciliation(&current, &[], &complete, &progress)
+                    .await?
+                    == LegResolution::Pending(reason),
+                "{case} reused unproven cached fills"
+            );
+            let leg = leg_snapshot(&store.pool, id).await?;
+            ensure!(
+                leg["status"] == current.status
+                    && leg["actual_shares"].is_null()
+                    && leg["actual_fee"].is_null()
+            );
+            ensure!(leg["last_order_info"]["fill_progress"] == progress);
+            ensure!(fill_snapshots(&store.pool, id).await? == fills);
+            ensure!(order_snapshot(&store.pool, order_id).await? == parent);
+        }
+        // Cached observations become usable only when this scan proves the exact nonempty ID set.
+        let current = reconciliation_open_leg(store, id).await?;
+        let complete = pm_missing_evidence(&current, "null_body", "LTE=", &["cached"]);
+        ensure!(
+            matches!(store.record_reconciliation(&current, &[], &complete,
+            &serde_json::to_value(complete.pm_scan.as_ref().unwrap())?).await?,
+            LegResolution::Terminal { status: "matched", shares, fee, .. }
+                if shares == Decimal::from(4) && fee == Decimal::new(2, 2))
+        );
+        ensure!(fill_snapshots(&store.pool, id).await? == fills);
+        ensure!(order_snapshot(&store.pool, order_id).await?["actual_cost"] == json!(1.62));
+        Ok(())
+    }
+    .await;
+    fixture
+        .cleanup()
+        .await
+        .expect("clean up cached-scan schema");
+    exercised.expect("empty, mismatched and legacy scans cannot close a missing order from cache");
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn reconciliation_pm_hash_fills_lock_identity_and_reject_inconsistent_scan_writes() {
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let exercised: Result<()> = async {
+        let store = &fixture.store;
+        store.migrate().await?;
+        let (order_id, legs) = submitted_reconciliation_order(store, &["polymarket"]).await?;
+        let id = legs[0].id;
+        let evidence = pm_missing_evidence(&legs[0], "http_404", "page-2", &["hash-fill"]);
+        let current = store
+            .record_order_poll(&legs[0], &evidence.poll)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("hash fixture poll rejected"))?;
+        let mut fill = reconciliation_trade(
+            evidence.poll.order_id.as_deref().unwrap(),
+            "hash-fill",
+            4,
+            Decimal::new(2, 2),
+        );
+        fill.coin = Some(current.token_id.clone());
+        fill.finality = FillFinality::Pending;
+        ensure!(matches!(
+            store
+                .record_reconciliation(
+                    &current,
+                    &[fill.clone()],
+                    &evidence,
+                    &serde_json::to_value(evidence.pm_scan.as_ref().unwrap())?
+                )
+                .await?,
+            LegResolution::Pending(_)
+        ));
+        let current = reconciliation_open_leg(store, id).await?;
+        ensure!(current.third_order_id == current.client_order_id);
+        let leg_before = leg_snapshot(&store.pool, id).await?;
+        let fills_before = fill_snapshots(&store.pool, id).await?;
+        let parent_before = order_snapshot(&store.pool, order_id).await?;
+        let response_before: Value =
+            sqlx::query_scalar("SELECT to_jsonb(e) FROM signed_envelopes e WHERE leg_id=$1")
+                .bind(id)
+                .fetch_one(&store.pool)
+                .await?;
+        ensure!(store
+            .record_submission(
+                id,
+                "actived",
+                Some("different-ack-oid"),
+                &json!({"kind":"ack"}),
+                &json!({"late":true})
+            )
+            .await
+            .is_err());
+        let response_after: Value =
+            sqlx::query_scalar("SELECT to_jsonb(e) FROM signed_envelopes e WHERE leg_id=$1")
+                .bind(id)
+                .fetch_one(&store.pool)
+                .await?;
+        ensure!(
+            response_after == response_before,
+            "rejected ACK leaked its transaction"
+        );
+        ensure!(leg_snapshot(&store.pool, id).await? == leg_before);
+        for found in [true, false] {
+            let mut poll = if found {
+                reconciliation_evidence("different-poll-oid", "matched").poll
+            } else {
+                evidence.poll.clone()
+            };
+            poll.order_id = Some("different-poll-oid".into());
+            ensure!(store.record_order_poll(&current, &poll).await.is_err());
+            ensure!(leg_snapshot(&store.pool, id).await? == leg_before);
+        }
+
+        // Each malformed write must reject before either an incoming fill or its cursor can persist.
+        for case in [
+            "progress",
+            "after",
+            "funder",
+            "asset",
+            "order",
+            "page_complete",
+            "history_complete",
+            "coin_missing",
+            "coin_other",
+            "trade_id",
+        ] {
+            let mut next =
+                pm_missing_evidence(&current, "http_404", "page-3", &["hash-fill", "second"]);
+            let scan = next.pm_scan.as_mut().unwrap();
+            let mut incoming = fill.clone();
+            incoming.trade_id = "second".into();
+            match case {
+                "after" => {
+                    scan.after += 1;
+                    scan.before += 1;
+                }
+                "funder" => scan.funder = "0x0000000000000000000000000000000000000002".into(),
+                "asset" => scan.asset_id = "other-token".into(),
+                "order" => scan.order_id = "other-order".into(),
+                "page_complete" => next.page_complete = true,
+                "history_complete" => next.history_complete = true,
+                "coin_missing" => incoming.coin = None,
+                "coin_other" => incoming.coin = Some("other-token".into()),
+                "trade_id" => incoming.trade_id = "outside-scan".into(),
+                _ => {}
+            }
+            let mut progress = serde_json::to_value(next.pm_scan.as_ref().unwrap())?;
+            if case == "progress" {
+                progress["next_cursor"] = json!("different-cursor");
+            }
+            ensure!(
+                store
+                    .record_reconciliation(&current, &[incoming], &next, &progress)
+                    .await
+                    .is_err(),
+                "inconsistent {case} unexpectedly accepted"
+            );
+            ensure!(
+                leg_snapshot(&store.pool, id).await? == leg_before,
+                "{case} advanced progress"
+            );
+            ensure!(
+                fill_snapshots(&store.pool, id).await? == fills_before,
+                "{case} inserted a fill"
+            );
+            ensure!(order_snapshot(&store.pool, order_id).await? == parent_before);
+        }
+        // Without observations, either recovery entry point may replace the hash, but not its scan.
+        for via_ack in [true, false] {
+            let (parent_id, legs) = submitted_reconciliation_order(store, &["polymarket"]).await?;
+            let evidence = pm_missing_evidence(&legs[0], "http_404", "page-2", &[]);
+            let current = store
+                .record_order_poll(&legs[0], &evidence.poll)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("empty hash scan poll rejected"))?;
+            ensure!(matches!(
+                store
+                    .record_reconciliation(
+                        &current,
+                        &[],
+                        &evidence,
+                        &serde_json::to_value(evidence.pm_scan.as_ref().unwrap())?
+                    )
+                    .await?,
+                LegResolution::Pending(_)
+            ));
+            let current = reconciliation_open_leg(store, current.id).await?;
+            ensure!(current.third_order_id == current.client_order_id);
+            let info = current.last_order_info.as_ref().unwrap();
+            ensure!(info["fill_progress"].is_object() && info["fill_evidence"].is_object());
+            let oid = format!("recovered-without-fills-{}", current.id);
+            if via_ack {
+                store
+                    .record_submission(
+                        current.id,
+                        "actived",
+                        Some(&oid),
+                        &json!({"kind":"ack"}),
+                        &json!({"ack":true}),
+                    )
+                    .await?;
+            } else {
+                ensure!(store
+                    .record_order_poll(&current, &reconciliation_evidence(&oid, "matched").poll)
+                    .await?
+                    .is_some());
+            }
+            let recovered = reconciliation_open_leg(store, current.id).await?;
+            ensure!(recovered.third_order_id.as_deref() == Some(oid.as_str()));
+            ensure!(
+                recovered.status == "actived" && recovered.submitted_at == current.submitted_at
+            );
+            let info = recovered.last_order_info.as_ref().unwrap();
+            ensure!(
+                info.get("fill_progress") == Some(&Value::Null)
+                    && info.get("fill_evidence") == Some(&Value::Null),
+                "identity recovery retained the old hash scan"
+            );
+            ensure!(fill_snapshots(&store.pool, current.id).await?.is_empty());
+            ensure!(order_snapshot(&store.pool, parent_id).await?["status"] == "actived");
+        }
+        Ok(())
+    }
+    .await;
+    fixture
+        .cleanup()
+        .await
+        .expect("clean up hash identity schema");
+    exercised
+        .expect("PM hash fills lock their order identity; empty scans are cleared on recovery");
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
 async fn reconciliation_rejects_stale_snapshots_and_audits_late_submission_responses() {
     let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
     let exercised: Result<()> = async {
@@ -664,13 +1096,30 @@ async fn reconciliation_sql_failures_roll_back_fills_leg_and_parent_before_retry
     let exercised: Result<()> = async {
         let store = &fixture.store;
         store.migrate().await?;
-        for table in ["legs", "arb_orders"] {
-            let (order_id, legs) = submitted_reconciliation_order(store, &["outcome"]).await?;
+        for (platform, table) in [("outcome", "legs"), ("outcome", "arb_orders"), ("polymarket", "arb_orders")] {
+            let (order_id, legs) = submitted_reconciliation_order(store, &[platform]).await?;
             let id = legs[0].id;
-            let evidence = reconciliation_evidence(&format!("fault-oid-{id}"), "filled");
-            let current = store.record_order_poll(&legs[0], &evidence.poll).await?
+            let evidence = if platform == "polymarket" {
+                pm_missing_evidence(&legs[0], "http_404", "page-2", &["real"])
+            } else {
+                reconciliation_evidence(&format!("fault-oid-{id}"), "filled")
+            };
+            let mut current = store.record_order_poll(&legs[0], &evidence.poll).await?
                 .ok_or_else(|| anyhow::anyhow!("fault fixture poll rejected"))?;
-            let fill = reconciliation_trade(evidence.poll.order_id.as_deref().unwrap(), "real", 10, Decimal::new(7, 2));
+            let mut fill = reconciliation_trade(evidence.poll.order_id.as_deref().unwrap(), "real", 10, Decimal::new(7, 2));
+            fill.coin = Some(current.token_id.clone());
+            let (evidence, progress) = if platform == "polymarket" {
+                let mut pending = fill.clone();
+                pending.finality = FillFinality::Pending;
+                ensure!(matches!(store.record_reconciliation(&current, &[pending], &evidence,
+                    &serde_json::to_value(evidence.pm_scan.as_ref().unwrap())?).await?, LegResolution::Pending(_)));
+                current = reconciliation_open_leg(store, id).await?;
+                let evidence = pm_missing_evidence(&current, "http_404", "LTE=", &["real"]);
+                let progress = serde_json::to_value(evidence.pm_scan.as_ref().unwrap())?;
+                (evidence, progress)
+            } else {
+                (evidence, json!({"complete":true}))
+            };
             let leg_before = leg_snapshot(&store.pool, id).await?;
             let parent_before = order_snapshot(&store.pool, order_id).await?;
             let fills_before = fill_snapshots(&store.pool, id).await?;
@@ -684,7 +1133,7 @@ async fn reconciliation_sql_failures_roll_back_fills_leg_and_parent_before_retry
             };
             sqlx::query(&format!("ALTER TABLE {table} ADD CONSTRAINT {constraint} CHECK ({check})"))
                 .execute(&store.pool).await?;
-            let rejected = store.record_reconciliation(&current, &[fill.clone()], &evidence, &json!({"cursor":"must-roll-back"})).await;
+            let rejected = store.record_reconciliation(&current, &[fill.clone()], &evidence, &progress).await;
             ensure!(matches!(&rejected, Err(market_arb::error::Error::Sqlx(sqlx::Error::Database(err)))
                 if err.code().as_deref() == Some("23514") && err.constraint() == Some(constraint.as_str())),
                 "expected injected {table} constraint failure, got {rejected:?}");
@@ -694,8 +1143,9 @@ async fn reconciliation_sql_failures_roll_back_fills_leg_and_parent_before_retry
             sqlx::query(&format!("ALTER TABLE {table} DROP CONSTRAINT {constraint}"))
                 .execute(&store.pool).await?;
             // The original snapshot must still be valid because every preceding write rolled back.
-            ensure!(matches!(store.record_reconciliation(&current, &[fill], &evidence, &json!({"complete":true})).await?,
+            ensure!(matches!(store.record_reconciliation(&current, &[fill], &evidence, &progress).await?,
                 LegResolution::Terminal {status:"matched", ..}));
+            ensure!(leg_snapshot(&store.pool, id).await?["last_order_info"]["fill_progress"] == progress);
             ensure!(fill_snapshots(&store.pool, id).await?.len() == 1);
             let parent = order_snapshot(&store.pool, order_id).await?;
             ensure!(parent["status"] == "completed" && parent["actual_cost"] == json!(4.07));

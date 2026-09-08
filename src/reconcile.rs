@@ -11,6 +11,43 @@ pub struct FillEvidence {
     pub page_complete: bool,
     pub history_complete: bool,
     pub expected_shares: Option<Decimal>,
+    #[serde(default)]
+    pub pm_scan: Option<PmTradeScan>,
+}
+
+/// 本次固定窗口扫描的证据；旧 fills 不能替代本轮实际查到的成交集合。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PmTradeScan {
+    pub version: u8,
+    pub funder: String,
+    pub asset_id: String,
+    pub order_id: String,
+    pub after: i64,
+    pub before: i64,
+    pub next_cursor: String,
+    pub trade_ids: Vec<String>,
+}
+
+impl PmTradeScan {
+    pub fn validate(&self) -> Result<()> {
+        let ids: HashSet<_> = self.trade_ids.iter().collect();
+        if self.version != 2
+            || self.after < 0
+            || self.before.checked_sub(self.after) != Some(300)
+            || self.funder.is_empty()
+            || self.asset_id.is_empty()
+            || self.order_id.is_empty()
+            || self.next_cursor.is_empty()
+            || ids.len() != self.trade_ids.len()
+            || self
+                .trade_ids
+                .iter()
+                .any(|id| id.is_empty() || id.starts_with("ack:"))
+        {
+            return Err(Error::msg("invalid polymarket trade scan evidence"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,7 +103,14 @@ pub fn resolve_leg(
     evidence: &FillEvidence,
 ) -> Result<LegResolution> {
     let poll = &evidence.poll;
-    if !poll.found || poll.order_id.is_none() {
+    let missing_pm_order = platform == POLYMARKET
+        && !poll.found
+        && poll.status == "not_found"
+        && matches!(
+            poll.raw.get("lookup_missing").and_then(|v| v.as_str()),
+            Some("http_404" | "null_body")
+        );
+    if poll.order_id.is_none() || (!poll.found && !missing_pm_order) {
         return Ok(LegResolution::Pending("order_not_found"));
     }
     let mut trades = BTreeMap::<String, TradeFill>::new();
@@ -100,7 +144,30 @@ pub fn resolve_leg(
     {
         return Ok(LegResolution::Pending("trade_confirmation_pending"));
     }
-    if platform == POLYMARKET {
+    if missing_pm_order {
+        let Some(scan) = &evidence.pm_scan else {
+            return Ok(LegResolution::Pending("trade_scan_evidence_missing"));
+        };
+        scan.validate()?;
+        if Some(scan.order_id.as_str()) != poll.order_id.as_deref()
+            || trades
+                .values()
+                .any(|fill| fill.coin.as_deref() != Some(scan.asset_id.as_str()))
+        {
+            return Err(Error::msg("polymarket scan identity mismatch"));
+        }
+        if !evidence.page_complete || !evidence.history_complete || scan.next_cursor != "LTE=" {
+            return Ok(LegResolution::Pending("trade_pages_incomplete"));
+        }
+        if scan.trade_ids.is_empty() {
+            return Ok(LegResolution::Pending("zero_fill_not_proven"));
+        }
+        let scanned: HashSet<_> = scan.trade_ids.iter().map(String::as_str).collect();
+        if scanned.len() != trades.len() || trades.keys().any(|id| !scanned.contains(id.as_str())) {
+            return Ok(LegResolution::Pending("trade_scan_snapshot_mismatch"));
+        }
+        // FAK 缺单时采用当轮可见的非空终态集合，不虚构 order 撮合量或关联列表。
+    } else if platform == POLYMARKET {
         if state != "matched" && !cancelled {
             return Ok(LegResolution::Pending("order_still_open"));
         }
@@ -281,6 +348,7 @@ mod tests {
             page_complete: true,
             history_complete: true,
             expected_shares: Some(d("10")),
+            pm_scan: None,
         }
     }
 
@@ -341,6 +409,180 @@ mod tests {
         );
     }
 
+    fn missing_pm_evidence(source: &str, ids: &[&str]) -> FillEvidence {
+        let mut evidence = pm_evidence();
+        evidence.poll = OrderPoll {
+            status: "not_found".into(),
+            order_id: Some("777".into()),
+            raw: json!({"lookup_missing":source}),
+            ..Default::default()
+        };
+        evidence.pm_scan = Some(PmTradeScan {
+            version: 2,
+            funder: "funder".into(),
+            asset_id: "token".into(),
+            order_id: "777".into(),
+            after: 1_700_000_000,
+            before: 1_700_000_300,
+            next_cursor: "LTE=".into(),
+            trade_ids: ids.iter().map(|id| (*id).into()).collect(),
+        });
+        evidence
+    }
+
+    #[test]
+    fn missing_pm_order_finalizes_only_confirmed_quantity_or_all_failed() {
+        for source in ["http_404", "null_body"] {
+            for (states, expected_status, expected_shares, expected_fee) in [
+                (
+                    [FillFinality::Confirmed, FillFinality::Confirmed],
+                    "matched",
+                    "10",
+                    "0.02",
+                ),
+                (
+                    [FillFinality::Confirmed, FillFinality::Failed],
+                    "matched",
+                    "6",
+                    "0.01",
+                ),
+                (
+                    [FillFinality::Failed, FillFinality::Failed],
+                    "failed",
+                    "0",
+                    "0",
+                ),
+            ] {
+                let evidence = missing_pm_evidence(source, &["one", "two"]);
+                let one = fill("one", "6", states[0]);
+                let two = fill("two", "4", states[1]);
+                let resolution =
+                    resolve_leg(POLYMARKET, &[one.clone(), two, one], &evidence).unwrap();
+                assert!(
+                    matches!(resolution, LegResolution::Terminal { status, shares, fee, price, .. }
+                    if status == expected_status && shares == d(expected_shares)
+                        && fee == d(expected_fee) && price == if shares.is_zero() { Decimal::ZERO } else { d("0.5") })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_pm_order_waits_for_nonempty_current_scan_and_finality() {
+        let evidence = missing_pm_evidence("http_404", &["one"]);
+        let confirmed = fill("one", "6", FillFinality::Confirmed);
+        let mut incomplete = evidence.clone();
+        incomplete.page_complete = false;
+        incomplete.history_complete = false;
+        incomplete.pm_scan.as_mut().unwrap().next_cursor = "next".into();
+        assert_eq!(
+            resolve_leg(POLYMARKET, &[confirmed.clone()], &incomplete).unwrap(),
+            LegResolution::Pending("trade_pages_incomplete")
+        );
+        assert_eq!(
+            resolve_leg(
+                POLYMARKET,
+                &[fill("one", "6", FillFinality::Pending)],
+                &evidence
+            )
+            .unwrap(),
+            LegResolution::Pending("trade_confirmation_pending")
+        );
+        let empty = missing_pm_evidence("null_body", &[]);
+        for observations in [vec![], vec![confirmed.clone()]] {
+            assert_eq!(
+                resolve_leg(POLYMARKET, &observations, &empty).unwrap(),
+                LegResolution::Pending("zero_fill_not_proven")
+            );
+        }
+        assert_eq!(
+            resolve_leg(POLYMARKET, &[], &evidence).unwrap(),
+            LegResolution::Pending("trade_scan_snapshot_mismatch")
+        );
+        let old_fill = fill("old", "1", FillFinality::Confirmed);
+        assert_eq!(
+            resolve_leg(POLYMARKET, &[confirmed.clone(), old_fill], &evidence).unwrap(),
+            LegResolution::Pending("trade_scan_snapshot_mismatch")
+        );
+        let mut no_fee = confirmed;
+        no_fee.fee = None;
+        assert_eq!(
+            resolve_leg(POLYMARKET, &[no_fee], &evidence).unwrap(),
+            LegResolution::Pending("fee_evidence_missing")
+        );
+    }
+
+    #[test]
+    fn missing_pm_order_rejects_wrong_identity_or_unproven_missing_response() {
+        let evidence = missing_pm_evidence("http_404", &["one"]);
+        let confirmed = fill("one", "6", FillFinality::Confirmed);
+        for field in ["order", "token"] {
+            let mut wrong = confirmed.clone();
+            if field == "order" {
+                wrong.order_id = Some("other".into());
+            } else {
+                wrong.coin = Some("other".into());
+            }
+            assert!(resolve_leg(POLYMARKET, &[wrong], &evidence).is_err());
+        }
+        let mut invalid = evidence.clone();
+        invalid.pm_scan.as_mut().unwrap().before += 1;
+        assert!(resolve_leg(POLYMARKET, &[confirmed.clone()], &invalid).is_err());
+        let mut old = serde_json::to_value(&evidence).unwrap();
+        old.as_object_mut().unwrap().remove("pm_scan");
+        let old: FillEvidence = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            resolve_leg(POLYMARKET, &[confirmed.clone()], &old).unwrap(),
+            LegResolution::Pending("trade_scan_evidence_missing")
+        );
+        for source in ["http_500", "timeout", "malformed"] {
+            let missing = missing_pm_evidence(source, &["one"]);
+            assert_eq!(
+                resolve_leg(POLYMARKET, &[confirmed.clone()], &missing).unwrap(),
+                LegResolution::Pending("order_not_found")
+            );
+        }
+        assert_eq!(
+            resolve_leg(OUTCOME, &[confirmed], &evidence).unwrap(),
+            LegResolution::Pending("order_not_found")
+        );
+    }
+
+    #[test]
+    fn found_pm_order_still_requires_order_state_associations_and_quantity() {
+        let fills = [
+            fill("one", "6", FillFinality::Confirmed),
+            fill("two", "4", FillFinality::Failed),
+        ];
+        for (field, expected) in [
+            ("state", "order_still_open"),
+            ("associations", "associated_trades_missing"),
+            ("missing", "associated_trade_missing"),
+            ("extra", "order_trade_snapshot_mismatch"),
+            ("quantity", "matched_quantity_incomplete"),
+        ] {
+            let mut evidence = pm_evidence();
+            evidence.pm_scan = missing_pm_evidence("http_404", &["one", "two"]).pm_scan;
+            match field {
+                "state" => evidence.poll.status = "live".into(),
+                "associations" => evidence.poll.raw = json!({}),
+                "missing" => {
+                    evidence.poll.associated_trades.push("three".into());
+                    evidence.poll.raw = json!({"associate_trades":["one","two","three"]});
+                }
+                "extra" => {
+                    evidence.poll.associated_trades = vec!["one".into()];
+                    evidence.poll.raw = json!({"associate_trades":["one"]});
+                }
+                _ => evidence.poll.shares = Some(d("11")),
+            }
+            assert_eq!(
+                resolve_leg(POLYMARKET, &fills, &evidence).unwrap(),
+                LegResolution::Pending(expected)
+            );
+        }
+    }
+
     #[test]
     fn outcome_does_not_use_remaining_size_or_incomplete_history_as_zero_fill() {
         let mut evidence = FillEvidence {
@@ -355,6 +597,7 @@ mod tests {
             page_complete: true,
             history_complete: false,
             expected_shares: None,
+            pm_scan: None,
         };
         assert_eq!(
             resolve_leg(OUTCOME, &[], &evidence).unwrap(),

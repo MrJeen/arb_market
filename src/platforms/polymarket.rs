@@ -701,30 +701,71 @@ impl PolymarketVenue {
     pub async fn poll_order(&self, funder: &str, order_id: &str) -> Result<OrderPoll> {
         let account = self.ensure_account(funder).await?;
         let path = format!("/data/order/{order_id}");
-        match self
+        let started = Instant::now();
+        let poll = match self
             .l2_json(&account, reqwest::Method::GET, &path, &[], None)
             .await
         {
-            Ok(raw) => Ok(parse_order_poll(raw, order_id)),
-            Err(Error::Http { status: 404, .. }) => Ok(OrderPoll {
+            Ok(raw) => {
+                // 只有明确的 null 才表示 missing；畸形成功响应不能触发历史查询兜底。
+                if !raw.is_null()
+                    && (!raw.is_object()
+                        || !raw
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .is_some_and(|status| !status.trim().is_empty()))
+                {
+                    tracing::warn!(
+                        service = "polymarket",
+                        operation = "order_poll",
+                        endpoint = %path,
+                        funder,
+                        order_id,
+                        http_status = 200,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        reason = "invalid_order_body",
+                        "polymarket order response invalid"
+                    );
+                    return Err(Error::msg("polymarket order missing or invalid status"));
+                }
+                parse_order_poll(raw, order_id)
+            }
+            Err(Error::Http { status: 404, .. }) => OrderPoll {
                 status: "not_found".into(),
                 order_id: Some(order_id.into()),
-                raw: json!({}),
+                raw: json!({"lookup_missing": "http_404"}),
                 ..OrderPoll::default()
-            }),
-            Err(err) => Err(err),
+            },
+            Err(err) => return Err(err),
+        };
+        if !poll.found {
+            tracing::debug!(
+                service = "polymarket",
+                operation = "order_poll",
+                endpoint = %path,
+                funder,
+                order_id,
+                lookup_missing = poll.raw["lookup_missing"].as_str().unwrap_or_default(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "polymarket order not found"
+            );
         }
+        Ok(poll)
     }
 
     /// 每次只读一页，让调用方将 fills 与 progress 一起持久化；后页失败不丢前页进度。
-    /// 读到 END 只证明本次历史扫描结束。下轮重新扫描，才能刷新未确认成交的状态。
+    /// Unix 秒窗口固定为 5 分钟；读到 END 后重扫同一窗口，刷新未确认成交的状态。
     pub async fn poll_trade_page(
         &self,
         funder: &str,
         token_id: &str,
+        order_id: &str,
+        after: i64,
+        before: i64,
         progress: &Value,
     ) -> Result<FillPage> {
-        let (cursor, mut seen) = trade_page_cursor(progress, funder, token_id)?;
+        let (cursor, mut seen, mut trade_ids) =
+            trade_page_cursor(progress, funder, token_id, order_id, after, before)?;
         let account = self.ensure_account(funder).await?;
         let started = Instant::now();
         let raw = self
@@ -732,7 +773,12 @@ impl PolymarketVenue {
                 &account,
                 reqwest::Method::GET,
                 "/data/trades",
-                &[("asset_id", token_id), ("next_cursor", &cursor)],
+                &[
+                    ("asset_id", token_id),
+                    ("next_cursor", &cursor),
+                    ("after", &after.to_string()),
+                    ("before", &before.to_string()),
+                ],
                 None,
             )
             .await?;
@@ -747,15 +793,33 @@ impl PolymarketVenue {
                 return Err(Error::msg("polymarket trades missing data array"));
             }
             let fills = parse_trades(&raw)?;
+            let mut known: std::collections::HashSet<_> = trade_ids.iter().cloned().collect();
+            // fills 保留全页；扫描证据只收集本单，不能把同 token 的其他订单算入覆盖。
+            for fill in &fills {
+                if fill.order_id.as_deref() != Some(order_id) {
+                    continue;
+                }
+                if fill.coin.as_deref() != Some(token_id) {
+                    return Err(Error::msg("polymarket trade order asset mismatch"));
+                }
+                if known.insert(fill.trade_id.clone()) {
+                    trade_ids.push(fill.trade_id.clone());
+                }
+            }
             seen.push(cursor);
             let complete = next == TRADES_END_CURSOR;
             Ok(FillPage {
                 fills,
                 progress: json!({
+                    "version": 2,
                     "funder": funder.to_ascii_lowercase(),
                     "asset_id": token_id,
+                    "order_id": order_id,
+                    "after": after,
+                    "before": before,
                     "next_cursor": next,
                     "seen_cursors": seen,
+                    "trade_ids": trade_ids,
                 }),
                 complete,
                 history_complete: complete,
@@ -767,6 +831,9 @@ impl PolymarketVenue {
                 operation = "trade_page",
                 funder,
                 token_id,
+                order_id,
+                after,
+                before,
                 fills = page.fills.len(),
                 complete = page.complete,
                 elapsed_ms = started.elapsed().as_millis() as u64,
@@ -777,6 +844,9 @@ impl PolymarketVenue {
                 operation = "trade_page",
                 funder,
                 token_id,
+                order_id,
+                after,
+                before,
                 reason = %err,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "polymarket trade page invalid"
@@ -785,9 +855,18 @@ impl PolymarketVenue {
         parsed
     }
 
-    /// 旧接口不能表达进度，因此不允许把未完整的第一页当成完整历史交给调用方。
-    pub async fn poll_trades(&self, funder: &str, token_id: &str) -> Result<Vec<TradeFill>> {
-        let page = self.poll_trade_page(funder, token_id, &Value::Null).await?;
+    /// 旧接口仍须指定订单和固定窗口，且不能把未完整的第一页当成完整历史。
+    pub async fn poll_trades(
+        &self,
+        funder: &str,
+        token_id: &str,
+        order_id: &str,
+        after: i64,
+        before: i64,
+    ) -> Result<Vec<TradeFill>> {
+        let page = self
+            .poll_trade_page(funder, token_id, order_id, after, before, &Value::Null)
+            .await?;
         if !page.complete {
             return Err(Error::msg(
                 "polymarket trades require resumable poll_trade_page",
@@ -891,6 +970,22 @@ impl PolymarketVenue {
                 } else {
                     redact_http(&text)
                 },
+            });
+        }
+        if path.starts_with("/data/order/") {
+            // 保留 JSON null 的 missing 语义；空响应或非法 JSON 不能伪装成订单不存在。
+            return serde_json::from_str(&text).map_err(|_| {
+                tracing::warn!(
+                    service = "polymarket",
+                    operation = %method,
+                    endpoint = path,
+                    funder = %account.funder,
+                    http_status = status.as_u16(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    reason = "invalid_json",
+                    "polymarket order response invalid"
+                );
+                Error::msg("polymarket order invalid JSON response")
             });
         }
         if text.is_empty() || text == "null" {
@@ -1343,6 +1438,14 @@ fn parse_fee_schedule(raw: &Value, condition_id: &str, observed_at_ms: u64) -> R
 }
 
 pub fn parse_order_poll(raw: Value, order_id: &str) -> OrderPoll {
+    if raw.is_null() {
+        return OrderPoll {
+            status: "not_found".into(),
+            order_id: Some(order_id.into()),
+            raw: json!({"lookup_missing": "null_body"}),
+            ..OrderPoll::default()
+        };
+    }
     let shares = raw.get("size_matched").and_then(parse_decimal);
     let original_shares = raw.get("original_size").and_then(parse_decimal);
     let remaining_shares = original_shares.zip(shares).and_then(|(original, matched)| {
@@ -1382,16 +1485,41 @@ fn trade_page_cursor(
     progress: &Value,
     funder: &str,
     token_id: &str,
-) -> Result<(String, Vec<String>)> {
+    order_id: &str,
+    after: i64,
+    before: i64,
+) -> Result<(String, Vec<String>, Vec<String>)> {
+    if after < 0 || before.checked_sub(after) != Some(300) {
+        return Err(Error::msg(
+            "polymarket trades require a fixed 300-second window",
+        ));
+    }
+    if order_id.trim().is_empty() {
+        return Err(Error::msg("polymarket trades require an order_id"));
+    }
     if progress.is_null() || progress.as_object().is_some_and(|obj| obj.is_empty()) {
-        return Ok((TRADES_INITIAL_CURSOR.into(), Vec::new()));
+        return Ok((TRADES_INITIAL_CURSOR.into(), Vec::new(), Vec::new()));
     }
     let invalid = || Error::msg("invalid polymarket trade pagination progress");
+    let legacy = match progress.get("version") {
+        None if ["order_id", "after", "before", "trade_ids"]
+            .iter()
+            .all(|field| progress.get(*field).is_none()) =>
+        {
+            true
+        }
+        Some(version) if version.as_u64() == Some(2) => false,
+        _ => return Err(invalid()),
+    };
     if !progress
         .get("funder")
         .and_then(Value::as_str)
         .is_some_and(|previous| previous.eq_ignore_ascii_case(funder))
         || progress.get("asset_id").and_then(Value::as_str) != Some(token_id)
+        || (!legacy
+            && (progress.get("order_id").and_then(Value::as_str) != Some(order_id)
+                || progress.get("after").and_then(Value::as_i64) != Some(after)
+                || progress.get("before").and_then(Value::as_i64) != Some(before)))
     {
         return Err(invalid());
     }
@@ -1417,10 +1545,27 @@ fn trade_page_cursor(
     {
         return Err(invalid());
     }
-    if cursor == TRADES_END_CURSOR {
-        return Ok((TRADES_INITIAL_CURSOR.into(), Vec::new()));
+    // 旧进度没有固定窗口证据，即使已到 END 也必须从第一页迁移，不能继承完成状态。
+    if legacy {
+        return Ok((TRADES_INITIAL_CURSOR.into(), Vec::new(), Vec::new()));
     }
-    Ok((cursor, seen))
+    let mut unique = std::collections::HashSet::new();
+    let trade_ids = progress
+        .get("trade_ids")
+        .and_then(Value::as_array)
+        .ok_or_else(invalid)?
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .filter(|id| !id.is_empty() && unique.insert(*id))
+                .map(str::to_string)
+                .ok_or_else(invalid)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if cursor == TRADES_END_CURSOR {
+        return Ok((TRADES_INITIAL_CURSOR.into(), Vec::new(), Vec::new()));
+    }
+    Ok((cursor, seen, trade_ids))
 }
 
 fn required_trade_string(item: &Value, field: &str) -> Result<String> {
@@ -1808,7 +1953,7 @@ fn redact_http(text: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2395,7 +2540,7 @@ mod tests {
         assert!(parse_trades(&json!({"data": []})).unwrap().is_empty());
     }
 
-    async fn poll_stub(
+    pub(crate) async fn poll_stub(
         responses: Vec<(u16, Value)>,
     ) -> (PolymarketVenue, tokio::task::JoinHandle<Vec<String>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2554,44 +2699,101 @@ mod tests {
         assert!(cache_test_venue().fee_schedule(" ").await.is_err());
     }
 
+    const TRADES_TEST_AFTER: i64 = 1_700_000_000;
+    const TRADES_TEST_BEFORE: i64 = TRADES_TEST_AFTER + 300;
+
     fn assert_trade_request(request: &str, cursor: &str) {
         assert!(request.starts_with("GET /data/trades?"));
         let target = request.split_whitespace().nth(1).unwrap();
         let url = url::Url::parse(&format!("http://localhost{target}")).unwrap();
+        assert_eq!(url.query_pairs().count(), 4);
         let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
         assert_eq!(query.get("asset_id").map(String::as_str), Some("yes"));
         assert_eq!(query.get("next_cursor").map(String::as_str), Some(cursor));
+        assert_eq!(query["after"], TRADES_TEST_AFTER.to_string());
+        assert_eq!(query["before"], TRADES_TEST_BEFORE.to_string());
+    }
+
+    fn trade_progress_fixture(cursor: &str, seen: &[&str], trade_ids: &[&str]) -> Value {
+        json!({
+            "version": 2,
+            "funder": "test-funder",
+            "asset_id": "yes",
+            "order_id": "taker-1",
+            "after": TRADES_TEST_AFTER,
+            "before": TRADES_TEST_BEFORE,
+            "next_cursor": cursor,
+            "seen_cursors": seen,
+            "trade_ids": trade_ids,
+        })
     }
 
     #[tokio::test]
     async fn trade_pagination_resumes_second_page_and_restarts_after_end() {
+        let mut unrelated = trade_fixture("unrelated");
+        unrelated["taker_order_id"] = json!("other-order");
+        let mut case_mismatch = trade_fixture("case-mismatch");
+        case_mismatch["taker_order_id"] = json!("TAKER-1");
         let (venue, server) = poll_stub(vec![
-            (200, json!({"data": [trade_fixture("first")], "next_cursor": "MQ=="})),
-            // 跨页重复 trade 不在解析层去重，上层按 trade + order ID 持久化。
+            (200, json!({"data": [trade_fixture("first"), unrelated, case_mismatch], "next_cursor": "MQ=="})),
+            // fills 不去重，上层按 trade + order ID 持久化；progress 则收集本单去重证据。
             (200, json!({"data": [trade_fixture("first"), trade_fixture("second")], "next_cursor": "LTE="})),
-            (200, json!({"data": [], "next_cursor": "LTE="})),
+            (200, json!({"data": [trade_fixture("rescan-only")], "next_cursor": "LTE="})),
         ]).await;
         let first = venue
-            .poll_trade_page("test-funder", "yes", &Value::Null)
+            .poll_trade_page(
+                "test-funder",
+                "yes",
+                "taker-1",
+                TRADES_TEST_AFTER,
+                TRADES_TEST_BEFORE,
+                &Value::Null,
+            )
             .await
             .unwrap();
         assert!(!first.complete && !first.history_complete);
+        assert_eq!(first.fills.len(), 3);
         assert_eq!(first.fills[0].trade_id, "first");
+        assert_eq!(
+            first.progress,
+            trade_progress_fixture("MQ==", &["MA=="], &["first"])
+        );
         let saved = serde_json::to_string(&first.progress).unwrap();
         let restored: Value = serde_json::from_str(&saved).unwrap();
         let second = venue
-            .poll_trade_page("test-funder", "yes", &restored)
+            .poll_trade_page(
+                "test-funder",
+                "yes",
+                "taker-1",
+                TRADES_TEST_AFTER,
+                TRADES_TEST_BEFORE,
+                &restored,
+            )
             .await
             .unwrap();
         assert!(second.complete && second.history_complete);
         assert_eq!(second.fills.len(), 2);
         assert_eq!(second.fills[1].trade_id, "second");
-        assert_eq!(second.progress["seen_cursors"], json!(["MA==", "MQ=="]));
+        assert_eq!(
+            second.progress,
+            trade_progress_fixture("LTE=", &["MA==", "MQ=="], &["first", "second"])
+        );
         let next = venue
-            .poll_trade_page("test-funder", "yes", &second.progress)
+            .poll_trade_page(
+                "test-funder",
+                "yes",
+                "taker-1",
+                TRADES_TEST_AFTER,
+                TRADES_TEST_BEFORE,
+                &second.progress,
+            )
             .await
             .unwrap();
         assert!(next.complete && next.history_complete);
+        assert_eq!(
+            next.progress,
+            trade_progress_fixture("LTE=", &["MA=="], &["rescan-only"])
+        );
         let requests = server.await.unwrap();
         assert_trade_request(&requests[0], "MA==");
         assert_trade_request(&requests[1], "MQ==");
@@ -2599,27 +2801,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trade_pagination_collects_only_matching_maker_ids() {
+        let mut trade = trade_fixture("maker-trade");
+        trade["asset_id"] = json!("no");
+        trade["maker_orders"] = json!([
+            {"order_id": "maker-1", "matched_amount": "2", "price": "0.4", "asset_id": "yes"},
+            {"order_id": "maker-2", "matched_amount": "3", "price": "0.6", "asset_id": "no"}
+        ]);
+        let (venue, server) = poll_stub(vec![
+            (200, json!({"data": [trade.clone(), trade, trade_fixture("unrelated")], "next_cursor": "LTE="})),
+        ]).await;
+        let page = venue
+            .poll_trade_page(
+                "test-funder",
+                "yes",
+                "maker-1",
+                TRADES_TEST_AFTER,
+                TRADES_TEST_BEFORE,
+                &Value::Null,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.fills.len(), 7);
+        let mut expected = trade_progress_fixture("LTE=", &["MA=="], &["maker-trade"]);
+        expected["order_id"] = json!("maker-1");
+        assert_eq!(page.progress, expected);
+        assert_trade_request(&server.await.unwrap()[0], "MA==");
+    }
+
+    #[tokio::test]
+    async fn trade_pagination_rejects_matching_order_with_wrong_asset() {
+        let mut wrong_taker = trade_fixture("wrong-taker");
+        wrong_taker["asset_id"] = json!("no");
+        let mut wrong_maker = trade_fixture("wrong-maker");
+        wrong_maker["maker_orders"] = json!([
+            {"order_id": "maker-1", "matched_amount": "2", "price": "0.4", "asset_id": "no"}
+        ]);
+        let (venue, server) = poll_stub(vec![
+            (
+                200,
+                json!({"data": [trade_fixture("staged"), wrong_taker], "next_cursor": "LTE="}),
+            ),
+            (200, json!({"data": [wrong_maker], "next_cursor": "LTE="})),
+        ])
+        .await;
+        for order_id in ["taker-1", "maker-1"] {
+            let mut progress = trade_progress_fixture("MQ==", &["MA=="], &["saved"]);
+            progress["order_id"] = json!(order_id);
+            let saved = progress.clone();
+            let err = venue
+                .poll_trade_page(
+                    "test-funder",
+                    "yes",
+                    order_id,
+                    TRADES_TEST_AFTER,
+                    TRADES_TEST_BEFORE,
+                    &progress,
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("order asset mismatch"));
+            assert_eq!(progress, saved);
+        }
+        for request in server.await.unwrap() {
+            assert_trade_request(&request, "MQ==");
+        }
+    }
+
+    #[tokio::test]
     async fn trade_pagination_rejects_repeated_cursor_and_preserves_saved_progress() {
         let (venue, server) = poll_stub(vec![
-            (200, json!({"data": [], "next_cursor": "MQ=="})),
+            (
+                200,
+                json!({"data": [trade_fixture("saved")], "next_cursor": "MQ=="}),
+            ),
             (200, json!({"data": [], "next_cursor": "MA=="})),
             (200, json!({"data": [], "next_cursor": "MQ=="})),
         ])
         .await;
         let first = venue
-            .poll_trade_page("test-funder", "yes", &json!({}))
+            .poll_trade_page(
+                "test-funder",
+                "yes",
+                "taker-1",
+                TRADES_TEST_AFTER,
+                TRADES_TEST_BEFORE,
+                &json!({}),
+            )
             .await
             .unwrap();
         let saved = first.progress.clone();
         for _ in 0..2 {
             let err = venue
-                .poll_trade_page("test-funder", "yes", &first.progress)
+                .poll_trade_page(
+                    "test-funder",
+                    "yes",
+                    "taker-1",
+                    TRADES_TEST_AFTER,
+                    TRADES_TEST_BEFORE,
+                    &first.progress,
+                )
                 .await
                 .unwrap_err();
             assert!(err.to_string().contains("repeated cursor"));
             assert_eq!(first.progress, saved);
         }
         let requests = server.await.unwrap();
+        assert_trade_request(&requests[0], "MA==");
         assert_trade_request(&requests[1], "MQ==");
         assert_trade_request(&requests[2], "MQ==");
     }
@@ -2642,44 +2930,345 @@ mod tests {
         ])
         .await;
         let first = venue
-            .poll_trade_page("test-funder", "yes", &Value::Null)
+            .poll_trade_page(
+                "test-funder",
+                "yes",
+                "taker-1",
+                TRADES_TEST_AFTER,
+                TRADES_TEST_BEFORE,
+                &Value::Null,
+            )
             .await
             .unwrap();
+        let saved = first.progress.clone();
         for _ in 0..4 {
             assert!(venue
-                .poll_trade_page("test-funder", "yes", &first.progress)
+                .poll_trade_page(
+                    "test-funder",
+                    "yes",
+                    "taker-1",
+                    TRADES_TEST_AFTER,
+                    TRADES_TEST_BEFORE,
+                    &first.progress
+                )
                 .await
                 .is_err());
+            assert_eq!(first.progress, saved);
         }
         let recovered = venue
-            .poll_trade_page("test-funder", "yes", &first.progress)
+            .poll_trade_page(
+                "test-funder",
+                "yes",
+                "taker-1",
+                TRADES_TEST_AFTER,
+                TRADES_TEST_BEFORE,
+                &first.progress,
+            )
             .await
             .unwrap();
         assert!(recovered.complete && recovered.history_complete);
         assert_eq!(recovered.fills[0].trade_id, "recovered");
+        assert_eq!(
+            recovered.progress,
+            trade_progress_fixture("LTE=", &["MA==", "MQ=="], &["saved", "recovered"])
+        );
         let requests = server.await.unwrap();
+        assert_trade_request(&requests[0], "MA==");
         for request in &requests[1..] {
             assert_trade_request(request, "MQ==");
+        }
+    }
+
+    #[tokio::test]
+    async fn trade_pagination_migrates_legacy_progress_by_restarting_same_window() {
+        let (venue, server) = poll_stub(vec![
+            (
+                200,
+                json!({"data": [trade_fixture("fresh")], "next_cursor": "MQ=="}),
+            ),
+            (
+                200,
+                json!({"data": [trade_fixture("fresh")], "next_cursor": "MQ=="}),
+            ),
+        ])
+        .await;
+        for cursor in ["Mg==", "LTE="] {
+            let legacy = json!({
+                "funder": "TEST-FUNDER", "asset_id": "yes", "next_cursor": cursor,
+                "seen_cursors": ["MA==", "MQ=="]
+            });
+            let page = venue
+                .poll_trade_page(
+                    "test-funder",
+                    "yes",
+                    "taker-1",
+                    TRADES_TEST_AFTER,
+                    TRADES_TEST_BEFORE,
+                    &legacy,
+                )
+                .await
+                .unwrap();
+            assert!(!page.complete && !page.history_complete);
+            assert_eq!(
+                page.progress,
+                trade_progress_fixture("MQ==", &["MA=="], &["fresh"])
+            );
+        }
+        for request in server.await.unwrap() {
+            assert_trade_request(&request, "MA==");
         }
     }
 
     #[test]
     fn trade_pagination_rejects_unknown_history_and_wrong_query_progress() {
         for progress in [
+            json!(false),
+            json!([]),
             json!({"next_cursor": "MQ=="}),
             json!({"funder": "other", "asset_id": "yes", "next_cursor": "MQ==", "seen_cursors": ["MA=="]}),
             json!({"funder": "test-funder", "asset_id": "no", "next_cursor": "MQ==", "seen_cursors": ["MA=="]}),
             json!({"funder": "test-funder", "asset_id": "yes", "next_cursor": "LTE=", "seen_cursors": []}),
             json!({"funder": "test-funder", "asset_id": "yes", "next_cursor": "MQ==", "seen_cursors": ["MA==", "MQ=="]}),
+            json!({"funder": "test-funder", "asset_id": "yes", "next_cursor": "MQ==", "seen_cursors": ["MA=="], "after": TRADES_TEST_AFTER}),
         ] {
-            assert!(trade_page_cursor(&progress, "test-funder", "yes").is_err());
+            assert!(trade_page_cursor(
+                &progress,
+                "test-funder",
+                "yes",
+                "taker-1",
+                TRADES_TEST_AFTER,
+                TRADES_TEST_BEFORE
+            )
+            .is_err());
+        }
+        let valid = trade_progress_fixture("MQ==", &["MA=="], &["saved"]);
+        for (field, value) in [
+            ("version", json!(1)),
+            ("version", json!(3)),
+            ("version", json!("2")),
+            ("version", Value::Null),
+            ("funder", json!("other")),
+            ("asset_id", json!("no")),
+            ("order_id", json!("TAKER-1")),
+            ("after", json!(TRADES_TEST_AFTER + 1)),
+            ("before", json!(TRADES_TEST_BEFORE + 1)),
+            ("after", json!(TRADES_TEST_AFTER.to_string())),
+            ("before", Value::Null),
+            ("next_cursor", json!("")),
+            ("next_cursor", json!("MA==")),
+            ("seen_cursors", json!([])),
+            ("seen_cursors", json!(["MQ=="])),
+            ("seen_cursors", json!(["MA==", "MA=="])),
+            ("seen_cursors", json!(["MA==", "LTE="])),
+            ("seen_cursors", json!(["MA==", null])),
+            ("seen_cursors", json!(["MA==", ""])),
+            ("trade_ids", Value::Null),
+            ("trade_ids", json!(["saved", "saved"])),
+            ("trade_ids", json!([""])),
+            ("trade_ids", json!([5])),
+        ] {
+            let mut progress = valid.clone();
+            progress[field] = value;
+            assert!(
+                trade_page_cursor(
+                    &progress,
+                    "test-funder",
+                    "yes",
+                    "taker-1",
+                    TRADES_TEST_AFTER,
+                    TRADES_TEST_BEFORE
+                )
+                .is_err(),
+                "{field}"
+            );
+        }
+        for field in valid.as_object().unwrap().keys() {
+            let mut progress = valid.clone();
+            progress.as_object_mut().unwrap().remove(field);
+            assert!(
+                trade_page_cursor(
+                    &progress,
+                    "test-funder",
+                    "yes",
+                    "taker-1",
+                    TRADES_TEST_AFTER,
+                    TRADES_TEST_BEFORE
+                )
+                .is_err(),
+                "missing {field}"
+            );
+        }
+        // END 不能绕过损坏 progress 的校验。
+        let corrupt_end = trade_progress_fixture("LTE=", &["MA=="], &["duplicate", "duplicate"]);
+        assert!(trade_page_cursor(
+            &corrupt_end,
+            "test-funder",
+            "yes",
+            "taker-1",
+            TRADES_TEST_AFTER,
+            TRADES_TEST_BEFORE
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn trade_pagination_rejects_changed_order_or_window_before_request() {
+        let (venue, server) =
+            poll_stub(vec![(200, json!({"data": [], "next_cursor": "LTE="}))]).await;
+        for cursor in ["MQ==", "LTE="] {
+            let progress = trade_progress_fixture(cursor, &["MA=="], &["saved"]);
+            for (order_id, after, before) in [
+                ("other-order", TRADES_TEST_AFTER, TRADES_TEST_BEFORE),
+                ("taker-1", TRADES_TEST_AFTER + 1, TRADES_TEST_BEFORE + 1),
+            ] {
+                let err = venue
+                    .poll_trade_page("test-funder", "yes", order_id, after, before, &progress)
+                    .await
+                    .unwrap_err();
+                assert!(err.to_string().contains("pagination progress"));
+            }
+        }
+        let page = venue
+            .poll_trade_page(
+                "TEST-FUNDER",
+                "yes",
+                "taker-1",
+                TRADES_TEST_AFTER,
+                TRADES_TEST_BEFORE,
+                &Value::Null,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.progress,
+            trade_progress_fixture("LTE=", &["MA=="], &[])
+        );
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_trade_request(&requests[0], "MA==");
+    }
+
+    #[tokio::test]
+    async fn trade_queries_require_order_and_exact_nonnegative_300_second_window() {
+        let venue = cache_test_venue();
+        for (after, before) in [
+            (-1, 299),
+            (0, 299),
+            (0, 301),
+            (300, 0),
+            (i64::MAX, i64::MIN),
+        ] {
+            let err = venue
+                .poll_trade_page("test-funder", "yes", "taker-1", after, before, &Value::Null)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("300-second window"));
+            let err = venue
+                .poll_trades("test-funder", "yes", "taker-1", after, before)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("300-second window"));
+        }
+        for order_id in ["", " "] {
+            let err = venue
+                .poll_trade_page("test-funder", "yes", order_id, 0, 300, &Value::Null)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("require an order_id"));
+        }
+        for (after, before) in [(0, 300), (i64::MAX - 300, i64::MAX)] {
+            assert_eq!(
+                trade_page_cursor(&Value::Null, "test-funder", "yes", "taker-1", after, before)
+                    .unwrap(),
+                (TRADES_INITIAL_CURSOR.into(), Vec::new(), Vec::new())
+            );
         }
     }
 
     #[tokio::test]
-    async fn poll_order_404_is_not_found_without_fill_or_association_evidence() {
-        let (venue, server) = poll_stub(vec![(404, json!({"error": "not found"}))]).await;
-        let order = venue.poll_order("test-funder", "order-id").await.unwrap();
+    async fn poll_trades_keeps_bounded_query_and_rejects_incomplete_first_page() {
+        let (venue, server) = poll_stub(vec![
+            (
+                200,
+                json!({"data": [trade_fixture("incomplete")], "next_cursor": "MQ=="}),
+            ),
+            (
+                200,
+                json!({"data": [trade_fixture("complete")], "next_cursor": "LTE="}),
+            ),
+        ])
+        .await;
+        let err = venue
+            .poll_trades(
+                "test-funder",
+                "yes",
+                "taker-1",
+                TRADES_TEST_AFTER,
+                TRADES_TEST_BEFORE,
+            )
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("require resumable poll_trade_page"));
+        let fills = venue
+            .poll_trades(
+                "test-funder",
+                "yes",
+                "taker-1",
+                TRADES_TEST_AFTER,
+                TRADES_TEST_BEFORE,
+            )
+            .await
+            .unwrap();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].trade_id, "complete");
+        for request in server.await.unwrap() {
+            assert_trade_request(&request, "MA==");
+        }
+    }
+
+    #[tokio::test]
+    async fn trade_window_is_sent_to_server_without_local_last_update_filter() {
+        let mut old_update = trade_fixture("old-update");
+        old_update["match_time"] = json!((TRADES_TEST_AFTER + 1).to_string());
+        old_update["last_update"] = json!((TRADES_TEST_AFTER - 1).to_string());
+        let mut later_update = trade_fixture("later-update");
+        later_update["match_time"] = json!((TRADES_TEST_AFTER + 2).to_string());
+        later_update["last_update"] = json!((TRADES_TEST_BEFORE + 600).to_string());
+        let (venue, server) = poll_stub(vec![
+            (200, json!({"data": [old_update.clone(), later_update.clone(), trade_fixture("no-update")], "next_cursor": "LTE="})),
+        ]).await;
+        let page = venue
+            .poll_trade_page(
+                "test-funder",
+                "yes",
+                "taker-1",
+                TRADES_TEST_AFTER,
+                TRADES_TEST_BEFORE,
+                &Value::Null,
+            )
+            .await
+            .unwrap();
+        // 只验证请求结构和本地不丢状态更新；mock 不证明真实服务的时间过滤语义。
+        assert_eq!(page.fills.len(), 3);
+        assert_eq!(page.fills[0].raw["last_update"], old_update["last_update"]);
+        assert_eq!(
+            page.fills[1].raw["last_update"],
+            later_update["last_update"]
+        );
+        assert_eq!(
+            page.progress,
+            trade_progress_fixture(
+                "LTE=",
+                &["MA=="],
+                &["old-update", "later-update", "no-update"]
+            )
+        );
+        assert_trade_request(&server.await.unwrap()[0], "MA==");
+    }
+
+    fn assert_missing_order(order: &OrderPoll, source: &str) {
         assert!(!order.found);
         assert_eq!(order.status, "not_found");
         assert_eq!(order.order_id.as_deref(), Some("order-id"));
@@ -2688,9 +3277,76 @@ mod tests {
                 && order.original_shares.is_none()
                 && order.remaining_shares.is_none()
         );
+        assert!(order.price.is_none() && order.fee.is_none() && order.coin.is_none());
         assert!(order.associated_trades.is_empty());
-        assert!(order.raw.get("associate_trades").is_none());
-        assert_eq!(server.await.unwrap(), ["GET /data/order/order-id HTTP/1.1"]);
+        assert_eq!(order.raw, json!({"lookup_missing": source}));
+    }
+
+    #[test]
+    fn parse_order_poll_null_is_not_found() {
+        assert_missing_order(&parse_order_poll(Value::Null, "order-id"), "null_body");
+    }
+
+    #[tokio::test]
+    async fn poll_order_404_and_null_are_missing_with_distinct_evidence() {
+        let (venue, server) = poll_stub(vec![
+            (404, json!({"error": "not found"})),
+            (200, Value::Null),
+        ])
+        .await;
+        for source in ["http_404", "null_body"] {
+            let order = venue.poll_order("test-funder", "order-id").await.unwrap();
+            assert_missing_order(&order, source);
+        }
+        assert_eq!(
+            server.await.unwrap(),
+            ["GET /data/order/order-id HTTP/1.1"; 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_order_rejects_malformed_success_and_other_http_errors() {
+        let invalid = vec![
+            json!([]),
+            json!(false),
+            json!(17),
+            json!("null"),
+            json!({}),
+            json!({"id": "order-id"}),
+            json!({"status": null}),
+            json!({"status": true}),
+            json!({"status": ""}),
+            json!({"status": " "}),
+        ];
+        let count = invalid.len();
+        let mut responses: Vec<_> = invalid.into_iter().map(|raw| (200, raw)).collect();
+        responses.push((503, json!({"error": "do not expose payload"})));
+        // 合法对象仍沿用原 parser 的可选字段行为，不要求完整订单字段。
+        responses.push((200, json!({"status": "MATCHED"})));
+        let (venue, server) = poll_stub(responses).await;
+        for _ in 0..count {
+            let err = venue
+                .poll_order("test-funder", "order-id")
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("missing or invalid status"));
+        }
+        let err = venue
+            .poll_order("test-funder", "order-id")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Http { status: 503, .. }));
+        assert!(!err.to_string().contains("do not expose payload"));
+        let found = venue.poll_order("test-funder", "order-id").await.unwrap();
+        assert!(found.found);
+        assert_eq!(found.status, "MATCHED");
+        assert_eq!(found.order_id.as_deref(), Some("order-id"));
+        assert!(found.shares.is_none() && found.associated_trades.is_empty());
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), count + 2);
+        assert!(requests
+            .iter()
+            .all(|request| request == "GET /data/order/order-id HTTP/1.1"));
     }
 
     fn d(s: &str) -> Decimal {

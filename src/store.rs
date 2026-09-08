@@ -3,7 +3,7 @@ use crate::domain::{MarketIdentity, TopicKey};
 use crate::error::{Error, Result};
 use crate::hedge::Positions;
 use crate::platforms::{OrderPoll, TradeFill};
-use crate::reconcile::{merge_observation, resolve_leg, FillEvidence, LegResolution};
+use crate::reconcile::{merge_observation, resolve_leg, FillEvidence, LegResolution, PmTradeScan};
 use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -430,20 +430,23 @@ impl Store {
             tx.commit().await?;
             return Ok(());
         }
+        let has_observation: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM fills WHERE leg_id = $1)")
+                .bind(leg_id)
+                .fetch_one(&mut *tx)
+                .await?;
         let known = current.third_order_id.as_deref();
         if let (Some(known), Some(incoming)) = (known, order_id) {
-            if known != incoming && Some(known) != current.client_order_id.as_deref() {
+            if known != incoming
+                && (Some(known) != current.client_order_id.as_deref()
+                    || (current.platform == POLYMARKET && has_observation))
+            {
                 return Err(Error::msg(
                     "submit response conflicts with recovered order id",
                 ));
             }
         }
         let terminal = status == "cancelled" || status == "failed";
-        let has_observation: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM fills WHERE leg_id = $1)")
-                .bind(leg_id)
-                .fetch_one(&mut *tx)
-                .await?;
         // 找到订单或已有撮合证据后，晚到的拒单不能证明零成交。
         let next_status = if terminal && (has_observation || current.status == "actived") {
             current.status.as_str()
@@ -455,6 +458,15 @@ impl Store {
         let mut info = current
             .last_order_info
             .unwrap_or_else(|| serde_json::json!({}));
+        if current.platform == POLYMARKET
+            && known
+                .zip(order_id)
+                .is_some_and(|(known, incoming)| known != incoming)
+        {
+            // 尚无成交时允许恢复远端 oid，但旧候选订单的窗口进度不能沿用。
+            info["fill_progress"] = Value::Null;
+            info["fill_evidence"] = Value::Null;
+        }
         if info.pointer("/submission/kind").and_then(Value::as_str) != Some("ack")
             || evidence.get("kind").and_then(Value::as_str) == Some("ack")
         {
@@ -486,13 +498,29 @@ impl Store {
             tx.rollback().await?;
             return Ok(None);
         }
-        if let Some(incoming) = poll.order_id.as_deref() {
-            if current.third_order_id.as_deref().is_some_and(|known| {
-                known != incoming && Some(known) != current.client_order_id.as_deref()
-            }) {
-                return Err(Error::msg(
-                    "order lookup conflicts with durable order identity",
-                ));
+        if let (Some(known), Some(incoming)) =
+            (current.third_order_id.as_deref(), poll.order_id.as_deref())
+        {
+            if known != incoming {
+                let has_pm_observation = if current.platform == POLYMARKET {
+                    sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS(SELECT 1 FROM fills WHERE leg_id = $1)",
+                    )
+                    .bind(leg.id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                } else {
+                    false
+                };
+                // 按本地订单哈希落过真实成交后，不能让迟到查单把腿与明细分离。
+                if Some(known) != current.client_order_id.as_deref()
+                    || has_pm_observation
+                    || (current.platform == POLYMARKET && !poll.found)
+                {
+                    return Err(Error::msg(
+                        "order lookup conflicts with durable order identity",
+                    ));
+                }
             }
         }
         if poll
@@ -514,6 +542,16 @@ impl Store {
             .last_order_info
             .clone()
             .unwrap_or_else(|| serde_json::json!({}));
+        if current.platform == POLYMARKET
+            && current
+                .third_order_id
+                .as_deref()
+                .zip(poll.order_id.as_deref())
+                .is_some_and(|(known, incoming)| known != incoming)
+        {
+            info["fill_progress"] = Value::Null;
+            info["fill_evidence"] = Value::Null;
+        }
         info["order_poll"] = serde_json::to_value(poll)?;
         sqlx::query(
             "UPDATE legs SET third_order_id = COALESCE($2,third_order_id),
@@ -529,6 +567,27 @@ impl Store {
         let updated = read_locked_leg(&mut tx, leg.id).await?;
         tx.commit().await?;
         Ok(Some(updated))
+    }
+
+    pub async fn record_reconciliation_wait(&self, leg: &LegRow, reason: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let (_, parent_open) = lock_leg_parent(&mut tx, leg.id).await?;
+        let current = read_locked_leg(&mut tx, leg.id).await?;
+        if !parent_open || !leg_open(&current.status) || current.updated_at != leg.updated_at {
+            tx.rollback().await?;
+            return Ok(());
+        }
+        let mut info = current
+            .last_order_info
+            .unwrap_or_else(|| serde_json::json!({}));
+        info["waiting_reason"] = serde_json::json!(reason);
+        sqlx::query("UPDATE legs SET last_order_info=$2,updated_at=clock_timestamp() WHERE id=$1")
+            .bind(leg.id)
+            .bind(info)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// 明细、分页进度、腿最终账务和父单完成在同一事务提交。
@@ -552,6 +611,31 @@ impl Store {
             .ok_or_else(|| Error::msg("reconciliation requires recovered order id"))?;
         if evidence.poll.order_id.as_deref() != Some(oid) {
             return Err(Error::msg("reconciliation evidence order id mismatch"));
+        }
+        if current.platform == POLYMARKET {
+            if let Some(scan) = &evidence.pm_scan {
+                scan.validate()?;
+                let persisted: PmTradeScan = serde_json::from_value(progress.clone())?;
+                if &persisted != scan
+                    || scan.order_id != oid
+                    || scan.asset_id != current.token_id
+                    || !current
+                        .funder_address
+                        .as_deref()
+                        .is_some_and(|funder| funder.eq_ignore_ascii_case(&scan.funder))
+                    || current.submitted_at.map(|time| time.timestamp()) != Some(scan.after)
+                    || evidence.page_complete != (scan.next_cursor == "LTE=")
+                    || evidence.history_complete != evidence.page_complete
+                    || observations.iter().any(|fill| {
+                        fill.coin.as_deref() != Some(current.token_id.as_str())
+                            || !scan.trade_ids.contains(&fill.trade_id)
+                    })
+                {
+                    return Err(Error::msg(
+                        "polymarket scan does not match persisted leg or page",
+                    ));
+                }
+            }
         }
         for incoming in observations {
             if incoming.trade_id.is_empty()
