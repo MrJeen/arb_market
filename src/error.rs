@@ -14,6 +14,10 @@ pub enum Error {
     StaleBook(String),
     #[error("no opportunity")]
     NoOpportunity,
+    #[error("order capacity reached")]
+    OrderCapacityReached,
+    #[error("order confirmation expired before admission")]
+    OrderConfirmationExpired,
     #[error("http {status}: {message}")]
     Http { status: u16, message: String },
     #[error("order rejected ({code}): {message}")]

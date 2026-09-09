@@ -12,10 +12,62 @@ pub struct FillEvidence {
     pub page_complete: bool,
     pub history_complete: bool,
     pub expected_shares: Option<Decimal>,
+    // 覆盖授权只存在于刚完成 HTTP 验证的调用链，持久化重载不能恢复它。
+    #[serde(skip)]
+    pub outcome_scan: Option<crate::platforms::outcome::FillProgress>,
     #[serde(default)]
     pub pm_scan: Option<PmTradeScan>,
     #[serde(default)]
     pub pm_order_constraints: Option<PmOrderConstraints>,
+}
+
+pub(crate) fn validate_outcome_evidence(
+    leg: &crate::store::LegRow,
+    evidence: &mut FillEvidence,
+    progress: &Value,
+) -> Result<()> {
+    let info = leg.last_order_info.as_ref();
+    evidence.expected_shares = info
+        .and_then(|info| info.pointer("/submission/expected_shares"))
+        .and_then(crate::platforms::parse_decimal);
+    let Some(scan) = evidence.outcome_scan.as_ref() else {
+        // v1 / 老调用者仍可提交真实成交并走数量捷径，但持久 bool 不授予覆盖证明。
+        evidence.history_complete = false;
+        return Ok(());
+    };
+    let persisted: crate::platforms::outcome::FillProgress =
+        serde_json::from_value(progress.clone())?;
+    let submitted = leg
+        .submitted_at
+        .map(|time| time.timestamp_millis().saturating_sub(30_000).max(0) as u64);
+    let observed = info
+        .and_then(|info| info.get("outcome_terminal_observed_at_ms"))
+        .and_then(Value::as_u64);
+    if &persisted != scan
+        || scan.version != 2
+        || scan.token_id != leg.token_id
+        || submitted != Some(scan.submitted_at_ms)
+        || !leg
+            .wallet_address
+            .as_deref()
+            .is_some_and(|account| account.eq_ignore_ascii_case(&scan.account))
+        || evidence.page_complete != scan.complete
+        || evidence.history_complete != scan.history_complete
+    {
+        return Err(Error::msg(
+            "outcome scan does not match persisted leg or page",
+        ));
+    }
+    if evidence.history_complete {
+        let follows_probe = info
+            .and_then(|info| info.get("fill_progress"))
+            .is_some_and(|previous| scan.follows_final_probe(previous));
+        if !scan.has_coverage() || scan.terminal_observed_at_ms != observed || !follows_probe {
+            evidence.history_complete = false;
+            evidence.outcome_scan = None;
+        }
+    }
+    Ok(())
 }
 
 /// 已查到的成交事实只能增加；缺单响应不能抹掉尚未取齐的关联成交。
@@ -351,7 +403,13 @@ pub fn resolve_leg(
             if expected < Decimal::ZERO || shares != expected {
                 return Ok(LegResolution::Pending("executed_quantity_incomplete"));
             }
-        } else if !evidence.page_complete || !evidence.history_complete {
+        } else if !evidence.page_complete
+            || !evidence.history_complete
+            || !evidence
+                .outcome_scan
+                .as_ref()
+                .is_some_and(|scan| scan.has_coverage())
+        {
             return Ok(LegResolution::Pending("fill_history_incomplete"));
         }
         if poll
@@ -515,6 +573,7 @@ mod tests {
             expected_shares: Some(d("10")),
             pm_scan: None,
             pm_order_constraints: None,
+            outcome_scan: None,
         }
     }
 
@@ -912,6 +971,7 @@ mod tests {
             expected_shares: None,
             pm_scan: None,
             pm_order_constraints: None,
+            outcome_scan: None,
         };
         assert_eq!(
             resolve_leg(OUTCOME, &[], &evidence).unwrap(),
@@ -923,8 +983,27 @@ mod tests {
             LegResolution::Pending("fill_history_incomplete")
         );
         evidence.history_complete = true;
+        assert_eq!(
+            resolve_leg(OUTCOME, &[one.clone()], &evidence).unwrap(),
+            LegResolution::Pending("fill_history_incomplete")
+        );
+        evidence.outcome_scan = Some(
+            serde_json::from_value(json!({
+                "version":2,"tokenId":"#5160","submittedAtMs":100,"endTime":1000,
+                "cursor":100,"seenIds":[],"historyChecked":true,"historyLowerBound":99,
+                "historyComplete":true,"scannedCount":1,"complete":true,"phase":"complete",
+                "account":"0xaccount","terminalObservedAtMs":999,"scanValid":true
+            }))
+            .unwrap(),
+        );
         assert!(
             matches!(resolve_leg(OUTCOME,&[one.clone()],&evidence).unwrap(),LegResolution::Terminal{shares,..} if shares==d("6"))
+        );
+        let reloaded: FillEvidence =
+            serde_json::from_value(serde_json::to_value(&evidence).unwrap()).unwrap();
+        assert_eq!(
+            resolve_leg(OUTCOME, &[one.clone()], &reloaded).unwrap(),
+            LegResolution::Pending("fill_history_incomplete")
         );
         evidence.history_complete = false;
         evidence.expected_shares = Some(d("6"));

@@ -55,13 +55,15 @@ struct Acc {
 }
 
 impl Acc {
-    fn plus(&self, net: Decimal, pm_px: Decimal, out_px: Decimal) -> Self {
+    fn plus(&self, net: Decimal, pm: &PmQuote, out_px: Decimal) -> Self {
+        debug_assert_eq!(net, floor_shares(net));
+        debug_assert!(net > Decimal::ZERO && net <= pm.max_net);
         Self {
             pm_shares: self.pm_shares + net,
             out_shares: self.out_shares + net,
-            pm_cost: self.pm_cost + pm_px * net,
+            pm_cost: self.pm_cost + pm.cost(net),
             out_cost: self.out_cost + out_px * net,
-            pm_cap: self.pm_cap.max(pm_px),
+            pm_cap: self.pm_cap.max(pm.cap),
             out_cap: self.out_cap.max(out_px),
         }
     }
@@ -252,6 +254,84 @@ fn take_asks_cost(
     Some(cost)
 }
 
+/// 一个物理终点档的整数报价：首股可跨档，后续整股都在 cap 价成交。
+struct PmQuote {
+    max_net: Decimal,
+    first_cost: Decimal,
+    cap: Decimal,
+}
+
+impl PmQuote {
+    fn cost(&self, net: Decimal) -> Decimal {
+        debug_assert!(net >= Decimal::ONE && net <= self.max_net);
+        self.first_cost + (net - Decimal::ONE) * self.cap
+    }
+
+    fn average_price(&self, net: Decimal) -> Decimal {
+        self.cost(net) / net
+    }
+}
+
+struct PmCursor {
+    asks: Vec<Level>,
+    index: usize,
+}
+
+impl PmCursor {
+    fn new(asks: &[Level]) -> Self {
+        let mut asks = asks.to_vec();
+        asks.sort_by(|a, b| a.price.cmp(&b.price));
+        Self { asks, index: 0 }
+    }
+
+    fn current(&mut self) -> Option<&mut Level> {
+        while let Some(level) = self.asks.get(self.index) {
+            if level.price > Decimal::ZERO && level.size > Decimal::ZERO {
+                break;
+            }
+            self.index += 1;
+        }
+        self.asks.get_mut(self.index)
+    }
+
+    // 游标先取报价；调用方只有完整消费该报价才继续，否则必须结束搜索。
+    fn next_quote(&mut self, max_net: Decimal) -> Option<PmQuote> {
+        debug_assert!(max_net >= Decimal::ONE && max_net == floor_shares(max_net));
+        let level = self.current()?;
+        let whole = floor_shares(level.size).min(max_net);
+        if whole >= Decimal::ONE {
+            level.size -= whole;
+            return Some(PmQuote {
+                max_net: whole,
+                first_cost: level.price,
+                cap: level.price,
+            });
+        }
+
+        // 小数尾量按物理档推进，凑满一股才报价，不受候选循环次数限制。
+        let mut remain = Decimal::ONE;
+        let mut cost = Decimal::ZERO;
+        let mut cap = Decimal::ZERO;
+        while remain > Decimal::ZERO {
+            let level = self.current()?;
+            let take = level.size.min(remain);
+            cost += level.price * take;
+            cap = cap.max(level.price);
+            level.size -= take;
+            remain -= take;
+        }
+        // 桥接股不是独立候选区间：连同终点档余下整股一起评估，避免刚凑够5股就早返。
+        let level = &mut self.asks[self.index];
+        let extra = floor_shares(level.size).min(max_net - Decimal::ONE);
+        level.size -= extra;
+        Some(PmQuote {
+            max_net: Decimal::ONE + extra,
+            first_cost: cost,
+            cap,
+        })
+    }
+}
+
 fn search_pair(
     pm_token: &TokenRef,
     out_token: &TokenRef,
@@ -261,42 +341,45 @@ fn search_pair(
     limits: &ArbLimits,
     pm_tick: Decimal,
 ) -> Option<ArbPlan> {
-    let mut pm_asks = pm_asks.to_vec();
+    let mut pm = PmCursor::new(pm_asks);
     let mut out_asks = out_asks.to_vec();
-    pm_asks.sort_by(|a, b| a.price.cmp(&b.price));
     out_asks.sort_by(|a, b| a.price.cmp(&b.price));
     let mut acc = Acc::default();
     let mut remain = limits.cost_limit;
 
-    for _ in 0..64 {
-        drop_unusable(&mut pm_asks, false);
+    loop {
         drop_unusable(&mut out_asks, true);
-        let Some((pm_px, pm_sz, out_px, out_sz)) = peek_first(&pm_asks, &out_asks) else {
+        let Some(out) = out_asks.first() else {
             break;
         };
-        let max_net = floor_shares(pm_sz.min(out_sz));
-        if max_net <= Decimal::ZERO {
+        let out_px = out.price;
+        let Some(quote) = pm.next_quote(floor_shares(out.size)) else {
             break;
-        }
-        let unit_cost = all_in_unit_cost(pm_px, out_px, fees);
+        };
+        let max_net = quote.max_net;
+        let unit_cost = all_in_unit_cost(quote.average_price(max_net), out_px, fees);
         if unit_cost >= Decimal::ONE || unit_cost <= Decimal::ZERO {
             break;
         }
 
-        // 门槛只判断能否做；同价档内能过线就买 min(剩余预算, 档深)。
-        if let Some(net) = fill_to_budget(
-            &acc, remain, unit_cost, pm_px, out_px, max_net, fees, limits,
-        ) {
+        let (take, ended) = if quote.first_cost != quote.cap {
+            // 跨档首股有折价，缩量后均价会变；只在本报价内按真实成本找预算边界。
+            let take = quote_net_to_budget(&acc, &quote, out_px, fees, limits);
+            (take, take < max_net)
+        } else {
+            clip_to_remain(max_net, unit_cost, remain)
+        };
+        // 门槛只判断能否做；当前物理终点区间能过线就买满预算或深度。
+        if let Some(net) = fill_to_budget(&acc, remain, take, &quote, out_px, fees, limits) {
             return acc
-                .plus(net, pm_px, out_px)
+                .plus(net, &quote, out_px)
                 .to_plan(pm_token, out_token, fees, limits, pm_tick);
         }
 
-        let (take, ended) = clip_to_remain(max_net, unit_cost, remain);
         if take <= Decimal::ZERO {
             break;
         }
-        acc = acc.plus(take, pm_px, out_px);
+        acc = acc.plus(take, &quote, out_px);
         remain = (limits.cost_limit - acc.metrics(fees, limits).total_cost).max(Decimal::ZERO);
         if acc.metrics(fees, limits).total_cost > limits.cost_limit {
             break;
@@ -307,7 +390,6 @@ fn search_pair(
         if ended {
             break;
         }
-        consume_qty(&mut pm_asks, take, false);
         consume_qty(&mut out_asks, take, true);
     }
     None
@@ -328,19 +410,6 @@ pub fn first_usable_ask(asks: &[Level], floor_out: bool) -> Option<(Decimal, Dec
         return None;
     }
     Some((level.price, size))
-}
-
-fn peek_first(
-    pm_asks: &[Level],
-    out_asks: &[Level],
-) -> Option<(Decimal, Decimal, Decimal, Decimal)> {
-    let pm = pm_asks.first()?;
-    let out = out_asks.first()?;
-    let out_sz = floor_shares(out.size);
-    if pm.size <= Decimal::ZERO || out_sz <= Decimal::ZERO {
-        return None;
-    }
-    Some((pm.price, pm.size, out.price, out_sz))
 }
 
 fn drop_unusable(asks: &mut Vec<Level>, floor_out: bool) {
@@ -400,25 +469,60 @@ fn clip_to_remain(max_net: Decimal, unit_cost: Decimal, remain: Decimal) -> (Dec
     }
 }
 
+/// 仅桥接报价需要重算预算边界。合法预测价格及 [0,1] 费率下，新增成本严格递增：
+/// PM 的边际费用 = rate * (p * (1-p) + (p-avg)^2)，Outcome 费用也非负。
+/// Decimal 最多96位整数，整数二分不超过96次；不逐股扫描大档。
+fn quote_net_to_budget(
+    acc: &Acc,
+    quote: &PmQuote,
+    out_px: Decimal,
+    fees: &FeeContext,
+    limits: &ArbLimits,
+) -> Decimal {
+    if !(Decimal::ZERO..=Decimal::ONE).contains(&fees.polymarket_fee_rate)
+        || !(Decimal::ZERO..=Decimal::ONE).contains(&fees.outcome_taker_rate)
+        || quote.cap > Decimal::ONE
+        || out_px > Decimal::ONE
+    {
+        // 不扩大费率配置校验范围；无法证明单调的桥接报价保守拒绝。
+        return Decimal::ZERO;
+    }
+    let mut low = Decimal::ZERO;
+    let mut high = quote.max_net;
+    while low < high {
+        let mid = low + ((high - low) / Decimal::from(2)).ceil();
+        if acc
+            .plus(mid, quote, out_px)
+            .metrics(fees, limits)
+            .total_cost
+            <= limits.cost_limit
+        {
+            low = mid;
+        } else {
+            high = mid - Decimal::ONE;
+        }
+    }
+    low
+}
+
 fn fill_to_budget(
     acc: &Acc,
     remain: Decimal,
-    unit_cost: Decimal,
-    pm_px: Decimal,
+    mut net: Decimal,
+    quote: &PmQuote,
     out_px: Decimal,
-    max_net: Decimal,
     fees: &FeeContext,
     limits: &ArbLimits,
 ) -> Option<Decimal> {
-    if remain <= Decimal::ZERO || unit_cost <= Decimal::ZERO {
+    if remain <= Decimal::ZERO {
         return None;
     }
-    let mut net = floor_shares((remain / unit_cost).min(max_net));
+    let max_net = quote.max_net;
     for _ in 0..8 {
         if net <= Decimal::ZERO {
             return None;
         }
-        let trial = acc.plus(net, pm_px, out_px);
+        let trial = acc.plus(net, quote, out_px);
         if trial.passes_all(fees, limits) {
             return Some(net);
         }
@@ -1077,6 +1181,354 @@ mod tests {
         assert!(reasons.contains(&"cost_limit"));
     }
 
+    fn assert_fractional_plan(
+        pm_asks: Vec<Level>,
+        out_asks: Vec<Level>,
+        fees: &FeeContext,
+        limits: &ArbLimits,
+        shares: Decimal,
+        pm_cost: Decimal,
+        pm_cap: Decimal,
+    ) -> ArbPlan {
+        let now = Instant::now();
+        let mut books = BookStore::default();
+        books.replace_snapshot(POLYMARKET, "pm-yes", vec![], pm_asks, 1, now);
+        books.set_tick_size(POLYMARKET, "pm-yes", d("0.01"));
+        books.replace_snapshot(OUTCOME, "#10", vec![], out_asks, 1, now);
+        let topic = sample_topic();
+        let pm = books.get(POLYMARKET, "pm-yes").unwrap();
+        let out = books.get(OUTCOME, "#10").unwrap();
+        let plan = plan_arbitrage(
+            &topic,
+            pm,
+            out,
+            &topic.tokens[0],
+            &topic.tokens[2],
+            fees,
+            limits,
+        )
+        .expect("fractional depth is fillable");
+        assert_eq!(plan.net_shares, shares);
+        assert_eq!(plan.pm.shares, shares);
+        assert_eq!(plan.outcome.shares, shares);
+        assert_eq!(floor_shares(shares), shares);
+        assert_eq!(plan.pm.cost, pm_cost);
+        assert_eq!(plan.pm.cap_price, pm_cap);
+        assert_eq!(
+            take_asks_cost(&pm.asks, shares, plan.pm.cap_price, false),
+            Some(plan.pm.cost)
+        );
+        assert_eq!(
+            take_asks_cost(&out.asks, shares, plan.outcome.cap_price, true),
+            Some(plan.outcome.cost)
+        );
+        assert_eq!(
+            plan.total_cost,
+            plan.pm.cost + plan.outcome.cost + plan.pm.fee + plan.outcome.fee
+        );
+        assert!(confirm_plan(&topic, &plan, pm, out, fees, limits).is_some());
+        plan
+    }
+
+    fn levels(rows: &[(&str, &str)]) -> Vec<Level> {
+        rows.iter()
+            .map(|(price, size)| Level {
+                price: d(price),
+                size: d(size),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fractional_first_level_fills_terminal_depth_not_just_venue_min() {
+        assert_fractional_plan(
+            levels(&[("0.30", "0.5"), ("0.40", "100")]),
+            levels(&[("0.40", "1000")]),
+            &fees_zero(),
+            &limits("0", "1000"),
+            d("100"),
+            d("39.95"),
+            d("0.40"),
+        );
+    }
+
+    #[test]
+    fn fractional_levels_cross_to_first_feasible_physical_interval() {
+        assert_fractional_plan(
+            levels(&[
+                ("0.20", "0.2"),
+                ("0.30", "0.3"),
+                ("0.40", "0.5"),
+                ("0.45", "20"),
+            ]),
+            levels(&[("0.40", "30")]),
+            &fees_zero(),
+            &limits("1", "100"),
+            d("21"),
+            d("9.33"),
+            d("0.45"),
+        );
+    }
+
+    #[test]
+    fn fractional_normal_level_remainder_keeps_real_cost_and_worst_cap() {
+        assert_fractional_plan(
+            levels(&[("0.30", "4.5"), ("0.40", "100")]),
+            levels(&[("0.40", "200")]),
+            &fees_zero(),
+            &limits("0", "1000"),
+            d("104"),
+            d("41.15"),
+            d("0.40"),
+        );
+        let plan = assert_fractional_plan(
+            levels(&[("0.20", "0.5"), ("0.21", "1.5"), ("0.40", "100")]),
+            levels(&[("0.40", "1000")]),
+            &fees_zero(),
+            &limits("0", "3.615"),
+            d("5"),
+            d("1.615"),
+            d("0.40"),
+        );
+        assert_eq!(plan.pm.avg_price, d("0.323"));
+    }
+
+    #[test]
+    fn fractional_many_tiny_levels_do_not_hit_candidate_limit() {
+        let pm = (0..1000)
+            .map(|i| Level {
+                price: d("0.20") + Decimal::from(i) * d("0.0001"),
+                size: d("0.01"),
+            })
+            .collect();
+        assert_fractional_plan(
+            pm,
+            levels(&[("0.40", "10")]),
+            &fees_zero(),
+            &limits("3", "100"),
+            d("9"),
+            d("2.20455"),
+            d("0.29"),
+        );
+        let pm = (0..100)
+            .map(|i| Level {
+                price: d("0.20") + Decimal::from(i) * d("0.001"),
+                size: d("0.1"),
+            })
+            .collect();
+        assert_fractional_plan(
+            pm,
+            levels(&[("0.40", "10")]),
+            &fees_zero(),
+            &limits("3", "100"),
+            d("9"),
+            d("2.2005"),
+            d("0.29"),
+        );
+    }
+
+    #[test]
+    fn fractional_search_can_visit_more_than_sixty_four_quotes() {
+        let pm = (0..160)
+            .map(|i| Level {
+                price: d("0.20") + Decimal::from(i) * d("0.0001"),
+                size: d("0.5"),
+            })
+            .collect();
+        assert_fractional_plan(
+            pm,
+            levels(&[("0.40", "100")]),
+            &fees_zero(),
+            &limits("27", "100"),
+            d("69"),
+            d("14.27265"),
+            d("0.22"),
+        );
+    }
+
+    #[test]
+    fn fractional_budget_refuses_unproven_fee_monotonicity() {
+        let quote = PmQuote {
+            max_net: d("100"),
+            first_cost: d("0.35"),
+            cap: d("0.40"),
+        };
+        for (pm_rate, out_rate) in [("-0.01", "0"), ("1.01", "0"), ("0", "-0.01"), ("0", "1.01")] {
+            let fees = FeeContext {
+                polymarket_fee_rate: d(pm_rate),
+                outcome_taker_rate: d(out_rate),
+            };
+            assert_eq!(
+                quote_net_to_budget(
+                    &Acc::default(),
+                    &quote,
+                    d("0.40"),
+                    &fees,
+                    &limits("0", "100")
+                ),
+                Decimal::ZERO
+            );
+        }
+    }
+
+    #[test]
+    fn fractional_quotes_scale_with_levels_not_share_count() {
+        let mut cursor = PmCursor::new(&levels(&[("0.30", "0.5"), ("0.40", "1000000000000")]));
+        let quote = cursor.next_quote(d("2000000000000")).unwrap();
+        assert_eq!(quote.max_net, d("1000000000000"));
+        assert_eq!(quote.cost(d("5")), d("1.95"));
+        assert_eq!(quote.cap, d("0.40"));
+        assert!(cursor.next_quote(d("2000000000000")).is_none());
+        assert_fractional_plan(
+            levels(&[("0.30", "0.5"), ("0.40", "1000000000000")]),
+            levels(&[("0.40", "1000000000000")]),
+            &fees_zero(),
+            &limits("0", "1000000000000"),
+            d("1000000000000"),
+            d("399999999999.95"),
+            d("0.40"),
+        );
+    }
+
+    #[test]
+    fn fractional_budget_exact_and_just_below_requote_cost() {
+        for (budget, shares, cost) in [("7.95", "10", "3.95"), ("7.949999", "9", "3.55")] {
+            assert_fractional_plan(
+                levels(&[("0.30", "0.5"), ("0.40", "100")]),
+                levels(&[("0.40", "200")]),
+                &fees_zero(),
+                &limits("0", budget),
+                d(shares),
+                d(cost),
+                d("0.40"),
+            );
+        }
+    }
+
+    #[test]
+    fn fractional_budget_nonzero_fees_profit_and_apr() {
+        let fees = FeeContext {
+            polymarket_fee_rate: d("0.07"),
+            outcome_taker_rate: d("0.00035"),
+        };
+        // 10 股 PM 均价0.395，费用0.1672825；Outcome费用0.0014。
+        let mut exact = limits("1.8", "8.1186825");
+        exact.days = 365;
+        exact.min_apr = d("0.23");
+        let plan = assert_fractional_plan(
+            levels(&[("0.30", "0.5"), ("0.40", "100")]),
+            levels(&[("0.40", "200")]),
+            &fees,
+            &exact,
+            d("10"),
+            d("3.95"),
+            d("0.40"),
+        );
+        assert_eq!(plan.pm.fee, d("0.1672825"));
+        assert_eq!(plan.total_cost, exact.cost_limit);
+        exact.cost_limit -= d("0.0000001");
+        exact.min_profit = d("0");
+        assert_fractional_plan(
+            levels(&[("0.30", "0.5"), ("0.40", "100")]),
+            levels(&[("0.40", "200")]),
+            &fees,
+            &exact,
+            d("9"),
+            d("3.55"),
+            d("0.40"),
+        );
+        // 已有整数累计后再桥接，预算必须包含整体均价手续费，而非仅新增报价手续费。
+        let accumulated = limits("0", "7.7116825");
+        assert_fractional_plan(
+            levels(&[("0.30", "4.5"), ("0.40", "100")]),
+            levels(&[("0.40", "200")]),
+            &fees,
+            &accumulated,
+            d("10"),
+            d("3.55"),
+            d("0.40"),
+        );
+        exact.min_profit = d("1.8");
+        assert!(search_pair(
+            &token(POLYMARKET, "pm-yes", "yes"),
+            &token(OUTCOME, "#10", "no"),
+            &levels(&[("0.30", "0.5"), ("0.40", "100")]),
+            &levels(&[("0.40", "200")]),
+            &fees,
+            &exact,
+            d("0.01")
+        )
+        .is_none());
+        exact.min_profit = Decimal::ZERO;
+        exact.min_apr = d("0.25");
+        assert!(search_pair(
+            &token(POLYMARKET, "pm-yes", "yes"),
+            &token(OUTCOME, "#10", "no"),
+            &levels(&[("0.30", "0.5"), ("0.40", "100")]),
+            &levels(&[("0.40", "200")]),
+            &fees,
+            &exact,
+            d("0.01")
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn fractional_insufficient_total_and_outcome_per_level_floor() {
+        for (pm, out) in [
+            (
+                levels(&[("0.30", "0.4"), ("0.40", "0.5")]),
+                levels(&[("0.40", "100")]),
+            ),
+            (
+                levels(&[("0.30", "4.5"), ("0.40", "0.4")]),
+                levels(&[("0.40", "100")]),
+            ),
+            (
+                levels(&[("0.30", "0.5"), ("0.40", "100")]),
+                levels(&[("0.30", "2.9"), ("0.40", "2.9")]),
+            ),
+        ] {
+            assert!(search_pair(
+                &token(POLYMARKET, "pm-yes", "yes"),
+                &token(OUTCOME, "#10", "no"),
+                &pm,
+                &out,
+                &fees_zero(),
+                &limits("0", "100"),
+                d("0.01")
+            )
+            .is_none());
+        }
+        assert_fractional_plan(
+            levels(&[("0.30", "0.5"), ("0.40", "100")]),
+            levels(&[("0.20", "0.9"), ("0.30", "2.9"), ("0.40", "3.9")]),
+            &fees_zero(),
+            &limits("0", "100"),
+            d("5"),
+            d("1.95"),
+            d("0.40"),
+        );
+    }
+
+    #[test]
+    fn accumulates_fractional_pm_first_level() {
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        snapshot(
+            &mut books,
+            POLYMARKET,
+            "pm-yes",
+            vec![("0.30", "0.5"), ("0.40", "20")],
+            now,
+        );
+        snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "20")], now);
+        let plan = plan_with(&books, now, &limits("1", "100"));
+        assert_eq!(plan.net_shares, d("20"));
+        assert_eq!(plan.pm.cost, d("7.95"));
+        assert_eq!(plan.pm.cap_price, d("0.40"));
+    }
+
     #[test]
     fn fills_available_depth_when_first_level_passes() {
         let mut books = BookStore::default();
@@ -1112,23 +1564,18 @@ mod tests {
 
     #[test]
     fn accumulates_next_level_when_first_level_misses_profit() {
-        let mut books = BookStore::default();
-        let now = Instant::now();
-        snapshot(
-            &mut books,
-            POLYMARKET,
-            "pm-yes",
-            vec![("0.45", "10"), ("0.45", "30")],
-            now,
-        );
-        snapshot(
-            &mut books,
-            OUTCOME,
-            "#10",
-            vec![("0.45", "10"), ("0.45", "30")],
-            now,
-        );
-        let plan = plan_with(&books, now, &limits("3", "100"));
+        // 直接保留旧计算样例；BookStore 现在拒绝快照中的重复价格。
+        let asks = levels(&[("0.45", "10"), ("0.45", "30")]);
+        let plan = search_pair(
+            &token(POLYMARKET, "pm-yes", "yes"),
+            &token(OUTCOME, "#10", "no"),
+            &asks,
+            &asks,
+            &fees_zero(),
+            &limits("3", "100"),
+            d("0.01"),
+        )
+        .expect("same integer depth plan");
         // 单位利润 0.10；第一档 10 不够门槛，吃掉后再把第二档 30 买满 → 40 股。
         assert_eq!(plan.net_shares, d("40"));
         assert_eq!(plan.total_cost, d("36"));

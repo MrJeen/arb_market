@@ -221,6 +221,8 @@ async fn submitted_reconciliation_order(
             Decimal::from(9),
             &json!([]),
             &legs,
+            0,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
         )
         .await?;
     for (id, platform) in ids.iter().zip(platforms) {
@@ -307,6 +309,7 @@ fn reconciliation_evidence(oid: &str, status: &str) -> FillEvidence {
         expected_shares: None,
         pm_scan: None,
         pm_order_constraints: None,
+        outcome_scan: None,
     }
 }
 
@@ -344,7 +347,64 @@ fn pm_missing_evidence(
             trade_ids: trade_ids.iter().map(|id| (*id).into()).collect(),
         }),
         pm_order_constraints: None,
+        outcome_scan: None,
     }
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn outcome_final_probe_is_fresh_and_retains_observed_fills_atomically() {
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let exercised: Result<()> = async {
+        let store=&fixture.store;
+        store.migrate().await?;
+        let (order_id,legs)=submitted_reconciliation_order(store,&["outcome"]).await?;
+        let leg_id=legs[0].id;
+        sqlx::query("UPDATE legs SET wallet_address='0xaccount' WHERE id=$1")
+            .bind(leg_id).execute(&store.pool).await?;
+        let mut evidence=reconciliation_evidence("987654", "canceled");
+        evidence.poll.shares=None;
+        evidence.poll.original_shares=Some(Decimal::from(10));
+        evidence.poll.remaining_shares=Some(Decimal::from(4));
+        let current=reconciliation_open_leg(store,leg_id).await?;
+        let current=store.record_order_poll(&current,&evidence.poll).await?.unwrap();
+        let info=current.last_order_info.as_ref().unwrap();
+        let observed=info["outcome_terminal_observed_at_ms"].as_u64().unwrap();
+        let start=current.submitted_at.unwrap().timestamp_millis().saturating_sub(30_000).max(0) as u64;
+        let before=json!({"version":2,"tokenId":current.token_id,"submittedAtMs":start,
+            "endTime":observed,"cursor":start,"seenIds":[],"historyChecked":true,
+            "historyLowerBound":start.saturating_sub(1),"historyComplete":false,
+            "scannedCount":0,"complete":false,"phase":"finalProbe","account":"0xaccount",
+            "terminalObservedAtMs":observed,"scanValid":true});
+        let mut fill=reconciliation_trade("987654","probe-only-fill",6,Decimal::new(1,2));
+        fill.coin=Some(current.token_id.clone());
+        // 旧布尔覆盖证明不能授权零成交/部分成交终态，但 probe 真成交仍必须被保存。
+        evidence.page_complete=true;
+        evidence.history_complete=true;
+        let pending=store.record_reconciliation(&current,&[fill.clone()],&evidence,&before).await?;
+        ensure!(matches!(pending,LegResolution::Pending(_)));
+        ensure!(fill_snapshots(&store.pool,leg_id).await?.len()==1);
+        ensure!(order_snapshot(&store.pool,order_id).await?["status"]=="actived");
+        let current=reconciliation_open_leg(store,leg_id).await?;
+        let mut complete=before.clone();
+        complete["phase"]=json!("complete");
+        complete["complete"]=json!(true);
+        complete["historyComplete"]=json!(true);
+        evidence.outcome_scan=Some(serde_json::from_value(complete.clone())?);
+        let restored:FillEvidence=serde_json::from_value(serde_json::to_value(&evidence)?)?;
+        ensure!(restored.outcome_scan.is_none(), "persisted evidence cannot restore fresh coverage");
+        let result=store.record_reconciliation(&current,&[fill],&evidence,&complete).await?;
+        ensure!(matches!(result,LegResolution::Terminal{status:"matched",shares,..} if shares==Decimal::from(6)));
+        ensure!(fill_snapshots(&store.pool,leg_id).await?.len()==1);
+        ensure!(order_snapshot(&store.pool,order_id).await?["status"]=="completed");
+        ensure!(store.open_legs().await?.is_empty());
+        Ok(())
+    }.await;
+    fixture
+        .cleanup()
+        .await
+        .expect("clean up outcome final probe schema");
+    exercised.expect("fresh final coverage and durable probe fill");
 }
 
 #[tokio::test]
@@ -2229,6 +2289,8 @@ async fn actived_order_and_initial_legs_are_never_visible_without_each_other() {
                 Decimal::new(95, 1),
                 &json!([]),
                 &legs,
+                0,
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
             )
             .await?;
         let created = order_snapshot(&fixture.store.pool, order_id).await?;
@@ -2254,6 +2316,8 @@ async fn actived_order_and_initial_legs_are_never_visible_without_each_other() {
                 Decimal::ZERO,
                 &json!([]),
                 &[],
+                0,
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
             )
             .await;
         let orphan_actived: i64 = sqlx::query_scalar(
@@ -2288,6 +2352,201 @@ async fn actived_order_and_initial_legs_are_never_visible_without_each_other() {
         "an actived order without legs must not be creatable"
     );
     assert_eq!(orphan_actived, 0);
+}
+
+async fn admission_order(
+    store: &Store,
+    key: TopicKey,
+    limit: usize,
+    deadline: std::time::Instant,
+    legs: &[NewLeg<'_>],
+) -> market_arb::error::Result<(i64, Vec<i64>)> {
+    store
+        .insert_actived_order_with_legs(
+            key,
+            &MarketIdentity::new("polymarket", "admission-condition")?,
+            "admission test",
+            "admission test",
+            None,
+            Decimal::ONE,
+            Decimal::ZERO,
+            Decimal::ONE,
+            &json!([]),
+            legs,
+            limit,
+            deadline,
+        )
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn admission_serializes_last_slot_and_preserves_counting_policy() {
+    use market_arb::error::Error;
+    use std::time::{Duration, Instant};
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let exercised: Result<()> = async {
+        fixture.store.migrate().await?;
+        for index in 0..19 {
+            let status = ["pending", "actived", "completed"][index % 3];
+            sqlx::query("INSERT INTO arb_orders(event_id,unified_index,status) VALUES ($1,0,$2)")
+                .bind(Uuid::new_v4())
+                .bind(status)
+                .execute(&fixture.store.pool)
+                .await?;
+        }
+        // completed 的已平仓/结算行仍沿用原计数口径，不顺手改变风控定义。
+        sqlx::query("UPDATE arb_orders SET position_status='closed' WHERE status='completed'")
+            .execute(&fixture.store.pool)
+            .await?;
+        for status in ["cancelled", "failed"] {
+            sqlx::query("INSERT INTO arb_orders(event_id,unified_index,status) VALUES ($1,0,$2)")
+                .bind(Uuid::new_v4())
+                .bind(status)
+                .execute(&fixture.store.pool)
+                .await?;
+        }
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let attempt = || {
+            let store = fixture.store.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                admission_order(
+                    &store,
+                    TopicKey::new(Uuid::new_v4(), 0),
+                    20,
+                    Instant::now() + Duration::from_secs(30),
+                    &[identity_probe_leg()],
+                )
+                .await
+            })
+        };
+        let (a, b) = tokio::join!(attempt(), attempt());
+        let results = [a?, b?];
+        ensure!(
+            results.iter().filter(|r| r.is_ok()).count() == 1,
+            "exactly one admission must win"
+        );
+        ensure!(
+            results
+                .iter()
+                .filter(|r| matches!(r, Err(Error::OrderCapacityReached)))
+                .count()
+                == 1
+        );
+        ensure!(fixture.store.count_active_orders().await? == 20);
+        let child_counts: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM legs),(SELECT COUNT(*) FROM arb_order_market_identities)",
+        )
+        .fetch_one(&fixture.store.pool)
+        .await?;
+        ensure!(
+            child_counts == (1, 1),
+            "rejected admission must leave no children"
+        );
+        let (unlimited, _) = admission_order(
+            &fixture.store,
+            TopicKey::new(Uuid::new_v4(), 0),
+            0,
+            Instant::now() + Duration::from_secs(30),
+            &[identity_probe_leg()],
+        )
+        .await?;
+        ensure!(unlimited > 0 && fixture.store.count_active_orders().await? == 21);
+        let expired = admission_order(
+            &fixture.store,
+            TopicKey::new(Uuid::new_v4(), 0),
+            0,
+            Instant::now(),
+            &[identity_probe_leg()],
+        )
+        .await;
+        ensure!(matches!(expired, Err(Error::OrderConfirmationExpired)));
+        ensure!(fixture.store.count_active_orders().await? == 21);
+        Ok(())
+    }
+    .await;
+    fixture.cleanup().await.expect("clean up admission schema");
+    exercised.expect("atomic admission and counting policy");
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn admission_rolls_back_failed_legs_and_preserves_topic_uniqueness() {
+    use market_arb::error::Error;
+    use std::time::{Duration, Instant};
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let exercised: Result<()> = async {
+        fixture.store.migrate().await?;
+        let mut bad = identity_probe_leg();
+        bad.side="too-long-side";
+        let deadline = || Instant::now()+Duration::from_secs(30);
+        ensure!(admission_order(&fixture.store,TopicKey::new(Uuid::new_v4(),0),1,deadline(),&[bad]).await.is_err());
+        ensure!(fixture.store.count_active_orders().await?==0);
+        let key=TopicKey::new(Uuid::new_v4(),0);
+        admission_order(&fixture.store,key,1,deadline(),&[identity_probe_leg()]).await?;
+        let duplicate=admission_order(&fixture.store,key,0,deadline(),&[identity_probe_leg()]).await;
+        ensure!(matches!(duplicate,Err(Error::Sqlx(sqlx::Error::Database(ref db))) if db.code().as_deref()==Some("23505")));
+        ensure!(fixture.store.count_active_orders().await?==1);
+        let counts:(i64,i64)=sqlx::query_as("SELECT (SELECT COUNT(*) FROM legs),(SELECT COUNT(*) FROM arb_order_market_identities)")
+            .fetch_one(&fixture.store.pool).await?;
+        ensure!(counts==(1,1));
+        Ok(())
+    }.await;
+    fixture.cleanup().await.expect("clean up admission schema");
+    exercised.expect("admission rollback and uniqueness");
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn admission_deadline_bounds_lock_wait_without_pending_legs() {
+    use market_arb::error::Error;
+    use std::time::{Duration, Instant};
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let exercised: Result<()> = async {
+        fixture.store.migrate().await?;
+        let mut blocker = fixture.store.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(0x6d61726b_61726201_i64)
+            .execute(&mut *blocker)
+            .await?;
+        let store = fixture.store.clone();
+        let mut attempt = tokio::spawn(async move {
+            admission_order(
+                &store,
+                TopicKey::new(Uuid::new_v4(), 0),
+                1,
+                Instant::now() + Duration::from_millis(100),
+                &[identity_probe_leg()],
+            )
+            .await
+        });
+        // 保持锁直到调用超时；取消中的SQL可以等待事务回滚，因此先释放阻塞者再收尾。
+        let before_release = tokio::time::timeout(Duration::from_millis(200), &mut attempt).await;
+        blocker.rollback().await?;
+        let result = match before_release {
+            Ok(result) => result?,
+            Err(_) => tokio::time::timeout(Duration::from_secs(5), attempt).await??,
+        };
+        ensure!(
+            matches!(result, Err(Error::OrderConfirmationExpired)),
+            "unexpected admission result: {result:?}"
+        );
+        ensure!(fixture.store.count_active_orders().await? == 0);
+        admission_order(
+            &fixture.store,
+            TopicKey::new(Uuid::new_v4(), 0),
+            1,
+            Instant::now() + Duration::from_secs(30),
+            &[identity_probe_leg()],
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+    fixture.cleanup().await.expect("clean up admission schema");
+    exercised.expect("admission deadline and lock release");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2985,6 +3244,8 @@ async fn order_market_identities_insert_read_backfill_and_conflict() {
             Decimal::ZERO,
             &json!([]),
             &[identity_probe_leg()],
+            0,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
         )
         .await
         .expect("insert order and identities");

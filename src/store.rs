@@ -10,8 +10,11 @@ use crate::reconcile::{
 use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::{postgres::PgPoolOptions, PgPool};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+// 所有新父单（包括不限额调用）遵守同一事务准入锁协议。
+const ORDER_ADMISSION_LOCK: i64 = 0x6d61726b_61726201;
 
 type ActualLegRow = (
     String,
@@ -145,6 +148,8 @@ impl Store {
         cost: Decimal,
         fills: &Value,
         legs: &[NewLeg<'_>],
+        max_active_orders: usize,
+        confirmation_deadline: Instant,
     ) -> Result<(i64, Vec<i64>)> {
         if market_identity.is_empty() {
             return Err(Error::msg("order market identity must not be empty"));
@@ -152,7 +157,66 @@ impl Store {
         if legs.is_empty() {
             return Err(Error::msg("actived order requires at least one leg"));
         }
-        let mut tx = self.pool.begin().await?;
+        if Instant::now() >= confirmation_deadline {
+            return Err(Error::OrderConfirmationExpired);
+        }
+        let deadline = tokio::time::Instant::from_std(confirmation_deadline);
+        let mut tx = tokio::time::timeout_at(deadline, self.pool.begin())
+            .await
+            .map_err(|_| Error::OrderConfirmationExpired)??;
+        let admitted = async {
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                .execute(&mut *tx)
+                .await?;
+            // 等锁仅用服务端超时；若客户端先取消，遗留的 55P03 会在 rollback 排空协议时冒出。
+            let wait_ms = confirmation_deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .clamp(1, i32::MAX as u128);
+            sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+                .bind(format!("{wait_ms}ms"))
+                .execute(&mut *tx)
+                .await?;
+            if let Err(err) = sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(ORDER_ADMISSION_LOCK)
+                .execute(&mut *tx)
+                .await
+            {
+                if err
+                    .as_database_error()
+                    .is_some_and(|db| db.code().as_deref() == Some("55P03"))
+                {
+                    return Err(Error::OrderConfirmationExpired);
+                }
+                return Err(err.into());
+            }
+            // 必须在等到锁后的独立 statement 取快照，才能看到上一位创建者提交的订单。
+            if max_active_orders > 0 {
+                let count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM arb_orders
+                     WHERE status IN ('pending','actived','completed')",
+                )
+                .fetch_one(&mut *tx)
+                .await?;
+                if count as u64 >= max_active_orders as u64 {
+                    return Err(Error::OrderCapacityReached);
+                }
+            }
+            Ok::<_, Error>(())
+        }
+        .await;
+        match admitted {
+            Ok(()) if Instant::now() < confirmation_deadline => {}
+            Err(err) => {
+                tx.rollback().await?;
+                return Err(err);
+            }
+            _ => {
+                // 等锁超时也是未提交，回滚释放锁，不能留下可被回填误认的 pending 腿。
+                tx.rollback().await?;
+                return Err(Error::OrderConfirmationExpired);
+            }
+        }
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO arb_orders (
                 event_id, unified_index, title, market_title, end_date, estimated_rev,
@@ -599,6 +663,18 @@ impl Store {
                 info["pm_order_constraints"] = serde_json::to_value(constraints)?;
             }
         }
+        if current.platform == OUTCOME
+            && poll.found
+            && (poll.status.eq_ignore_ascii_case("filled")
+                || crate::reconcile::cancellation_status(&poll.status.to_ascii_lowercase()))
+            && !info
+                .get("outcome_terminal_observed_at_ms")
+                .and_then(Value::as_i64)
+                .is_some_and(|value| value > 0)
+        {
+            info["outcome_terminal_observed_at_ms"] =
+                serde_json::json!(chrono::Utc::now().timestamp_millis());
+        }
         info["order_poll"] = serde_json::to_value(poll)?;
         sqlx::query(
             "UPDATE legs SET third_order_id = COALESCE($2,third_order_id),
@@ -778,6 +854,9 @@ impl Store {
         let mut effective = evidence.clone();
         // 调用者提供的约束不具权威性，避免遗漏字段或旧快照削弱已持久化事实。
         effective.pm_order_constraints = leg_pm_order_constraints(&current, Some(&evidence.poll))?;
+        if current.platform == OUTCOME {
+            crate::reconcile::validate_outcome_evidence(&current, &mut effective, progress)?;
+        }
         let resolution = resolve_leg(&current.platform, &fills, &effective)?;
         let mut info = current
             .last_order_info

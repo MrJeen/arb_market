@@ -43,7 +43,7 @@ pub async fn run() -> anyhow::Result<()> {
     let stats = Arc::new(MinuteStats::new());
     let pm = PolymarketVenue::connect(&cfg, stats.clone()).await?;
     let outcome = OutcomeVenue::connect(&cfg)?;
-    let books = Arc::new(Mutex::new(BookStore::default()));
+    let books = Arc::new(Mutex::new(BookStore::new(cfg.book_stale)));
     let dirty = Arc::new(Mutex::new(DirtyCoalescer::default()));
     let topics = Arc::new(RwLock::new(HashMap::new()));
     let (calc_tx, mut calc_rx) = mpsc::channel::<TopicKey>(256);

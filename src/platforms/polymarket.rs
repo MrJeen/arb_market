@@ -519,7 +519,8 @@ impl PolymarketVenue {
             .error_for_status()?
             .json()
             .await?;
-        Ok(parse_book_json(&value))
+        validate_book_identity(&value, token_id)?;
+        parse_book_json(&value)
     }
 
     pub async fn rest_books(&self, token_ids: &[String]) -> Result<Vec<Value>> {
@@ -545,11 +546,11 @@ impl PolymarketVenue {
                 message: redact_http(&text),
             });
         }
-        let parsed: Value = serde_json::from_str(&text).unwrap_or(json!([]));
-        let items = match parsed {
-            Value::Array(items) => items,
-            other => vec![other],
-        };
+        let parsed: Value = serde_json::from_str(&text)?;
+        let items = parsed
+            .as_array()
+            .cloned()
+            .ok_or_else(|| Error::msg("polymarket books missing array"))?;
         tracing::info!(
             requested = token_ids.len(),
             returned = items.len(),
@@ -1370,26 +1371,61 @@ pub fn parse_submit(body: &Value, order_hash: String, envelope: Value) -> Submit
     }
 }
 
-pub fn parse_book_json(value: &Value) -> (Vec<Level>, Vec<Level>, i64) {
-    let ts = value
-        .get("timestamp")
-        .and_then(|v| {
-            v.as_str()
-                .and_then(|s| s.parse().ok())
-                .or_else(|| v.as_i64())
-        })
-        .unwrap_or(0);
-    (
-        parse_levels(value.get("bids")),
-        parse_levels(value.get("asks")),
-        ts,
-    )
+fn book_token(value: &Value) -> Option<&str> {
+    let token = value
+        .get("asset_id")
+        .or_else(|| value.get("assetId"))?
+        .as_str()?;
+    if token.is_empty() {
+        return None;
+    }
+    if value
+        .get("assetId")
+        .is_some_and(|v| v.as_str() != Some(token))
+    {
+        return None;
+    }
+    Some(token)
 }
 
-fn apply_book_tick(books: &mut BookStore, token: &str, payload: &Value) {
-    if let Some(tick) = parse_tick_size(payload) {
-        books.set_tick_size(POLYMARKET, token, tick);
+fn validate_book_identity(value: &Value, token: &str) -> Result<()> {
+    if book_token(value) != Some(token) {
+        return Err(Error::msg("polymarket book asset mismatch"));
     }
+    Ok(())
+}
+
+fn book_timestamp(value: &Value) -> Result<i64> {
+    value
+        .get("timestamp")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
+        .filter(|ts| *ts > 0)
+        .ok_or_else(|| Error::msg("polymarket book invalid timestamp"))
+}
+
+pub fn parse_book_json(value: &Value) -> Result<(Vec<Level>, Vec<Level>, i64)> {
+    if book_token(value).is_none() {
+        return Err(Error::msg("polymarket book missing asset"));
+    }
+    let ts = book_timestamp(value)?;
+    // 可选 tick 一旦出现也必须有效，不能以缺失语义吞掉坏字段。
+    for field in [
+        "tick_size",
+        "tickSize",
+        "minimum_tick_size",
+        "order_price_min_tick_size",
+    ] {
+        if value.get(field).is_some_and(|v| {
+            parse_decimal(v).is_none_or(|tick| tick <= Decimal::ZERO || tick > Decimal::ONE)
+        }) {
+            return Err(Error::msg("polymarket book invalid tick"));
+        }
+    }
+    Ok((
+        parse_levels(value.get("bids"))?,
+        parse_levels(value.get("asks"))?,
+        ts,
+    ))
 }
 
 fn parse_tick_size(value: &Value) -> Option<Decimal> {
@@ -1399,19 +1435,31 @@ fn parse_tick_size(value: &Value) -> Option<Decimal> {
         .or_else(|| value.get("minimum_tick_size"))
         .or_else(|| value.get("order_price_min_tick_size"))
         .and_then(parse_decimal)
-        .filter(|tick| *tick > Decimal::ZERO)
+        .filter(|tick| *tick > Decimal::ZERO && *tick <= Decimal::ONE)
 }
 
-fn parse_levels(value: Option<&Value>) -> Vec<Level> {
-    let Some(Value::Array(items)) = value else {
-        return Vec::new();
-    };
+fn parse_levels(value: Option<&Value>) -> Result<Vec<Level>> {
+    let items = value
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::msg("polymarket book missing levels array"))?;
+    let mut prices = std::collections::HashSet::new();
     items
         .iter()
-        .filter_map(|item| {
-            let price = item.get("price").and_then(parse_decimal)?;
-            let size = item.get("size").and_then(parse_decimal)?;
-            Some(Level { price, size })
+        .map(|item| {
+            let price = item
+                .get("price")
+                .and_then(parse_decimal)
+                .filter(|v| *v > Decimal::ZERO && *v <= Decimal::ONE)
+                .ok_or_else(|| Error::msg("polymarket book invalid price"))?;
+            let size = item
+                .get("size")
+                .and_then(parse_decimal)
+                .filter(|v| *v > Decimal::ZERO)
+                .ok_or_else(|| Error::msg("polymarket book invalid size"))?;
+            if !prices.insert(price) {
+                return Err(Error::msg("polymarket book duplicate price"));
+            }
+            Ok(Level { price, size })
         })
         .collect()
 }
@@ -1761,76 +1809,129 @@ pub fn apply_ws_message(
     payload: &Value,
     now: Instant,
 ) -> Vec<(String, bool)> {
+    use crate::book::BookReject;
     let mut changed = Vec::new();
-    let event = payload
+    match payload
         .get("event_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if event == "book" {
-        let token = payload
-            .get("asset_id")
-            .or_else(|| payload.get("assetId"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if token.is_empty() {
-            return changed;
+        .and_then(Value::as_str)
+        .unwrap_or("")
+    {
+        "book" => {
+            let Some(token) = payload
+                .get("asset_id")
+                .or_else(|| payload.get("assetId"))
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+            else {
+                return changed;
+            };
+            match parse_book_json(payload) {
+                Ok((bids, asks, ts)) => {
+                    let result = books.replace_snapshot(POLYMARKET, token, bids, asks, ts, now);
+                    if !matches!(result, crate::book::BookUpdate::Rejected(_)) {
+                        let tick_changed = parse_tick_size(payload).is_some_and(|tick| {
+                            books.set_tick_size(POLYMARKET, token, tick).is_applied()
+                        });
+                        if result.is_applied() || tick_changed {
+                            changed.push((token.into(), true));
+                        }
+                    }
+                }
+                Err(err) => {
+                    books.invalidate_ws(POLYMARKET, token, BookReject::InvalidPayload);
+                    tracing::warn!(platform = POLYMARKET, token, error = %err, "invalid WS book");
+                }
+            }
         }
-        let (bids, asks, ts) = parse_book_json(payload);
-        if books.replace_snapshot(POLYMARKET, token, bids, asks, ts, now) {
-            apply_book_tick(books, token, payload);
-            changed.push((token.to_string(), true));
+        "tick_size_change" => {
+            let Some(token) = book_token(payload) else {
+                return changed;
+            };
+            let tick = payload
+                .get("new_tick_size")
+                .or_else(|| payload.get("newTickSize"))
+                .and_then(parse_decimal)
+                .filter(|v| *v > Decimal::ZERO && *v <= Decimal::ONE);
+            let Ok(ts) = book_timestamp(payload) else {
+                books.invalidate_ws(POLYMARKET, token, BookReject::InvalidPayload);
+                return changed;
+            };
+            if books
+                .get_at(POLYMARKET, token, now)
+                .is_some_and(|book| ts < book.exchange_ts_ms)
+            {
+                books.invalidate_ws(POLYMARKET, token, BookReject::OlderTimestamp);
+                return changed;
+            }
+            if let Some(tick) = tick {
+                if books.set_tick_size(POLYMARKET, token, tick).is_applied() {
+                    changed.push((token.into(), false));
+                }
+            } else {
+                books.invalidate_ws(POLYMARKET, token, BookReject::InvalidPayload);
+            }
         }
-    } else if event == "tick_size_change" {
-        let token = payload
-            .get("asset_id")
-            .or_else(|| payload.get("assetId"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if token.is_empty() {
-            return changed;
-        }
-        if let Some(tick) = payload
-            .get("new_tick_size")
-            .or_else(|| payload.get("newTickSize"))
-            .and_then(parse_decimal)
-        {
-            books.set_tick_size(POLYMARKET, token, tick);
-            changed.push((token.to_string(), false));
-        }
-    } else if event == "price_change" {
-        let ts = payload
-            .get("timestamp")
-            .and_then(|v| {
-                v.as_str()
-                    .and_then(|s| s.parse().ok())
-                    .or_else(|| v.as_i64())
-            })
-            .unwrap_or(unix_millis() as i64);
-        if let Some(arr) = payload.get("price_changes").and_then(|v| v.as_array()) {
+        "price_change" => {
+            let ts = book_timestamp(payload);
+            let Some(arr) = payload.get("price_changes").and_then(Value::as_array) else {
+                if let Some(token) = book_token(payload) {
+                    books.invalidate_ws(POLYMARKET, token, BookReject::InvalidPayload);
+                }
+                return changed;
+            };
             let mut by_token = std::collections::BTreeMap::<&str, Vec<_>>::new();
+            let mut invalid = std::collections::HashSet::new();
             for change in arr {
-                let token = change
+                let Some(token) = change
                     .get("asset_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let price = change.get("price").and_then(parse_decimal);
-                let size = change.get("size").and_then(parse_decimal);
-                let side = change.get("side").and_then(|v| v.as_str()).unwrap_or("");
-                if token.is_empty() || price.is_none() || size.is_none() {
+                    .or_else(|| change.get("assetId"))
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty())
+                else {
                     continue;
+                };
+                let price = change
+                    .get("price")
+                    .and_then(parse_decimal)
+                    .filter(|v| *v > Decimal::ZERO && *v <= Decimal::ONE);
+                let size = change
+                    .get("size")
+                    .and_then(parse_decimal)
+                    .filter(|v| *v >= Decimal::ZERO);
+                let side = change.get("side").and_then(Value::as_str).and_then(|s| {
+                    if s.eq_ignore_ascii_case("BUY") || s.eq_ignore_ascii_case("BID") {
+                        Some(true)
+                    } else if s.eq_ignore_ascii_case("SELL") || s.eq_ignore_ascii_case("ASK") {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                });
+                if let (Some(price), Some(size), Some(is_bid), Ok(_)) = (price, size, side, &ts) {
+                    by_token
+                        .entry(token)
+                        .or_default()
+                        .push((is_bid, price, size));
+                } else {
+                    invalid.insert(token);
                 }
-                let is_bid = side.eq_ignore_ascii_case("BUY") || side.eq_ignore_ascii_case("BID");
-                by_token
-                    .entry(token)
-                    .or_default()
-                    .push((is_bid, price.unwrap(), size.unwrap()));
             }
-            for (token, updates) in by_token {
-                if books.apply_levels(POLYMARKET, token, &updates, ts, now) {
-                    changed.push((token.to_string(), true));
+            for token in &invalid {
+                books.invalidate_ws(POLYMARKET, token, BookReject::InvalidPayload);
+            }
+            if let Ok(ts) = ts {
+                for (token, updates) in by_token {
+                    if !invalid.contains(token)
+                        && books
+                            .apply_levels(POLYMARKET, token, &updates, ts, now)
+                            .is_applied()
+                    {
+                        changed.push((token.into(), true));
+                    }
                 }
             }
         }
+        _ => {}
     }
     changed
 }
@@ -1838,28 +1939,41 @@ pub fn apply_ws_message(
 pub fn apply_rest_books(
     books: &mut BookStore,
     payloads: &[Value],
+    tickets: &[crate::book::RestTicket],
     now: Instant,
 ) -> (Vec<String>, usize) {
     let mut applied = Vec::new();
-    let mut skipped_old = 0usize;
+    let mut rejected = 0;
     for payload in payloads {
-        let token = payload
-            .get("asset_id")
-            .or_else(|| payload.get("assetId"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if token.is_empty() {
+        let Some(token) = book_token(payload) else {
+            rejected += 1;
             continue;
-        }
-        let (bids, asks, ts) = parse_book_json(payload);
-        if books.replace_snapshot(POLYMARKET, token, bids, asks, ts, now) {
-            apply_book_tick(books, token, payload);
-            applied.push(token.to_string());
-        } else {
-            skipped_old += 1;
+        };
+        let Some(ticket) = tickets
+            .iter()
+            .find(|t| t.key.platform == POLYMARKET && t.key.token_id == token)
+        else {
+            rejected += 1;
+            continue;
+        };
+        match parse_book_json(payload) {
+            Ok((bids, asks, ts)) => {
+                if books
+                    .accept_rest(ticket, bids, asks, ts, now, parse_tick_size(payload))
+                    .is_ok()
+                {
+                    applied.push(token.into());
+                } else {
+                    rejected += 1;
+                }
+            }
+            Err(err) => {
+                rejected += 1;
+                tracing::warn!(platform = POLYMARKET, token, error = %err, "invalid REST book");
+            }
         }
     }
-    (applied, skipped_old)
+    (applied, rejected)
 }
 
 pub async fn run_market_ws(
@@ -1876,6 +1990,7 @@ pub async fn run_market_ws(
         }
         match tokio_tungstenite::connect_async(&url).await {
             Ok((ws, _)) => {
+                books.lock().await.begin_platform_connection(POLYMARKET);
                 tracing::info!("polymarket market ws connected");
                 let (mut write, mut read) = ws.split();
                 if !subscribed.is_empty() {
@@ -2419,19 +2534,19 @@ pub(crate) mod tests {
             Decimal::from(3)
         );
         let later = now + Duration::from_secs(1);
-        for ts in ["101", "99"] {
+        for ts in ["99"] {
             let mut replay = payload.clone();
             replay["timestamp"] = json!(ts);
             assert!(apply_ws_message(&mut books, &replay, later).is_empty());
             assert_eq!(books.get(POLYMARKET, "a").unwrap().received_at, now);
         }
-        // 一个 token 的旧批次不能阻止同消息中另一个 token 的新批次。
+        // 一个 token 的无变化批次不能阻止同消息中另一个 token 的有效更新。
         books.replace_snapshot(POLYMARKET, "b", vec![], vec![], 102, later);
         let mut mixed = payload;
         mixed["timestamp"] = json!("102");
         assert_eq!(
             apply_ws_message(&mut books, &mixed, later),
-            vec![("a".into(), true)]
+            vec![("b".into(), true)]
         );
     }
 
@@ -2464,13 +2579,14 @@ pub(crate) mod tests {
             snapshot["timestamp"] = json!("101");
             assert!(apply_ws_message(&mut books, &snapshot, later).is_empty());
             assert!(books.get(POLYMARKET, "t").unwrap().stale);
-            snapshot["timestamp"] = json!("102");
+            snapshot["timestamp"] = json!("103");
             snapshot["asks"] = json!([]);
             snapshot["bids"][0]["size"] = json!("8");
             snapshot.as_object_mut().unwrap().remove("tick_size");
             if use_rest {
+                let tickets = vec![books.begin_rest(POLYMARKET, "t")];
                 assert_eq!(
-                    apply_rest_books(&mut books, &[snapshot.clone()], later),
+                    apply_rest_books(&mut books, &[snapshot.clone()], &tickets, later),
                     (vec!["t".into()], 0)
                 );
             } else {
@@ -2484,8 +2600,95 @@ pub(crate) mod tests {
             assert!(book.asks.is_empty());
             assert_eq!(book.bids[0].size, Decimal::from(8));
             assert_eq!(book.tick_size, Some("0.01".parse().unwrap()));
-            assert!(apply_ws_message(&mut books, &snapshot, later).is_empty());
+            let initialized = apply_ws_message(&mut books, &snapshot, later);
+            assert_eq!(initialized.is_empty(), !use_rest);
         }
+    }
+
+    #[test]
+    fn malformed_ws_payload_invalidates_identified_token_atomically() {
+        let now = Instant::now();
+        let valid = json!({"event_type":"book", "asset_id":"t", "timestamp":"100",
+            "bids":[], "asks":[{"price":"0.5","size":"3"}]});
+        for bad in [
+            json!({"event_type":"book", "asset_id":"t", "timestamp":"bad", "bids":[], "asks":[]}),
+            json!({"event_type":"book", "asset_id":"t", "timestamp":"101", "bids":[]}),
+            json!({"event_type":"price_change", "timestamp":"bad", "price_changes":[{"asset_id":"t","side":"BUY","price":"0.4","size":"1"}]}),
+            json!({"event_type":"price_change", "timestamp":"101", "price_changes":[
+                {"asset_id":"t","side":"SELL","price":"0.5","size":"0"},
+                {"asset_id":"t","side":"unexpected","price":"0.4","size":"1"}]}),
+            json!({"event_type":"price_change", "timestamp":"101", "price_changes":[{"asset_id":"t","side":"BUY","price":"0.4","size":"-1"}]}),
+        ] {
+            let mut books = BookStore::default();
+            apply_ws_message(&mut books, &valid, now);
+            assert!(apply_ws_message(&mut books, &bad, now).is_empty());
+            let book = books.get_at(POLYMARKET, "t", now).unwrap();
+            assert!(book.stale);
+            assert_eq!(book.exchange_ts_ms, 100);
+            assert_eq!(book.asks[0].size, Decimal::from(3));
+        }
+    }
+
+    #[test]
+    fn strict_book_parser_rejects_incomplete_identity_timestamp_and_levels() {
+        let valid = json!({"asset_id":"t", "timestamp":"100", "bids":[], "asks":[{"price":"0.5","size":"3"}]});
+        for (field, bad) in [
+            ("timestamp", json!(null)),
+            ("timestamp", json!("invalid")),
+            ("timestamp", json!(0)),
+            ("timestamp", json!(-1)),
+            ("timestamp", json!(1.5)),
+            ("asset_id", json!("")),
+            ("asks", json!(null)),
+            ("asks", json!([{"price":"0.5"}])),
+            ("asks", json!([{"price":"0.5","size":"-1"}])),
+            ("asks", json!([{"price":"1.1","size":"1"}])),
+            (
+                "asks",
+                json!([{"price":"0.5","size":"1"},{"price":"0.5","size":"2"}]),
+            ),
+            ("tick_size", json!("oops")),
+        ] {
+            let mut payload = valid.clone();
+            payload[field] = bad;
+            assert!(parse_book_json(&payload).is_err(), "field={field}");
+        }
+        assert!(validate_book_identity(&valid, "other").is_err());
+        assert!(parse_book_json(&valid).is_ok());
+    }
+
+    #[test]
+    fn batch_rest_checks_requested_identity_and_each_ticket_independently() {
+        let now = Instant::now();
+        let mut books = BookStore::default();
+        let tickets = ["a", "b", "missing"].map(|t| books.begin_rest(POLYMARKET, t));
+        books.set_tick_size(POLYMARKET, "a", Decimal::new(1, 2));
+        let payloads: Vec<_> = ["a", "b", "unsolicited"]
+            .map(|t| json!({"asset_id":t,"timestamp":"101","bids":[],"asks":[]}))
+            .into();
+        let (accepted, rejected) = apply_rest_books(&mut books, &payloads, &tickets, now);
+        assert_eq!(accepted, vec!["b"]);
+        assert_eq!(rejected, 2);
+        assert!(books.get(POLYMARKET, "unsolicited").is_none());
+        assert!(books.get(POLYMARKET, "missing").is_none());
+        assert_eq!(apply_rest_books(&mut books, &payloads, &tickets, now).1, 3);
+    }
+
+    #[tokio::test]
+    async fn frame_array_preserves_same_millisecond_set_delete_order() {
+        let books = Arc::new(Mutex::new(BookStore::default()));
+        let (tx, _rx) = mpsc::channel(10);
+        let frame = json!([
+            {"event_type":"book","asset_id":"t","timestamp":"100","bids":[],"asks":[{"price":"0.5","size":"3"}]},
+            {"event_type":"price_change","timestamp":"100","price_changes":[{"asset_id":"t","side":"SELL","price":"0.5","size":"2"}]},
+            {"event_type":"price_change","timestamp":"100","price_changes":[{"asset_id":"t","side":"SELL","price":"0.5","size":"0"}]},
+            {"event_type":"book","asset_id":"t","timestamp":"100","bids":[],"asks":[{"price":"0.5","size":"3"}]}
+        ]);
+        handle_ws_text(&frame.to_string(), &books, &tx).await;
+        let books = books.lock().await;
+        let book = books.get(POLYMARKET, "t").unwrap();
+        assert!(book.asks.is_empty());
+        assert!(book.stale);
     }
 
     #[test]
@@ -2557,6 +2760,10 @@ pub(crate) mod tests {
             200,
             now,
         );
+        let tickets = vec![
+            books.begin_rest(POLYMARKET, "t1"),
+            books.begin_rest(POLYMARKET, "t2"),
+        ];
         let (applied, skipped_old) = apply_rest_books(
             &mut books,
             &[
@@ -2575,6 +2782,7 @@ pub(crate) mod tests {
                     "asks": [{"price": "0.46", "size": "8"}]
                 }),
             ],
+            &tickets,
             now,
         );
         assert_eq!(applied, vec!["t2".to_string()]);
@@ -2974,6 +3182,81 @@ pub(crate) mod tests {
             },
         );
         (venue, server)
+    }
+
+    #[tokio::test]
+    async fn rest_book_http_rejects_wrong_identity_and_malformed_success() {
+        let valid = json!({"asset_id":"t", "timestamp":"100", "bids":[], "asks":[]});
+        let (venue, server) = poll_stub(vec![
+            (
+                200,
+                json!({"asset_id":"other", "timestamp":"100", "bids":[], "asks":[]}),
+            ),
+            (
+                200,
+                json!({"asset_id":"t", "timestamp":"invalid", "bids":[], "asks":[]}),
+            ),
+            (200, valid),
+        ])
+        .await;
+        assert!(venue.rest_book("t").await.is_err());
+        assert!(venue.rest_book("t").await.is_err());
+        assert_eq!(venue.rest_book("t").await.unwrap().2, 100);
+        assert_eq!(server.await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn rest_book_http_in_flight_delete_rejects_newer_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 2048];
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert!(count > 0);
+            arrived_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            let body = json!({"asset_id":"t", "timestamp":"200", "bids":[], "asks":[{"price":"0.5","size":"3"}]}).to_string();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+        });
+        let mut venue = cache_test_venue();
+        venue.base = format!("http://{address}");
+        venue.http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        apply_ws_message(
+            &mut books,
+            &json!({"event_type":"book", "asset_id":"t", "timestamp":"100", "bids":[], "asks":[{"price":"0.5","size":"3"}]}),
+            now,
+        );
+        let ticket = books.begin_rest(POLYMARKET, "t");
+        let request = tokio::spawn(async move { venue.rest_book("t").await });
+        tokio::time::timeout(Duration::from_secs(3), arrived_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        apply_ws_message(
+            &mut books,
+            &json!({"event_type":"price_change", "timestamp":"100", "price_changes":[{"asset_id":"t","side":"SELL","price":"0.5","size":"0"}]}),
+            now,
+        );
+        release_tx.send(()).unwrap();
+        let (bids, asks, ts) = request.await.unwrap().unwrap();
+        assert_eq!(
+            books
+                .accept_rest(&ticket, bids, asks, ts, Instant::now(), None)
+                .unwrap_err(),
+            crate::book::BookReject::RevisionChanged
+        );
+        assert!(books.get(POLYMARKET, "t").unwrap().asks.is_empty());
+        server.await.unwrap();
     }
 
     #[tokio::test]

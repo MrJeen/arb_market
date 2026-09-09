@@ -22,21 +22,43 @@ const USDC_BALANCE_CACHE_TTL: Duration = Duration::from_secs(10);
 const FILL_PAGE_SIZE: usize = 2_000;
 const FILL_HISTORY_LIMIT: usize = 10_000;
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct FillProgress {
-    version: u8,
-    token_id: String,
-    submitted_at_ms: u64,
-    end_time: u64,
-    cursor: u64,
+pub(crate) enum FillPhase {
+    #[default]
+    InitialProbe,
+    Scan,
+    FinalProbe,
+    Complete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FillProgress {
+    pub(crate) version: u8,
+    pub(crate) token_id: String,
+    pub(crate) submitted_at_ms: u64,
+    pub(crate) end_time: u64,
+    pub(crate) cursor: u64,
     // startTime 为包含边界；只保留 cursor 毫秒已见过的账户成交 ID。
     seen_ids: BTreeSet<String>,
     history_checked: bool,
     history_lower_bound: Option<u64>,
-    history_complete: bool,
+    pub(crate) history_complete: bool,
     scanned_count: usize,
-    complete: bool,
+    pub(crate) complete: bool,
+    #[serde(default)]
+    pub(crate) phase: FillPhase,
+    #[serde(default)]
+    pub(crate) account: String,
+    #[serde(default)]
+    pub(crate) terminal_observed_at_ms: Option<u64>,
+    #[serde(default = "scan_valid_default")]
+    scan_valid: bool,
+}
+
+fn scan_valid_default() -> bool {
+    true
 }
 
 impl FillProgress {
@@ -45,7 +67,11 @@ impl FillProgress {
             .map_err(|_| Error::msg("outcome fill start time must be nonnegative"))?;
         if value.is_null() || value.as_object().is_some_and(|v| v.is_empty()) {
             return Ok(Self {
-                version: 1,
+                version: 2,
+                phase: FillPhase::InitialProbe,
+                account: String::new(),
+                terminal_observed_at_ms: None,
+                scan_valid: true,
                 token_id: token_id.to_string(),
                 submitted_at_ms: start,
                 end_time: unix_millis().max(start),
@@ -59,7 +85,7 @@ impl FillProgress {
             });
         }
         let mut state: Self = serde_json::from_value(value.clone())?;
-        if state.version != 1
+        if !matches!(state.version, 1 | 2)
             || state.token_id != token_id
             || state.submitted_at_ms != start
             || state.cursor < start
@@ -68,16 +94,71 @@ impl FillProgress {
         {
             return Err(Error::msg("invalid outcome fill progress"));
         }
-        if state.complete {
-            // 只有完整扫描后才开启下一轮；保留历史下界，但重新探测当前保留范围。
-            state.end_time = unix_millis().max(state.end_time).max(start);
-            state.cursor = start;
-            state.seen_ids.clear();
-            state.history_checked = false;
-            state.scanned_count = 0;
+        if state.version == 1 {
+            // v1 游标仍有效，但旧 historyComplete 不能成为当前覆盖授权。
+            state.version = 2;
+            state.phase = if state.complete {
+                FillPhase::FinalProbe
+            } else if state.history_checked {
+                FillPhase::Scan
+            } else {
+                FillPhase::InitialProbe
+            };
+            state.scan_valid = state.scanned_count < FILL_HISTORY_LIMIT;
             state.complete = false;
+        } else if state.phase == FillPhase::Complete {
+            state.restart();
         }
+        state.history_complete = false;
         Ok(state)
+    }
+
+    fn restart(&mut self) {
+        self.end_time = unix_millis().max(self.end_time).max(self.submitted_at_ms);
+        self.cursor = self.submitted_at_ms;
+        self.seen_ids.clear();
+        self.history_checked = false;
+        self.history_lower_bound = None;
+        self.history_complete = false;
+        self.scanned_count = 0;
+        self.complete = false;
+        self.scan_valid = true;
+        self.phase = FillPhase::InitialProbe;
+    }
+
+    pub(crate) fn follows_final_probe(&self, previous: &Value) -> bool {
+        let Ok(mut previous) = serde_json::from_value::<Self>(previous.clone()) else {
+            return false;
+        };
+        if previous.version != 2
+            || previous.phase != FillPhase::FinalProbe
+            || previous.complete
+            || previous.history_complete
+        {
+            return false;
+        }
+        previous.phase = self.phase;
+        previous.complete = self.complete;
+        previous.history_complete = self.history_complete;
+        previous.history_lower_bound = self.history_lower_bound;
+        previous.history_checked = self.history_checked;
+        previous == *self
+    }
+
+    pub(crate) fn has_coverage(&self) -> bool {
+        self.version == 2
+            && self.phase == FillPhase::Complete
+            && self.complete
+            && self.history_complete
+            && self.scan_valid
+            && self.scanned_count < FILL_HISTORY_LIMIT
+            && self
+                .history_lower_bound
+                .is_some_and(|time| time < self.submitted_at_ms)
+            && self
+                .terminal_observed_at_ms
+                .is_some_and(|time| time <= self.end_time)
+            && !self.account.is_empty()
     }
 }
 
@@ -183,16 +264,18 @@ impl OutcomeVenue {
 
     pub async fn rest_book(&self, coin: &str) -> Result<(Vec<Level>, Vec<Level>, i64)> {
         let body = json!({"type": "l2Book", "coin": coin});
-        let value: Value = self
-            .http
-            .post(&self.info_url)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        Ok(parse_l2_book(&value))
+        let value = self.query_info("l2Book", coin, &body).await?;
+        let result = (|| {
+            if value.get("coin").and_then(Value::as_str) != Some(coin) {
+                return Err(Error::msg("outcome book response coin mismatch"));
+            }
+            parse_l2_book(&value)
+        })();
+        if let Err(err) = &result {
+            tracing::warn!(service = "outcome", api = "l2Book", token_id = coin,
+                error = %err, "outcome book validation failed");
+        }
+        result
     }
 
     pub async fn user_state(&self) -> Result<Decimal> {
@@ -401,13 +484,37 @@ impl OutcomeVenue {
         submitted_at_ms: i64,
         progress: &Value,
     ) -> Result<FillPage> {
+        self.poll_fill_page_after_terminal(token_id, submitted_at_ms, progress, None)
+            .await
+    }
+
+    pub(crate) async fn poll_fill_page_after_terminal(
+        &self,
+        token_id: &str,
+        submitted_at_ms: i64,
+        progress: &Value,
+        terminal_observed_at_ms: Option<u64>,
+    ) -> Result<FillPage> {
         let mut state = FillProgress::load(token_id, submitted_at_ms, progress)?;
         let user = self
             .account
             .as_deref()
             .ok_or_else(|| Error::msg("missing OUTCOME_ACCOUNT_ADDRESS"))?;
+        if !state.account.is_empty() && !state.account.eq_ignore_ascii_case(user) {
+            return Err(Error::msg("outcome fill progress account mismatch"));
+        }
+        state.account = user.to_ascii_lowercase();
+        if let Some(observed) = terminal_observed_at_ms {
+            if state.terminal_observed_at_ms != Some(observed) {
+                // 首次终态之后重新整轮扫描，后续 poll 不反复重置已保存游标。
+                state.restart();
+                state.end_time = state.end_time.max(observed);
+                state.terminal_observed_at_ms = Some(observed);
+            }
+        }
         // 每次只查询一页，让调用方立即持久化成功进度；后页失败不得抹掉此前进展。
-        let probing_history = !state.history_checked;
+        let probing_history =
+            matches!(state.phase, FillPhase::InitialProbe | FillPhase::FinalProbe);
         let start_time = if probing_history { 0 } else { state.cursor };
         let started = Instant::now();
         let raw = self
@@ -500,33 +607,54 @@ impl OutcomeVenue {
     }
 }
 
-pub fn parse_l2_book(value: &Value) -> (Vec<Level>, Vec<Level>, i64) {
+pub fn parse_l2_book(value: &Value) -> Result<(Vec<Level>, Vec<Level>, i64)> {
     let data = value.get("data").unwrap_or(value);
-    let ts = data.get("time").and_then(|v| v.as_i64()).unwrap_or(0);
-    let levels = data.get("levels").and_then(|v| v.as_array());
-    let bids = levels
-        .and_then(|arr| arr.first())
-        .map(parse_hl_levels)
-        .unwrap_or_default();
-    let asks = levels
-        .and_then(|arr| arr.get(1))
-        .map(parse_hl_levels)
-        .unwrap_or_default();
-    (bids, asks, ts)
+    let coin = data
+        .get("coin")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::msg("outcome book missing coin"))?;
+    parse_side_coin(coin).ok_or_else(|| Error::msg("outcome book invalid coin"))?;
+    let ts = data
+        .get("time")
+        .and_then(Value::as_i64)
+        .filter(|time| *time > 0)
+        .ok_or_else(|| Error::msg("outcome book missing valid timestamp"))?;
+    let levels = data
+        .get("levels")
+        .and_then(Value::as_array)
+        .filter(|levels| levels.len() == 2)
+        .ok_or_else(|| Error::msg("outcome book requires two complete sides"))?;
+    Ok((
+        parse_hl_levels(&levels[0])?,
+        parse_hl_levels(&levels[1])?,
+        ts,
+    ))
 }
 
-fn parse_hl_levels(value: &Value) -> Vec<Level> {
-    match value {
-        Value::Array(items) => items
-            .iter()
-            .filter_map(|item| {
-                let price = item.get("px").and_then(parse_decimal)?;
-                let size = item.get("sz").and_then(parse_decimal)?;
-                Some(Level { price, size })
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
+fn parse_hl_levels(value: &Value) -> Result<Vec<Level>> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| Error::msg("outcome book side is not an array"))?;
+    let mut prices = BTreeSet::new();
+    items
+        .iter()
+        .map(|item| {
+            let price = item
+                .get("px")
+                .and_then(parse_decimal)
+                .filter(|price| *price > Decimal::ZERO && *price <= Decimal::ONE)
+                .ok_or_else(|| Error::msg("outcome book invalid price"))?;
+            let size = item
+                .get("sz")
+                .and_then(parse_decimal)
+                .filter(|size| *size > Decimal::ZERO)
+                .ok_or_else(|| Error::msg("outcome book invalid size"))?;
+            if !prices.insert(price) {
+                return Err(Error::msg("outcome book duplicate price"));
+            }
+            Ok(Level { price, size })
+        })
+        .collect()
 }
 
 pub fn is_explicit_order_reject(message: &str) -> bool {
@@ -823,10 +951,28 @@ fn apply_fill_page(
     if probing_history {
         let lower_bound = records.first().map(|record| record.0);
         state.history_checked = true;
-        // 最近 10000 条的保留限制不能用“返回了短页/空页”排除更早的成交。
-        state.history_complete = lower_bound.is_some_and(|time| time <= state.submitted_at_ms);
         state.history_lower_bound = lower_bound;
-        return Ok((Vec::new(), false));
+        state.history_complete = false;
+        if state.phase == FillPhase::FinalProbe {
+            // 下界必须严格早于查询起点：同毫秒的更早记录也可能已被保留上限截断。
+            // 覆盖授权只来自本轮尾页之后的新请求；满页同毫秒下界同样不作证明。
+            let ambiguous_boundary = items.len() == FILL_PAGE_SIZE
+                && records.first().map(|r| r.0) == records.last().map(|r| r.0);
+            state.history_complete = state.scan_valid
+                && state.scanned_count < FILL_HISTORY_LIMIT
+                && !ambiguous_boundary
+                && lower_bound.is_some_and(|time| time < state.submitted_at_ms);
+            state.complete = true;
+            state.phase = FillPhase::Complete;
+        } else {
+            state.phase = FillPhase::Scan;
+        }
+        // probe 也是实际成交观测；跨请求去重交由既有事务按真实 tid 合并。
+        let fills = records
+            .into_iter()
+            .filter_map(|(_, _, fill)| fill)
+            .collect();
+        return Ok((fills, false));
     }
 
     let old_cursor = state.cursor;
@@ -844,8 +990,9 @@ fn apply_fill_page(
     }
     state.scanned_count = state.scanned_count.saturating_add(new_count);
     if state.scanned_count >= FILL_HISTORY_LIMIT {
-        state.history_complete = false;
+        state.scan_valid = false;
     }
+    state.history_complete = false;
     if let Some((last_time, _, _)) = records.last() {
         if *last_time > old_cursor {
             state.cursor = *last_time;
@@ -857,19 +1004,37 @@ fn apply_fill_page(
             }
         }
     }
-    state.complete = items.len() < FILL_PAGE_SIZE;
+    let tail = items.len() < FILL_PAGE_SIZE;
+    state.complete = false;
+    if tail {
+        state.phase = FillPhase::FinalProbe;
+    }
     // 同一毫秒有 >=2000 条且接口反复返回同一页时，不能 +1 跳过未知成交。
-    let stalled = !state.complete
+    let stalled = !tail
         && ((state.cursor == old_cursor && new_count == 0)
             || state.seen_ids.len() >= FILL_HISTORY_LIMIT);
+    if stalled {
+        state.scan_valid = false;
+    }
     Ok((fills, stalled))
 }
 
 pub fn apply_ws_book(books: &mut BookStore, payload: &Value, now: Instant) -> Option<String> {
     let data = payload.get("data").unwrap_or(payload);
     let coin = data.get("coin").and_then(|v| v.as_str())?;
-    let (bids, asks, ts) = parse_l2_book(payload);
-    if books.replace_snapshot(OUTCOME, coin, bids, asks, ts, now) {
+    let (bids, asks, ts) = match parse_l2_book(payload) {
+        Ok(book) => book,
+        Err(err) => {
+            books.invalidate_ws(OUTCOME, coin, crate::book::BookReject::InvalidPayload);
+            tracing::warn!(service = "outcome", event = "invalid_ws_book", token_id = coin,
+                error = %err, "outcome websocket book invalidated");
+            return Some(coin.to_string());
+        }
+    };
+    if books
+        .replace_snapshot(OUTCOME, coin, bids, asks, ts, now)
+        .is_applied()
+    {
         Some(coin.to_string())
     } else {
         None
@@ -890,7 +1055,12 @@ pub async fn run_l2_ws(
         }
         match tokio_tungstenite::connect_async(&url).await {
             Ok((ws, _)) => {
-                tracing::info!("hyperliquid l2 ws connected");
+                books.lock().await.begin_platform_connection(OUTCOME);
+                tracing::info!(
+                    service = "outcome",
+                    event = "ws_connected",
+                    "hyperliquid l2 ws connected"
+                );
                 let (mut write, mut read) = ws.split();
                 for coin in &coins {
                     let msg =
@@ -900,7 +1070,11 @@ pub async fn run_l2_ws(
                 loop {
                     tokio::select! {
                         msg = sub_rx.recv() => {
-                            let Some(next) = msg else { return; };
+                            let Some(next) = msg else {
+                                books.lock().await.mark_platform_stale(OUTCOME);
+                                tracing::info!(service = "outcome", event = "ws_stopped", "outcome subscription channel closed");
+                                return;
+                            };
                             let dropped: Vec<_> = coins
                                 .iter()
                                 .filter(|coin| !next.contains(*coin))
@@ -929,10 +1103,19 @@ pub async fn run_l2_ws(
                             };
                             handle_ws(&text, &books, &calc_tx).await;
                         }
-                        _ = wait_shutdown(&shutdown) => return,
+                        _ = wait_shutdown(&shutdown) => {
+                            books.lock().await.mark_platform_stale(OUTCOME);
+                            tracing::info!(service = "outcome", event = "ws_stopped", "outcome websocket shutdown");
+                            return;
+                        },
                     }
                 }
                 books.lock().await.mark_platform_stale(OUTCOME);
+                tracing::warn!(
+                    service = "outcome",
+                    event = "ws_disconnected",
+                    "hyperliquid l2 ws disconnected; reconnecting"
+                );
             }
             Err(err) => tracing::warn!(error = %err, "hyperliquid ws connect failed"),
         }
@@ -1254,13 +1437,16 @@ mod tests {
         for (raw, covered) in [
             (json!([]), false),
             (json!([fill(1, 101, "#other")]), false),
-            (json!([fill(1, 100, "#other")]), true),
+            (json!([fill(1, 100, "#other")]), false),
             (json!([fill(1, 99, "#other")]), true),
         ] {
             let mut state = fill_state(100);
             apply_fill_page(&raw, &mut state, true).unwrap();
-            assert_eq!(state.history_complete, covered);
+            assert!(!state.history_complete);
             apply_fill_page(&json!([]), &mut state, false).unwrap();
+            assert!(!state.complete);
+            assert_eq!(state.phase, FillPhase::FinalProbe);
+            apply_fill_page(&raw, &mut state, true).unwrap();
             assert!(state.complete);
             assert_eq!(state.history_complete, covered);
         }
@@ -1268,6 +1454,7 @@ mod tests {
         state.history_complete = true;
         state.scanned_count = FILL_HISTORY_LIMIT - 1;
         apply_fill_page(&json!([fill(1, 100, "#5160")]), &mut state, false).unwrap();
+        apply_fill_page(&json!([fill(0, 99, "#other")]), &mut state, true).unwrap();
         assert!(state.complete);
         assert!(!state.history_complete);
     }
@@ -1332,8 +1519,9 @@ mod tests {
             .poll_fill_page("#5160", 100, &first.progress)
             .await
             .unwrap();
-        assert!(page.complete);
-        assert!(page.history_complete);
+        assert!(!page.complete);
+        assert!(!page.history_complete);
+        assert_eq!(page.progress["phase"], "finalProbe");
         assert_eq!(
             page.fills
                 .iter()
@@ -1368,6 +1556,7 @@ mod tests {
                 json!([fill(3999, 4098, "#5160"), fill(4000, 4099, "#5160")]),
             ),
             (200, json!([fill(0, 99, "#other")])),
+            (200, json!([fill(0, 99, "#other")])),
             (200, json!([])),
         ]);
         let probe = venue
@@ -1389,14 +1578,20 @@ mod tests {
             .poll_fill_page("#5160", 100, &second.progress)
             .await
             .unwrap();
-        assert!(third.complete);
-        assert!(third.history_complete);
+        assert!(!third.complete);
+        assert!(!third.history_complete);
         assert_eq!(third.fills.len(), 1);
         assert_eq!(third.fills[0].trade_id, "4000");
         assert_eq!(third.progress["endTime"], first.progress["endTime"]);
         assert_eq!(third.progress["historyLowerBound"], 99);
-        let next_probe = venue
+        let completed = venue
             .poll_fill_page("#5160", 100, &third.progress)
+            .await
+            .unwrap();
+        assert!(completed.complete);
+        assert!(completed.history_complete);
+        let next_probe = venue
+            .poll_fill_page("#5160", 100, &completed.progress)
             .await
             .unwrap();
         assert!(!next_probe.complete);
@@ -1404,14 +1599,15 @@ mod tests {
             .poll_fill_page("#5160", 100, &next_probe.progress)
             .await
             .unwrap();
-        assert!(next_round.complete);
+        assert!(!next_round.complete);
+        assert_eq!(next_round.progress["phase"], "finalProbe");
         let requests = server.join().unwrap();
         assert_eq!(
             requests
                 .iter()
                 .map(|r| r["startTime"].as_u64().unwrap())
                 .collect::<Vec<_>>(),
-            vec![0, 100, 2099, 4098, 0, 100]
+            vec![0, 100, 2099, 4098, 0, 0, 100]
         );
         assert!(requests[..4]
             .iter()
@@ -1461,7 +1657,8 @@ mod tests {
     #[tokio::test]
     async fn empty_or_truncated_history_never_proves_zero_fills() {
         for probe in [json!([]), json!([fill(1, 101, "#other")])] {
-            let (venue, server) = info_stub(vec![(200, probe), (200, json!([]))]);
+            let (venue, server) =
+                info_stub(vec![(200, probe.clone()), (200, json!([])), (200, probe)]);
             let probe = venue
                 .poll_fill_page("#5160", 100, &Value::Null)
                 .await
@@ -1472,10 +1669,16 @@ mod tests {
                 .poll_fill_page("#5160", 100, &probe.progress)
                 .await
                 .unwrap();
-            assert!(page.complete);
+            assert!(!page.complete);
             assert!(!page.history_complete);
             assert!(page.fills.is_empty());
-            assert_eq!(server.join().unwrap().len(), 2);
+            let final_page = venue
+                .poll_fill_page("#5160", 100, &page.progress)
+                .await
+                .unwrap();
+            assert!(final_page.complete);
+            assert!(!final_page.history_complete);
+            assert_eq!(server.join().unwrap().len(), 3);
         }
     }
 
@@ -1536,8 +1739,9 @@ mod tests {
             assert!(venue.poll_fill_page("#5160", 100, &saved).await.is_err());
         }
         let recovered = venue.poll_fill_page("#5160", 100, &saved).await.unwrap();
-        assert!(recovered.complete);
-        assert!(recovered.history_complete);
+        assert!(!recovered.complete);
+        assert!(!recovered.history_complete);
+        assert_eq!(recovered.progress["phase"], "finalProbe");
         assert_eq!(recovered.fills.len(), 1);
         assert_eq!(recovered.fills[0].trade_id, "2001");
         let requests = server.join().unwrap();
@@ -1551,6 +1755,137 @@ mod tests {
         assert!(requests
             .iter()
             .all(|r| r["endTime"] == requests[0]["endTime"]));
+    }
+
+    #[tokio::test]
+    async fn probes_keep_unique_fills_and_recheck_coverage_after_reload() {
+        for final_probe in [json!([]), json!([fill(9, 101, "#other")])] {
+            let (venue, server) = info_stub(vec![
+                (200, json!([fill(0, 99, "#other"), fill(1, 100, "#5160")])),
+                (200, json!([])),
+                (200, final_probe),
+            ]);
+            let initial = venue
+                .poll_fill_page_after_terminal("#5160", 100, &Value::Null, Some(200))
+                .await
+                .unwrap();
+            assert_eq!(initial.fills.len(), 1);
+            assert_eq!(initial.fills[0].trade_id, "1");
+            assert!(!initial.history_complete);
+            let saved: Value = serde_json::from_str(&initial.progress.to_string()).unwrap();
+            let tail = venue
+                .poll_fill_page_after_terminal("#5160", 100, &saved, Some(200))
+                .await
+                .unwrap();
+            assert!(!tail.complete);
+            assert_eq!(tail.progress["phase"], "finalProbe");
+            let final_page = venue
+                .poll_fill_page_after_terminal("#5160", 100, &tail.progress, Some(200))
+                .await
+                .unwrap();
+            assert!(final_page.complete);
+            assert!(!final_page.history_complete);
+            let requests = server.join().unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|r| r["startTime"].as_u64().unwrap())
+                    .collect::<Vec<_>>(),
+                vec![0, 100, 0]
+            );
+            assert!(requests
+                .iter()
+                .all(|r| r["endTime"] == requests[0]["endTime"]));
+        }
+    }
+
+    #[tokio::test]
+    async fn final_probe_retries_saved_stage_and_returns_real_fills() {
+        let (venue, server) = info_stub(vec![
+            (200, json!([fill(0, 99, "#other")])),
+            (200, json!([])),
+            (503, json!({"error":"temporary"})),
+            (200, json!([fill(0, 99, "#other"), fill(2, 150, "#5160")])),
+        ]);
+        let initial = venue
+            .poll_fill_page_after_terminal("#5160", 100, &Value::Null, Some(200))
+            .await
+            .unwrap();
+        let tail = venue
+            .poll_fill_page_after_terminal("#5160", 100, &initial.progress, Some(200))
+            .await
+            .unwrap();
+        let saved: Value = serde_json::from_str(&tail.progress.to_string()).unwrap();
+        assert!(venue
+            .poll_fill_page_after_terminal("#5160", 100, &saved, Some(200))
+            .await
+            .is_err());
+        let final_page = venue
+            .poll_fill_page_after_terminal("#5160", 100, &saved, Some(200))
+            .await
+            .unwrap();
+        assert!(final_page.complete && final_page.history_complete);
+        assert_eq!(final_page.fills[0].trade_id, "2");
+        let proof: FillProgress = serde_json::from_value(final_page.progress).unwrap();
+        assert!(proof.has_coverage());
+        assert!(proof.follows_final_probe(&saved));
+        let requests = server.join().unwrap();
+        assert_eq!(requests[2], requests[3]);
+    }
+
+    #[test]
+    fn final_probe_cannot_clear_scan_limits_or_same_millisecond_ambiguity() {
+        let full: Vec<_> = (1..=2000).map(|id| fill(id, 100, "#5160")).collect();
+        let mut state = fill_state(100);
+        apply_fill_page(&json!(full), &mut state, false).unwrap();
+        assert!(apply_fill_page(&json!(full), &mut state, false).unwrap().1);
+        apply_fill_page(&json!([]), &mut state, false).unwrap();
+        apply_fill_page(&json!([fill(0, 99, "#other")]), &mut state, true).unwrap();
+        assert!(!state.history_complete);
+        let mut state = fill_state(100);
+        state.phase = FillPhase::FinalProbe;
+        let (fills, _) = apply_fill_page(&json!(full), &mut state, true).unwrap();
+        assert_eq!(fills.len(), 2000);
+        assert!(!state.history_complete);
+    }
+
+    #[tokio::test]
+    async fn first_terminal_poll_restarts_old_window_once_and_v1_keeps_safe_cursor() {
+        let mut old = serde_json::to_value(fill_state(100)).unwrap();
+        old["version"] = json!(1);
+        old["historyChecked"] = json!(true);
+        old["historyComplete"] = json!(true);
+        old["cursor"] = json!(150);
+        for field in ["phase", "account", "terminalObservedAtMs", "scanValid"] {
+            old.as_object_mut().unwrap().remove(field);
+        }
+        let migrated = FillProgress::load("#5160", 100, &old).unwrap();
+        assert_eq!(migrated.phase, FillPhase::Scan);
+        assert_eq!(migrated.cursor, 150);
+        assert_eq!(migrated.end_time, 100_000);
+        assert!(!migrated.history_complete);
+        old["complete"] = json!(true);
+        assert_eq!(
+            FillProgress::load("#5160", 100, &old).unwrap().phase,
+            FillPhase::FinalProbe
+        );
+        let (venue, server) = info_stub(vec![(200, json!([])), (200, json!([]))]);
+        let first = venue
+            .poll_fill_page_after_terminal("#5160", 100, &old, Some(100_001))
+            .await
+            .unwrap();
+        assert_eq!(first.progress["phase"], "scan");
+        assert_eq!(first.progress["cursor"], 100);
+        assert_eq!(first.progress["terminalObservedAtMs"], 100_001);
+        let second = venue
+            .poll_fill_page_after_terminal("#5160", 100, &first.progress, Some(100_001))
+            .await
+            .unwrap();
+        assert_eq!(second.progress["phase"], "finalProbe");
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0]["startTime"], 0);
+        assert_eq!(requests[1]["startTime"], 100);
+        assert_eq!(requests[0]["endTime"], requests[1]["endTime"]);
     }
 
     #[test]
@@ -1754,10 +2089,46 @@ mod tests {
                 ]
             }
         });
-        let (bids, asks, ts) = parse_l2_book(&raw);
+        let (bids, asks, ts) = parse_l2_book(&raw).unwrap();
         assert_eq!(ts, 10);
         assert_eq!(bids[0].price.to_string(), "0.40");
         assert_eq!(asks[0].size.to_string(), "8");
+    }
+
+    #[tokio::test]
+    async fn rest_book_rejects_wrong_identity_and_malformed_complete_payloads() {
+        let valid = json!({"coin":"#5160","time":10,"levels":[[],[{"px":"0.4","sz":"2"}]]});
+        for (field, value) in [
+            ("coin", json!("#5161")),
+            ("time", Value::Null),
+            ("time", json!(-1)),
+            ("time", json!("10")),
+            ("levels", json!([[]])),
+            ("levels", json!([[],[{"px":"0.4","sz":"bad"}]])),
+            ("levels", json!([[],[{"px":"1.1","sz":"2"}]])),
+        ] {
+            let mut bad = valid.clone();
+            bad[field] = value;
+            let (venue, server) = info_stub(vec![(200, bad)]);
+            assert!(venue.rest_book("#5160").await.is_err());
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn invalid_ws_book_cannot_refresh_existing_snapshot() {
+        let now = Instant::now();
+        let mut books = BookStore::default();
+        let valid = json!({"coin":"#5160","time":10,"levels":[[],[{"px":"0.4","sz":"2"}]]});
+        assert!(apply_ws_book(&mut books, &valid, now).is_some());
+        let mut invalid = valid.clone();
+        invalid["time"] = Value::Null;
+        assert!(parse_l2_book(&invalid).is_err());
+        apply_ws_book(&mut books, &invalid, now);
+        assert!(!books
+            .get(OUTCOME, "#5160")
+            .unwrap()
+            .is_fresh(Duration::from_secs(5), now));
     }
 
     #[test]

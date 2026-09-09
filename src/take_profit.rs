@@ -366,17 +366,10 @@ mod tests {
     }
 
     #[test]
-    fn accumulates_sub_share_levels_and_skips_non_positive_levels() {
+    fn accumulates_sub_share_levels() {
+        // 非法档位由 BookStore 输入边界拒绝，规划器使用已验证的完整盘口。
         let plan = partial_plan(
-            &[
-                ("0.99", "0"),
-                ("0.98", "-2"),
-                ("0.80", "0.6"),
-                ("0.75", "0.6"),
-                ("0.70", "0.9"),
-                ("0", "100"),
-                ("-0.1", "100"),
-            ],
+            &[("0.80", "0.6"), ("0.75", "0.6"), ("0.70", "0.9")],
             &[("0.65", "0.4"), ("0.60", "0.7"), ("0.55", "1.1")],
             "2.9",
             &fees(),
@@ -488,12 +481,18 @@ mod tests {
                 }),
                 now
             ),
-            vec![("pm-yes".into(), true)]
+            vec![]
         );
         assert!(books.get(POLYMARKET, "pm-yes").unwrap().stale);
         assert!(plan(&books).is_none());
         pm_snapshot["timestamp"] = json!("101");
         pm_snapshot["asks"] = json!([]);
+        assert!(apply_ws_message(&mut books, &pm_snapshot, now).is_empty());
+        assert!(
+            plan(&books).is_none(),
+            "same-timestamp conflict cannot repair the missing baseline"
+        );
+        pm_snapshot["timestamp"] = json!("102");
         assert_eq!(
             apply_ws_message(&mut books, &pm_snapshot, now),
             vec![("pm-yes".into(), true)]

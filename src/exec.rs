@@ -309,7 +309,8 @@ impl Engine {
             "balances confirmed"
         );
 
-        let Some(plan) = self.confirm_http_plan(topic, &plan).await? else {
+        let Some((plan, confirmation_deadline)) = self.confirm_http_plan(topic, &plan).await?
+        else {
             return Ok(());
         };
         let pm_need = plan.pm.cost + plan.pm.fee;
@@ -395,10 +396,21 @@ impl Engine {
                 plan.total_cost,
                 &fills,
                 &initial_legs,
+                self.cfg.max_active_orders,
+                confirmation_deadline,
             )
             .await
         {
             Ok(created) => created,
+            Err(Error::OrderCapacityReached) => {
+                self.stats.max_orders();
+                tracing::info!(topic = %topic.key.as_str(), limit = self.cfg.max_active_orders, "order admission capacity reached");
+                return Ok(());
+            }
+            Err(Error::OrderConfirmationExpired) => {
+                tracing::info!(topic = %topic.key.as_str(), "order confirmation expired while awaiting admission");
+                return Ok(());
+            }
             Err(Error::Sqlx(sqlx::Error::Database(db)))
                 if db.code().as_deref() == Some("23505") =>
             {
@@ -499,7 +511,19 @@ impl Engine {
         notify::format_platform_label(POLYMARKET, self.polymarket_service(funder))
     }
 
-    async fn confirm_http_plan(&self, topic: &Topic, plan: &ArbPlan) -> Result<Option<ArbPlan>> {
+    async fn confirm_http_plan(
+        &self,
+        topic: &Topic,
+        plan: &ArbPlan,
+    ) -> Result<Option<(ArbPlan, Instant)>> {
+        self.ensure_pm_tick(&plan.pm.token_id).await;
+        let (pm_ticket, out_ticket) = {
+            let books = self.books.lock().await;
+            (
+                books.begin_rest(POLYMARKET, &plan.pm.token_id),
+                books.begin_rest(OUTCOME, &plan.outcome.token_id),
+            )
+        };
         let (pm_res, out_res) = tokio::join!(
             async {
                 let started = Instant::now();
@@ -565,128 +589,32 @@ impl Engine {
         let (out_ask, out_sz) = first_usable_ask(&out_asks, true)
             .map(|(px, sz)| (Some(px), Some(sz)))
             .unwrap_or((None, None));
-        // REST 盘口写回内存：exchange_ts 更旧或相同则丢弃。两边都拉到就写，skew 失败也写。
-        let (
-            pm_prev_ts,
-            out_prev_ts,
-            pm_prev_ask,
-            pm_prev_sz,
-            out_prev_ask,
-            out_prev_sz,
-            pm_applied,
-            out_applied,
-        ) = {
+        // 两边校验及返回本次请求副本在同一锁内完成；拒绝不可回退为 WS 确认。
+        let accepted = {
             let mut books = self.books.lock().await;
-            let pm_prev = books.get(POLYMARKET, &plan.pm.token_id);
-            let out_prev = books.get(OUTCOME, &plan.outcome.token_id);
-            let pm_prev_ts = pm_prev.map(|b| b.exchange_ts_ms).unwrap_or(0);
-            let out_prev_ts = out_prev.map(|b| b.exchange_ts_ms).unwrap_or(0);
-            let (pm_prev_ask, pm_prev_sz) = pm_prev
-                .and_then(|b| first_usable_ask(&b.asks, false))
-                .map(|(px, sz)| (Some(px), Some(sz)))
-                .unwrap_or((None, None));
-            let (out_prev_ask, out_prev_sz) = out_prev
-                .and_then(|b| first_usable_ask(&b.asks, true))
-                .map(|(px, sz)| (Some(px), Some(sz)))
-                .unwrap_or((None, None));
-            let pm_applied = books.replace_snapshot(
-                POLYMARKET,
-                &plan.pm.token_id,
-                pm_bids.clone(),
-                pm_asks.clone(),
-                pm_ts,
-                pm_at,
-            );
-            let out_applied = books.replace_snapshot(
-                OUTCOME,
-                &plan.outcome.token_id,
-                out_bids.clone(),
-                out_asks.clone(),
-                out_ts,
-                out_at,
-            );
-            (
-                pm_prev_ts,
-                out_prev_ts,
-                pm_prev_ask,
-                pm_prev_sz,
-                out_prev_ask,
-                out_prev_sz,
-                pm_applied,
-                out_applied,
+            accept_confirmation_books(
+                &mut books,
+                &pm_ticket,
+                (pm_bids, pm_asks, pm_ts, pm_at),
+                &out_ticket,
+                (out_bids, out_asks, out_ts, out_at),
+                self.cfg.book_stale,
+                Instant::now(),
             )
         };
+        let Some((pm_book, out_book)) = accepted else {
+            tracing::debug!(topic = %topic.key.as_str(), pm_epoch = pm_ticket.epoch,
+                pm_revision = pm_ticket.revision, out_epoch = out_ticket.epoch,
+                out_revision = out_ticket.revision, "http confirmation book rejected or expired");
+            return Ok(None);
+        };
         if !book_recv_skew_ok(pm_at, out_at, HTTP_BOOK_SKEW_MAX) {
-            tracing::warn!(
-                topic = %topic.key.as_str(),
-                pm_token = %plan.pm.token_id,
-                out_token = %plan.outcome.token_id,
-                skew_ms = skew.as_millis() as u64,
-                pm_elapsed_ms = pm_elapsed.as_millis() as u64,
-                out_elapsed_ms = out_elapsed.as_millis() as u64,
-                pm_ts,
-                out_ts,
-                pm_prev_ts,
-                out_prev_ts,
-                pm_ask = %fmt_px(pm_ask),
-                pm_sz = %fmt_px(pm_sz),
-                out_ask = %fmt_px(out_ask),
-                out_sz = %fmt_px(out_sz),
-                pm_prev_ask = %fmt_px(pm_prev_ask),
-                pm_prev_sz = %fmt_px(pm_prev_sz),
-                out_prev_ask = %fmt_px(out_prev_ask),
-                out_prev_sz = %fmt_px(out_prev_sz),
-                pm_applied,
-                out_applied,
-                "http book receive skew exceeded 1s"
-            );
+            tracing::warn!(topic = %topic.key.as_str(), skew_ms = skew.as_millis() as u64,
+                "http book receive skew exceeded 1s");
             self.stats.skew();
             return Ok(None);
         }
-        tracing::info!(
-            topic = %topic.key.as_str(),
-            pm_token = %plan.pm.token_id,
-            out_token = %plan.outcome.token_id,
-            skew_ms = skew.as_millis() as u64,
-            pm_elapsed_ms = pm_elapsed.as_millis() as u64,
-            out_elapsed_ms = out_elapsed.as_millis() as u64,
-            pm_ts,
-            out_ts,
-            pm_prev_ts,
-            out_prev_ts,
-            pm_ask = %fmt_px(pm_ask),
-            pm_sz = %fmt_px(pm_sz),
-            out_ask = %fmt_px(out_ask),
-            out_sz = %fmt_px(out_sz),
-            pm_prev_ask = %fmt_px(pm_prev_ask),
-            pm_prev_sz = %fmt_px(pm_prev_sz),
-            out_prev_ask = %fmt_px(out_prev_ask),
-            out_prev_sz = %fmt_px(out_prev_sz),
-            pm_applied,
-            out_applied,
-            "http books received"
-        );
-        let pm_tick = self.ensure_pm_tick(&plan.pm.token_id).await;
-        let pm_book = OrderBook {
-            platform: POLYMARKET.to_string(),
-            token_id: plan.pm.token_id.clone(),
-            bids: pm_bids,
-            asks: pm_asks,
-            exchange_ts_ms: pm_ts,
-            received_at: pm_at,
-            stale: false,
-            tick_size: pm_tick,
-        };
-        let out_book = OrderBook {
-            platform: OUTCOME.to_string(),
-            token_id: plan.outcome.token_id.clone(),
-            bids: out_bids,
-            asks: out_asks,
-            exchange_ts_ms: out_ts,
-            received_at: out_at,
-            stale: false,
-            tick_size: None,
-        };
+        let confirmation_deadline = pm_at.min(out_at) + self.cfg.book_stale;
         let fees = self.fee_context(topic);
         let limits = ArbLimits {
             cost_limit: self.cfg.arb_cost_limit,
@@ -710,7 +638,7 @@ impl Engine {
                     out_sz = %fmt_px(out_sz),
                     "http arb confirmed"
                 );
-                Ok(Some(confirmed))
+                Ok(Some((confirmed, confirmation_deadline)))
             }
             None => {
                 let miss = diagnose_books(
@@ -727,20 +655,12 @@ impl Engine {
                     topic = %topic.key.as_str(),
                     pm_ts,
                     out_ts,
-                    pm_prev_ts,
-                    out_prev_ts,
                     pm_ask = %fmt_px(pm_ask),
                     pm_sz = %fmt_px(pm_sz),
                     out_ask = %fmt_px(out_ask),
                     out_sz = %fmt_px(out_sz),
-                    pm_prev_ask = %fmt_px(pm_prev_ask),
-                    pm_prev_sz = %fmt_px(pm_prev_sz),
-                    out_prev_ask = %fmt_px(out_prev_ask),
-                    out_prev_sz = %fmt_px(out_prev_sz),
                     unit_cost = %fmt_px(miss.unit_cost),
                     reason,
-                    pm_applied,
-                    out_applied,
                     "http plan not fillable"
                 );
                 self.stats.no_longer();
@@ -1032,10 +952,15 @@ impl Engine {
         // 与平台时钟留重叠；精确 oid 匹配会排除窗口中其他订单的成交。
         let page = self
             .outcome
-            .poll_fill_page(
+            .poll_fill_page_after_terminal(
                 &current.token_id,
                 submitted.timestamp_millis().saturating_sub(30_000).max(0),
                 &progress,
+                current
+                    .last_order_info
+                    .as_ref()
+                    .and_then(|info| info.get("outcome_terminal_observed_at_ms"))
+                    .and_then(Value::as_u64),
             )
             .await?;
         self.apply_fill_page(&current, poll, page).await
@@ -1741,6 +1666,14 @@ impl Engine {
             .iter()
             .find(|a| a.platform == OUTCOME)
             .ok_or_else(|| Error::msg("take profit plan missing outcome action"))?;
+        self.ensure_pm_tick(&pm_action.token_id).await;
+        let (pm_ticket, out_ticket) = {
+            let books = self.books.lock().await;
+            (
+                books.begin_rest(POLYMARKET, &pm_action.token_id),
+                books.begin_rest(OUTCOME, &out_action.token_id),
+            )
+        };
         let (pm, outcome) = tokio::join!(
             async {
                 let started = Instant::now();
@@ -1806,30 +1739,44 @@ impl Engine {
             skew_ms = skew.as_millis() as u64,
             "take profit rest books fetched"
         );
-        let mut books = BookStore::default();
-        books.replace_snapshot(
-            POLYMARKET,
-            &pm_action.token_id,
-            pm_bids,
-            pm_asks,
-            pm_ts,
-            pm_at,
-        );
-        books.replace_snapshot(
-            OUTCOME,
-            &out_action.token_id,
-            out_bids,
-            out_asks,
-            out_ts,
-            out_at,
-        );
-        if let Some(tick) = self.ensure_pm_tick(&pm_action.token_id).await {
-            books.set_tick_size(POLYMARKET, &pm_action.token_id, tick);
+        let accepted = {
+            let mut books = self.books.lock().await;
+            accept_confirmation_books(
+                &mut books,
+                &pm_ticket,
+                (pm_bids, pm_asks, pm_ts, pm_at),
+                &out_ticket,
+                (out_bids, out_asks, out_ts, out_at),
+                self.cfg.book_stale,
+                Instant::now(),
+            )
+        };
+        let Some((pm_book, out_book)) = accepted else {
+            tracing::debug!(topic = %topic.key.as_str(), "take profit confirmation book rejected or expired");
+            return Ok(None);
+        };
+        // 只放接纳后的请求副本，不允许独立缓存接纳原始被拒回包。
+        let mut confirmed_books = BookStore::new(self.cfg.book_stale);
+        for book in [pm_book, out_book] {
+            let ticket = confirmed_books.begin_rest(&book.platform, &book.token_id);
+            if confirmed_books
+                .accept_rest(
+                    &ticket,
+                    book.bids,
+                    book.asks,
+                    book.exchange_ts_ms,
+                    book.received_at,
+                    book.tick_size,
+                )
+                .is_err()
+            {
+                return Ok(None);
+            }
         }
         Ok(plan_take_profit(
             topic,
             positions,
-            &books,
+            &confirmed_books,
             fees,
             self.cfg.take_profit_min_gain,
             Instant::now(),
@@ -2104,9 +2051,14 @@ impl Engine {
 
     pub async fn resync_stale_pm_books(&self) -> Result<Vec<TopicKey>> {
         let limit = self.cfg.book_resync_batch.min(500);
-        let stale = {
-            let books = self.books.lock().await;
-            books.stale_pm_tokens(self.cfg.book_stale, Instant::now(), limit)
+        let (stale, tickets) = {
+            let mut books = self.books.lock().await;
+            let stale = books.stale_pm_tokens(self.cfg.book_stale, Instant::now(), limit);
+            let tickets: Vec<_> = stale
+                .iter()
+                .map(|token| books.begin_rest(POLYMARKET, token))
+                .collect();
+            (stale, tickets)
         };
         if stale.is_empty() {
             tracing::debug!(stale = 0, "polymarket book resync skipped");
@@ -2128,8 +2080,9 @@ impl Engine {
         let now = Instant::now();
         let (applied, skipped_old, topics) = {
             let mut books = self.books.lock().await;
-            let (applied, skipped_old) =
-                crate::platforms::polymarket::apply_rest_books(&mut books, &payloads, now);
+            let (applied, skipped_old) = crate::platforms::polymarket::apply_rest_books(
+                &mut books, &payloads, &tickets, now,
+            );
             let mut topics = Vec::new();
             for token in &applied {
                 topics.extend(books.topics_for(POLYMARKET, token));
@@ -2168,6 +2121,10 @@ impl Engine {
             return;
         }
         let fetches = need.into_iter().map(|(platform, token_id)| async move {
+            if platform == POLYMARKET {
+                self.ensure_pm_tick(&token_id).await;
+            }
+            let ticket = self.books.lock().await.begin_rest(&platform, &token_id);
             let started = Instant::now();
             let result = if platform == POLYMARKET {
                 self.pm.rest_book(&token_id).await
@@ -2177,30 +2134,31 @@ impl Engine {
             (
                 platform,
                 token_id,
+                ticket,
                 result,
                 Instant::now(),
                 started.elapsed(),
             )
         });
-        for (platform, token_id, result, received_at, elapsed) in
+        for (platform, token_id, ticket, result, received_at, elapsed) in
             futures_util::future::join_all(fetches).await
         {
             match result {
                 Ok((bids, asks, exchange_ts_ms)) => {
-                    let applied = self.books.lock().await.replace_snapshot(
-                        &platform,
-                        &token_id,
+                    let accepted = self.books.lock().await.accept_rest(
+                        &ticket,
                         bids,
                         asks,
                         exchange_ts_ms,
                         received_at,
+                        None,
                     );
                     tracing::info!(
                         order_id,
                         %platform,
                         token = %token_id,
                         exchange_ts_ms,
-                        applied,
+                        accepted = accepted.is_ok(),
                         elapsed_ms = elapsed.as_millis() as u64,
                         "hedge rest book fetched"
                     );
@@ -2252,6 +2210,40 @@ impl Engine {
             }
         }
     }
+}
+
+/// 不使用全局 get 的 WS 优先策略：HTTP 硬确认只能用这次通过票据验证的完整副本。
+fn accept_confirmation_books(
+    books: &mut BookStore,
+    pm_ticket: &crate::book::RestTicket,
+    pm: (
+        Vec<crate::book::Level>,
+        Vec<crate::book::Level>,
+        i64,
+        Instant,
+    ),
+    out_ticket: &crate::book::RestTicket,
+    out: (
+        Vec<crate::book::Level>,
+        Vec<crate::book::Level>,
+        i64,
+        Instant,
+    ),
+    max_age: Duration,
+    now: Instant,
+) -> Option<(OrderBook, OrderBook)> {
+    let pm_book = books.accept_rest(pm_ticket, pm.0, pm.1, pm.2, pm.3, None);
+    let out_book = books.accept_rest(out_ticket, out.0, out.1, out.2, out.3, None);
+    let (Ok(pm_book), Ok(out_book)) = (pm_book, out_book) else {
+        return None;
+    };
+    if !pm_book.is_fresh(max_age, now)
+        || !out_book.is_fresh(max_age, now)
+        || pm_book.tick_size.is_none()
+    {
+        return None;
+    }
+    Some((pm_book, out_book))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2540,6 +2532,11 @@ async fn apply_reconciliation_page(
         page_complete: page.complete,
         history_complete: page.history_complete,
         expected_shares,
+        outcome_scan: if leg.platform == OUTCOME {
+            Some(serde_json::from_value(page.progress.clone())?)
+        } else {
+            None
+        },
         pm_scan,
         pm_order_constraints: None,
     };
@@ -2783,6 +2780,110 @@ mod tests {
         Decimal::from_str(s).unwrap()
     }
 
+    #[test]
+    fn hard_http_confirmation_rejects_conflict_without_ws_fallback_then_recovers() {
+        let now = Instant::now();
+        let level = || {
+            vec![crate::book::Level {
+                price: d("0.5"),
+                size: d("3"),
+            }]
+        };
+        for conflict_on_pm in [true, false] {
+            let mut books = BookStore::default();
+            books.set_tick_size(POLYMARKET, "pm", d("0.01"));
+            books.replace_snapshot(POLYMARKET, "pm", vec![], level(), 100, now);
+            books.replace_snapshot(OUTCOME, "out", vec![], level(), 100, now);
+            // 两条生产确认路径共用此入口；持续冲突每轮只尝试一次。
+            for _ in 0..3 {
+                let pm = books.begin_rest(POLYMARKET, "pm");
+                let out = books.begin_rest(OUTCOME, "out");
+                if conflict_on_pm {
+                    let ticket = books.begin_rest(POLYMARKET, "pm");
+                    books
+                        .accept_rest(&ticket, vec![], level(), 100, now, None)
+                        .unwrap();
+                } else {
+                    let ticket = books.begin_rest(OUTCOME, "out");
+                    books
+                        .accept_rest(&ticket, vec![], level(), 100, now, None)
+                        .unwrap();
+                }
+                assert!(accept_confirmation_books(
+                    &mut books,
+                    &pm,
+                    (vec![], level(), 100, now),
+                    &out,
+                    (vec![], level(), 100, now),
+                    Duration::from_secs(5),
+                    now
+                )
+                .is_none());
+                assert!(books
+                    .get_at(POLYMARKET, "pm", now)
+                    .unwrap()
+                    .is_fresh(Duration::from_secs(5), now));
+                assert!(books
+                    .get_at(OUTCOME, "out", now)
+                    .unwrap()
+                    .is_fresh(Duration::from_secs(5), now));
+            }
+            let pm = books.begin_rest(POLYMARKET, "pm");
+            let out = books.begin_rest(OUTCOME, "out");
+            assert!(accept_confirmation_books(
+                &mut books,
+                &pm,
+                (vec![], level(), 100, now),
+                &out,
+                (vec![], level(), 100, now),
+                Duration::from_secs(5),
+                now
+            )
+            .is_some());
+        }
+    }
+
+    #[test]
+    fn hard_http_confirmation_rejects_expired_missing_tick_and_delete_races() {
+        let now = Instant::now();
+        for case in 0..3 {
+            let mut books = BookStore::default();
+            if case != 0 {
+                books.set_tick_size(POLYMARKET, "pm", d("0.01"));
+            }
+            let level = || {
+                vec![crate::book::Level {
+                    price: d("0.5"),
+                    size: d("3"),
+                }]
+            };
+            books.replace_snapshot(POLYMARKET, "pm", vec![], level(), 100, now);
+            let pm = books.begin_rest(POLYMARKET, "pm");
+            let out = books.begin_rest(OUTCOME, "out");
+            if case == 2 {
+                books.apply_levels(POLYMARKET, "pm", &[(false, d("0.5"), d("0"))], 100, now);
+            }
+            let check_at = if case == 1 {
+                now + Duration::from_secs(6)
+            } else {
+                now
+            };
+            assert!(accept_confirmation_books(
+                &mut books,
+                &pm,
+                (vec![], level(), 101, now),
+                &out,
+                (vec![], level(), 101, now),
+                Duration::from_secs(5),
+                check_at
+            )
+            .is_none());
+            if case == 2 {
+                assert!(books.get_at(POLYMARKET, "pm", now).unwrap().asks.is_empty());
+            }
+        }
+    }
+
     fn fill(trade_id: &str, order_id: &str, shares: &str, extra_ids: &[&str]) -> TradeFill {
         let mut order_ids = vec![order_id.to_string()];
         order_ids.extend(extra_ids.iter().map(|id| (*id).to_string()));
@@ -2866,6 +2967,8 @@ mod tests {
                             req_fee: Decimal::ZERO,
                             client_order_id: None,
                         }],
+                        0,
+                        Instant::now() + Duration::from_secs(30),
                     )
                     .await?;
                 let oid = format!("taker-{}", ids[0]);
@@ -2977,6 +3080,7 @@ mod tests {
                         funder:Some("test-funder"),wallet:None,service:None,req_price:d("0.5"),req_shares:d("10"),
                         req_fee:Decimal::ZERO,client_order_id:None,
                     }],
+                    0, Instant::now() + Duration::from_secs(30),
                 ).await?;
                 let id=ids[0];
                 let oid=format!("fee-oid-{id}");
