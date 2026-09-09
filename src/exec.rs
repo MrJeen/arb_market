@@ -1140,7 +1140,7 @@ impl Engine {
             }
         };
         let settlement_access = self
-            .settlement_gate(order.id, &order.title, &identity)
+            .settlement_gate_after_end(order.id, &order.title, &identity, topic.end_date)
             .await?;
         if settlement_access == SettlementAccess::Stop {
             return Ok(());
@@ -1187,7 +1187,12 @@ impl Engine {
                         };
                         // Final gate after claiming and immediately before creating either leg.
                         if self
-                            .settlement_gate(order.id, &order.title, &identity)
+                            .settlement_gate_after_end(
+                                order.id,
+                                &order.title,
+                                &identity,
+                                topic.end_date,
+                            )
                             .await?
                             != SettlementAccess::All
                         {
@@ -1323,7 +1328,7 @@ impl Engine {
         };
         // Balances, REST books and planning are complete; gate once more before the first leg.
         let final_access = self
-            .settlement_gate(order.id, &order.title, &identity)
+            .settlement_gate_after_end(order.id, &order.title, &identity, topic.end_date)
             .await?;
         if final_access == SettlementAccess::Stop
             || actions
@@ -1528,6 +1533,38 @@ impl Engine {
                 Ok(None)
             }
         }
+    }
+
+    async fn settlement_gate_after_end(
+        &self,
+        order_id: i64,
+        title: &str,
+        identity: &MarketIdentity,
+        end_date: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<SettlementAccess> {
+        // 普通持仓到期前不查结算；已确认结算的 pending 路径直接调用原 gate。
+        let checked_at = chrono::Utc::now();
+        let due = settlement_check_due(end_date, checked_at);
+        let decision = if !due {
+            self.stats.settlement_skipped_before_end();
+            "skip_before_end"
+        } else if end_date.is_none() {
+            self.stats.settlement_end_date_missing();
+            "query_missing_end_date"
+        } else {
+            "query_due"
+        };
+        tracing::debug!(
+            order_id,
+            ?end_date,
+            %checked_at,
+            decision,
+            "settlement time gate evaluated"
+        );
+        if !due {
+            return Ok(SettlementAccess::All);
+        }
+        self.settlement_gate(order_id, title, identity).await
     }
 
     async fn settlement_gate(
@@ -2428,6 +2465,13 @@ fn position_qty(positions: &crate::hedge::Positions, platform: &str, label: &str
         .unwrap_or(Decimal::ZERO)
 }
 
+fn settlement_check_due(
+    end_date: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    end_date.is_none_or(|end| now >= end)
+}
+
 fn settlement_only_scan(position_status: &str) -> bool {
     position_status == "settlement_pending"
 }
@@ -2895,6 +2939,190 @@ mod tests {
             nats_channel: String::new(),
             cat: "admission-test".into(),
         }
+    }
+
+    #[test]
+    fn settlement_end_gate_uses_exact_time_and_queries_unknown_dates() {
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        assert!(!settlement_check_due(
+            Some(now + chrono::Duration::nanoseconds(1)),
+            now
+        ));
+        assert!(settlement_check_due(Some(now), now));
+        assert!(settlement_check_due(
+            Some(now - chrono::Duration::nanoseconds(1)),
+            now
+        ));
+        assert!(settlement_check_due(None, now));
+    }
+
+    #[tokio::test]
+    async fn settlement_end_gate_skips_future_and_queries_due_or_unknown() {
+        use crate::platforms::polymarket::tests::execution_test_venue;
+        use sqlx::postgres::PgPoolOptions;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = requests.clone();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = tokio::select! {
+                    _ = &mut stop_rx => break,
+                    accepted = listener.accept() => accepted.unwrap(),
+                };
+                let mut bytes = Vec::new();
+                let (body_start, content_length) = loop {
+                    let mut buffer = [0u8; 4096];
+                    let n = tokio::time::timeout(Duration::from_secs(3), socket.read(&mut buffer))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(n > 0, "stub request ended before headers");
+                    bytes.extend_from_slice(&buffer[..n]);
+                    assert!(bytes.len() < 65_536);
+                    if let Some(index) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = std::str::from_utf8(&bytes[..index]).unwrap();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (key, value) = line.split_once(':')?;
+                                key.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        assert!(length < 65_536);
+                        break (index + 4, length);
+                    }
+                };
+                while bytes.len() < body_start + content_length {
+                    let mut buffer = [0u8; 4096];
+                    let n = tokio::time::timeout(Duration::from_secs(3), socket.read(&mut buffer))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(n > 0, "stub request ended before body");
+                    bytes.extend_from_slice(&buffer[..n]);
+                }
+                let request = std::str::from_utf8(&bytes[..body_start])
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_string();
+                let body = match request.as_str() {
+                    "GET /markets/test-condition HTTP/1.1" => json!({
+                        "tokens": [{"token_id": "123", "winner": false}],
+                        "closed": false, "accepting_orders": true, "enable_order_book": true
+                    }),
+                    "POST /info HTTP/1.1" => {
+                        let body: Value =
+                            serde_json::from_slice(&bytes[body_start..body_start + content_length])
+                                .unwrap();
+                        assert_eq!(body, json!({"type": "settledOutcome", "outcome": 1211}));
+                        Value::Null
+                    }
+                    _ => panic!("unexpected stub request: {request}"),
+                }
+                .to_string();
+                observed.lock().await.push(request);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        // 本测试不访问数据库；未结算响应无需任何持仓状态写入。
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .unwrap();
+        let cfg = admission_test_config(&base);
+        let outcome = OutcomeVenue::connect(&cfg).unwrap();
+        let (pm, _) = execution_test_venue(base).await;
+        let (pm_sub_tx, _pm_sub_rx) = mpsc::channel(1);
+        let (out_sub_tx, _out_sub_rx) = mpsc::channel(1);
+        let engine = Engine {
+            cfg,
+            store: Store { pool: pool.clone() },
+            common: pool,
+            books: Arc::new(Mutex::new(BookStore::default())),
+            dirty: Arc::new(Mutex::new(DirtyCoalescer::default())),
+            topics: Arc::new(RwLock::new(HashMap::new())),
+            pm,
+            outcome,
+            pm_sub_tx,
+            out_sub_tx,
+            notify: None,
+            stats: Arc::new(MinuteStats::new()),
+            position_scan_cursor: Mutex::new(0),
+            settlement_scan_cursor: Mutex::new(0),
+            last_settlement_sweep: Mutex::new(None),
+            reported_stale_unknown: Mutex::new(HashSet::new()),
+        };
+        let mut identity = MarketIdentity::new(POLYMARKET, "test-condition").unwrap();
+        identity.insert(OUTCOME, "1211").unwrap();
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        assert_eq!(
+            engine
+                .settlement_gate_after_end(1, "test", &identity, Some(future))
+                .await
+                .unwrap(),
+            SettlementAccess::All
+        );
+        assert!(requests.lock().await.is_empty());
+        let skipped = engine.stats.snapshot_and_reset();
+        assert_eq!(skipped.settlement_scan, 0);
+        assert_eq!(skipped.settlement_skipped_before_end, 1);
+        assert_eq!(skipped.settlement_end_date_missing, 0);
+
+        // 同一入口每次重判时间；未来检查不能缓存成提交前永久放行。
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        for end_date in [Some(past), None] {
+            assert_eq!(
+                engine
+                    .settlement_gate_after_end(1, "test", &identity, end_date)
+                    .await
+                    .unwrap(),
+                SettlementAccess::All
+            );
+            let queried = engine.stats.snapshot_and_reset();
+            assert_eq!(queried.settlement_scan, 1);
+            assert_eq!(queried.settlement_skipped_before_end, 0);
+            assert_eq!(
+                queried.settlement_end_date_missing,
+                u64::from(end_date.is_none())
+            );
+        }
+        // pending 使用的原 gate 不经过时间门禁，仍查询两个平台。
+        assert_eq!(
+            engine.settlement_gate(1, "test", &identity).await.unwrap(),
+            SettlementAccess::All
+        );
+        let pending = engine.stats.snapshot_and_reset();
+        assert_eq!(pending.settlement_scan, 1);
+        assert_eq!(pending.settlement_skipped_before_end, 0);
+        assert_eq!(pending.settlement_end_date_missing, 0);
+        stop_tx.send(()).unwrap();
+        server.await.unwrap();
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 6);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.starts_with("GET /markets/"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.starts_with("POST /info "))
+                .count(),
+            3
+        );
     }
 
     #[tokio::test]

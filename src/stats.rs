@@ -104,6 +104,8 @@ minute_stats! {
     take_profit_out_ok,
     take_profit_out_fail,
     settlement_scan,
+    settlement_skipped_before_end,
+    settlement_end_date_missing,
     settlement_pending_entered,
     settlement_pending_scan,
     settlement_finalize_fail,
@@ -157,6 +159,9 @@ mod tests {
         stats.take_profit_candidate();
         stats.settled();
         stats.settlement_finalize_fail();
+        stats.settlement_skipped_before_end();
+        stats.settlement_skipped_before_end();
+        stats.settlement_end_date_missing();
         stats.lifecycle_busy();
 
         let first = stats.snapshot_and_reset();
@@ -166,6 +171,8 @@ mod tests {
         assert_eq!(first.take_profit_candidate, 1);
         assert_eq!(first.settled, 1);
         assert_eq!(first.settlement_finalize_fail, 1);
+        assert_eq!(first.settlement_skipped_before_end, 2);
+        assert_eq!(first.settlement_end_date_missing, 1);
         assert_eq!(first.lifecycle_busy, 1);
         assert_eq!(first.calc, 0);
 

@@ -1215,17 +1215,7 @@ fn unix_millis() -> u64 {
 }
 
 fn parse_usdc_balance(value: &Value) -> Result<Decimal> {
-    if let Some((total, hold)) = parse_coin_balance_fields(value, "USDC")? {
-        // 按原始总额选币；USDC 全部冻结时不能切换到 USDH。
-        if total > Decimal::ZERO {
-            return Ok(if total > hold {
-                total - hold
-            } else {
-                Decimal::ZERO
-            });
-        }
-    }
-    parse_coin_balance(value, "USDH")
+    parse_coin_balance(value, "USDC")
 }
 
 fn parse_coin_balance(value: &Value, want: &str) -> Result<Decimal> {
@@ -2306,7 +2296,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_usdc_balance_selects_by_total_before_subtracting_hold() {
+    fn parse_usdc_balance_subtracts_hold_without_using_usdh() {
         for (hold, expected) in [("2", 8), ("10", 0), ("11", 0)] {
             let raw = json!({"balances": [
                 {"coin": "usdc", "total": "10", "hold": hold},
@@ -2323,22 +2313,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_usdc_balance_falls_back_only_when_absent_or_valid_zero() {
+    fn parse_usdc_balance_returns_zero_when_absent_or_zero_and_ignores_usdh() {
         for usdc in [
             None,
             Some(json!({"coin": "USDC", "total": "0", "hold": "0"})),
         ] {
-            for (hold, expected) in [("3", 17), ("20", 0), ("21", 0)] {
-                let mut balances = vec![json!({"coin": "usdh", "total": "20", "hold": hold})];
+            for usdh in [
+                json!({"coin": "usdh", "total": "20", "hold": "3"}),
+                json!({"coin": "USDH", "total": "20", "hold": "20"}),
+                json!({"coin": "USDH", "total": "20", "hold": "21"}),
+                json!({"coin": "USDH", "total": "20"}),
+                json!({"coin": "USDH", "total": "bad", "hold": "bad"}),
+            ] {
+                let mut balances = vec![usdh];
                 balances.extend(usdc.clone());
                 assert_eq!(
                     parse_usdc_balance(&json!({"balances": balances})).unwrap(),
-                    Decimal::from(expected)
+                    Decimal::ZERO
                 );
             }
-            let mut balances = vec![json!({"coin": "USDH", "total": "20"})];
-            balances.extend(usdc);
-            assert!(parse_usdc_balance(&json!({"balances": balances})).is_err());
         }
         for usdc in [
             json!({"coin": "USDC", "hold": "0"}),
@@ -2360,8 +2353,8 @@ mod tests {
             {"coin": "USDH", "total": "20", "hold": "3"},
             {"coin": "+5160", "total": "7.5", "hold": "2.25"}
         ]});
-        let fallback = json!({"balances": [{"coin": "USDH", "total": "20", "hold": "3"}]});
-        let (venue, server) = info_stub(vec![(200, raw.clone()), (200, raw), (200, fallback)]);
+        let usdh_only = json!({"balances": [{"coin": "USDH", "total": "20", "hold": "3"}]});
+        let (venue, server) = info_stub(vec![(200, raw.clone()), (200, raw), (200, usdh_only)]);
         assert_eq!(venue.user_state().await.unwrap(), Decimal::ZERO);
         assert_eq!(venue.user_state().await.unwrap(), Decimal::ZERO);
         assert_eq!(
@@ -2369,7 +2362,8 @@ mod tests {
             "5.25".parse().unwrap()
         );
         venue.invalidate_usdc_balance().await;
-        assert_eq!(venue.user_state().await.unwrap(), Decimal::from(17));
+        assert_eq!(venue.user_state().await.unwrap(), Decimal::ZERO);
+        assert_eq!(venue.user_state().await.unwrap(), Decimal::ZERO);
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 3);
         for request in requests {
@@ -2394,7 +2388,7 @@ mod tests {
             ),
             (
                 200,
-                json!({"balances": [{"coin": "USDH", "total": "20", "hold": "bad"}]}),
+                json!({"balances": [{"coin": "USDC", "total": "20", "hold": "bad"}]}),
             ),
         ] {
             let good = json!({"balances": [{"coin": "USDC", "total": "10", "hold": "3"}]});

@@ -76,6 +76,10 @@ Outcome 历史覆盖采用初始探测、数据分页、最终覆盖验证三个
 
 common 数据库提供给本服务的统一事件视为已经完成业务筛选的二元市场。Outcome 结算遵循 HIP-4 原始分数兑付：side 0 每股兑付 `settleFraction`，side 1 每股兑付 `1-settleFraction`，两侧合计为 1；`0.5` 时两侧各兑付 0.5。分数必须位于 `[0,1]`，缺字段、不可解析或越界值不会落为已结算。
 
+普通持仓的结算检查使用当前已加载或恢复的事件 `Topic.end_date`（来自 common 的 `events.end_date`）：结束时间未到时跳过两平台结算接口和结算判定，继续既有止盈、再平衡计算及执行开关逻辑；到达结束时间（含相等）或结束时间缺失时照常查询。止盈和再平衡提交前会重新比较当前 UTC 时间，不复用扫描初次的时间判断。已进入 `settlement_pending` 的订单不受此时间门禁影响，仍按独立清扫节奏核实结算。该规则会推迟发现平台提前结算或不可交易的情况，跳过检查不代表已确认市场仍可交易。
+
+时间门禁的排查优先看每分钟 `minute stats`：`settlement_skipped_before_end` 统计未到期跳过次数，`settlement_end_date_missing` 统计时间缺失而继续查询的次数；配合原有 `settlement_scan`、`settlement_pending_scan` 判断处理路径。这些均是检查次数，不是去重订单数或 HTTP 请求数，提交前复查也会计数。需要逐订单排查时，启用 `market_arb::exec` 的 DEBUG 可见 `settlement time gate evaluated`，包含 `order_id`、`end_date`、`checked_at` 和 `decision`（`skip_before_end`、`query_due`、`query_missing_end_date`）。日志过滤器在加载 `.env` 前初始化，应通过进程启动环境或 systemd 覆盖配置设置 `RUST_LOG`，仅修改 `.env` 不会调整日志级别。
+
 任一平台先确认结算时，订单进入 `settlement_pending`：该订单立即停止止盈、再平衡和所有新交易，只保留两平台结算查询。两平台 payout 都可信后才核算最终 `actual_cost`、`actual_rev`、`actual_profit` 并转为 `settled`；不会用单平台结果推算另一侧，也不会自动卖出另一平台持仓。
 
 `settlement_pending` 走独立的扫描游标和批量，默认每 `SETTLEMENT_PENDING_SCAN_INTERVAL_SECS`（60 秒）清扫一次、每次至多 `SETTLEMENT_PENDING_SCAN_BATCH` 条，不再占用 `POSITION_SCAN_BATCH` 给活跃订单的配额，因此 pending 积压不会拉长止盈响应。清扫在同一个循环内串行执行，同一订单不会被两条路径并发处理。pending 没有超时自动最终化，长期缺失对手方 payout 时会持续驻留并每轮重试。
@@ -94,7 +98,7 @@ USDC 余额按 funder 使用 10 秒缓存。TTL 从 fetch 完成写入本地缓�
 
 ## Outcome 可用余额
 
-现金与 token 均按 `max(total - hold, 0)` 检查可用余额，不把冻结量当可支配资金。匹配币种的 total/hold 缺失、畸形或为负数时返回错误且不缓存失败；合法余额数组没有该币种时返回零。USDC/USDH 选择仍按原 USDC total 判断：total 为正但全部冻结时返回 USDC 可用零，不自动改用 USDH；仅 USDC 不存在或合法 total 为零时沿用 USDH fallback。缓存机制不变，仍不能代替资金预留。
+现金与 token 均按 `max(total - hold, 0)` 检查可用余额，不把冻结量当可支配资金。匹配币种的 total/hold 缺失、畸形或为负数时返回错误且不缓存失败；合法余额数组没有该币种时返回零。现金余额只使用 USDC，不回退或合并 USDH；USDC 不存在、合法 total 为零或全部冻结时均返回零，USDH 的金额及格式不影响 USDC 余额结果。缓存机制不变，仍不能代替资金预留。
 
 ## 本地下单测试
 
