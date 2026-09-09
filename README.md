@@ -240,6 +240,12 @@ DEPLOY_HOST=arb DEPLOY_PATH=/var/www/arb_market/dist SERVICE_USER=market-arb ./s
 
 ## 查看日志
 
+正常套利候选 `arb opportunity`、批量盘口拉取 `polymarket books fetched`、重同步 `polymarket book resync`、持仓盘口拉取 `hedge rest book fetched` 的逐次明细使用 DEBUG；失败、真实交易及重要状态变化日志保持原级别。INFO 下优先查看每分钟 `minute stats`：套利计算与候选沿用 `calc/found/arb_disabled/claimed/orders`，候选次数不代表订单数。
+
+盘口新增统计：`pm_book_resync_batches/requested/returned/applied/skipped/failed`（每个后缀都带 `pm_book_resync_` 前缀），分别记录完成批次数、请求 token 数、返回条目数、应用数、丢弃数和失败批次数；无待刷新 token 的轮次不计批次，成功空响应不计失败。`hedge_pm_book_*`、`hedge_out_book_*` 按平台记录 `requests/accepted/discarded/failed`，一次已完成请求只进入一种结果；丢弃指 HTTP/解析成功但快照未被接受，不等于请求失败。底层 HTTP 不重复累计上层统计。
+
+上述三个前缀均有 `elapsed_ms`（累计）及 `max_ms`（最大单次）字段，含成功和失败耗时。批量 resync 耗时包含请求和应用过程；持仓盘口耗时为单次请求/解析，不包含 tick 初始化及等待同批其他请求。计数与耗时在处理结果时记录，取消未完成的操作不计。复用原子计数，每分钟逐字段读取并清零，因此并发跨分钟时字段可能落入相邻窗口，并非事务一致性快照。临时排查可在进程启动环境设置 `RUST_LOG=info,market_arb::exec=debug,market_arb::platforms::polymarket=debug`，排查结束后恢复 INFO。
+
 【服务器】进程 stdout 进 systemd journal，没有 `/var/www/arb_market/*.log`。`-u market-arb` 按 **unit 名** 过滤（`market-arb.service`），不是按 Linux 用户。别的服务即使也跑在 `market-arb` 用户下，也不会出现在这条命令里。
 
 ```bash

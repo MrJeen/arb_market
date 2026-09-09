@@ -568,7 +568,7 @@ impl PolymarketVenue {
             .as_array()
             .cloned()
             .ok_or_else(|| Error::msg("polymarket books missing array"))?;
-        tracing::info!(
+        tracing::debug!(
             requested = token_ids.len(),
             returned = items.len(),
             elapsed_ms = started.elapsed().as_millis() as u64,

@@ -234,7 +234,7 @@ impl Engine {
             return Ok(());
         };
         self.stats.found();
-        tracing::info!(
+        tracing::debug!(
             topic = %topic.key.as_str(),
             profit = %plan.profit,
             cost = %plan.total_cost,
@@ -2156,10 +2156,13 @@ impl Engine {
         let payloads = match self.pm.rest_books(&stale).await {
             Ok(payloads) => payloads,
             Err(err) => {
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                self.stats
+                    .record_pm_book_resync(stale.len(), None, elapsed_ms);
                 tracing::warn!(
                     stale = stale.len(),
                     error = %err,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    elapsed_ms,
                     "polymarket book resync failed"
                 );
                 return Err(err);
@@ -2177,13 +2180,19 @@ impl Engine {
             }
             (applied, skipped_old, topics)
         };
-        tracing::info!(
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        self.stats.record_pm_book_resync(
+            stale.len(),
+            Some((payloads.len(), applied.len(), skipped_old)),
+            elapsed_ms,
+        );
+        tracing::debug!(
             stale = stale.len(),
             requested = stale.len(),
             applied = applied.len(),
             skipped_old,
             topics = topics.len(),
-            elapsed_ms = started.elapsed().as_millis() as u64,
+            elapsed_ms,
             "polymarket book resync"
         );
         Ok(topics)
@@ -2247,7 +2256,12 @@ impl Engine {
                         received_at,
                         tick,
                     );
-                    tracing::info!(
+                    self.stats.record_hedge_book(
+                        &platform,
+                        Some(accepted.is_ok()),
+                        elapsed.as_millis() as u64,
+                    );
+                    tracing::debug!(
                         order_id,
                         %platform,
                         token = %token_id,
@@ -2258,6 +2272,8 @@ impl Engine {
                     );
                 }
                 Err(err) => {
+                    self.stats
+                        .record_hedge_book(&platform, None, elapsed.as_millis() as u64);
                     tracing::warn!(
                         order_id,
                         %platform,

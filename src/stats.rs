@@ -113,9 +113,87 @@ minute_stats! {
     settled,
     unavailable,
     lifecycle_busy,
+    pm_book_resync_batches,
+    pm_book_resync_requested,
+    pm_book_resync_returned,
+    pm_book_resync_applied,
+    pm_book_resync_skipped,
+    pm_book_resync_failed,
+    pm_book_resync_elapsed_ms,
+    pm_book_resync_max_ms,
+    hedge_pm_book_requests,
+    hedge_pm_book_accepted,
+    hedge_pm_book_discarded,
+    hedge_pm_book_failed,
+    hedge_pm_book_elapsed_ms,
+    hedge_pm_book_max_ms,
+    hedge_out_book_requests,
+    hedge_out_book_accepted,
+    hedge_out_book_discarded,
+    hedge_out_book_failed,
+    hedge_out_book_elapsed_ms,
+    hedge_out_book_max_ms,
 }
 
 impl MinuteStats {
+    /// 按完成的批次记录；None 表示请求失败，而非空响应。
+    pub fn record_pm_book_resync(
+        &self,
+        requested: usize,
+        result: Option<(usize, usize, usize)>,
+        elapsed_ms: u64,
+    ) {
+        self.pm_book_resync_batches();
+        self.pm_book_resync_requested
+            .fetch_add(requested as u64, Ordering::Relaxed);
+        if let Some((returned, applied, skipped)) = result {
+            self.pm_book_resync_returned
+                .fetch_add(returned as u64, Ordering::Relaxed);
+            self.pm_book_resync_applied
+                .fetch_add(applied as u64, Ordering::Relaxed);
+            self.pm_book_resync_skipped
+                .fetch_add(skipped as u64, Ordering::Relaxed);
+        } else {
+            self.pm_book_resync_failed();
+        }
+        self.pm_book_resync_elapsed_ms
+            .fetch_add(elapsed_ms, Ordering::Relaxed);
+        self.pm_book_resync_max_ms
+            .fetch_max(elapsed_ms, Ordering::Relaxed);
+    }
+
+    /// Some 表示 HTTP/解析成功后盘口是否被接受；None 表示请求或解析失败。
+    pub fn record_hedge_book(&self, platform: &str, accepted: Option<bool>, elapsed_ms: u64) {
+        let (requests, applied, discarded, failed, total, max) = match platform {
+            crate::config::POLYMARKET => (
+                &self.hedge_pm_book_requests,
+                &self.hedge_pm_book_accepted,
+                &self.hedge_pm_book_discarded,
+                &self.hedge_pm_book_failed,
+                &self.hedge_pm_book_elapsed_ms,
+                &self.hedge_pm_book_max_ms,
+            ),
+            crate::config::OUTCOME => (
+                &self.hedge_out_book_requests,
+                &self.hedge_out_book_accepted,
+                &self.hedge_out_book_discarded,
+                &self.hedge_out_book_failed,
+                &self.hedge_out_book_elapsed_ms,
+                &self.hedge_out_book_max_ms,
+            ),
+            _ => return,
+        };
+        requests.fetch_add(1, Ordering::Relaxed);
+        match accepted {
+            Some(true) => applied,
+            Some(false) => discarded,
+            None => failed,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        total.fetch_add(elapsed_ms, Ordering::Relaxed);
+        max.fetch_max(elapsed_ms, Ordering::Relaxed);
+    }
+
     pub fn add_missing_book(&self, n: u64) {
         if n > 0 {
             self.missing_book.fetch_add(n, Ordering::Relaxed);
@@ -178,6 +256,81 @@ mod tests {
 
         let second = stats.snapshot_and_reset();
         assert_eq!(second, MinuteSnapshot::default());
+    }
+
+    #[test]
+    fn book_refresh_stats_count_results_latency_and_reset() {
+        let stats = MinuteStats::new();
+        stats.record_pm_book_resync(4, Some((3, 2, 1)), 250);
+        stats.record_pm_book_resync(2, None, 500);
+        stats.record_pm_book_resync(1, Some((0, 0, 0)), 10);
+        for platform in [crate::config::POLYMARKET, crate::config::OUTCOME] {
+            stats.record_hedge_book(platform, Some(true), 100);
+            stats.record_hedge_book(platform, Some(false), 200);
+            stats.record_hedge_book(platform, None, 300);
+        }
+        let s = stats.snapshot_and_reset();
+        assert_eq!(s.pm_book_resync_batches, 3);
+        assert_eq!(s.pm_book_resync_requested, 7);
+        assert_eq!(s.pm_book_resync_returned, 3);
+        assert_eq!(s.pm_book_resync_applied, 2);
+        assert_eq!(s.pm_book_resync_skipped, 1);
+        assert_eq!(s.pm_book_resync_failed, 1);
+        assert_eq!(s.pm_book_resync_elapsed_ms, 760);
+        assert_eq!(s.pm_book_resync_max_ms, 500);
+        assert_eq!(
+            (s.hedge_pm_book_requests, s.hedge_out_book_requests),
+            (3, 3)
+        );
+        assert_eq!(
+            (s.hedge_pm_book_accepted, s.hedge_out_book_accepted),
+            (1, 1)
+        );
+        assert_eq!(
+            (s.hedge_pm_book_discarded, s.hedge_out_book_discarded),
+            (1, 1)
+        );
+        assert_eq!((s.hedge_pm_book_failed, s.hedge_out_book_failed), (1, 1));
+        assert_eq!(
+            (s.hedge_pm_book_elapsed_ms, s.hedge_out_book_elapsed_ms),
+            (600, 600)
+        );
+        assert_eq!(
+            (s.hedge_pm_book_max_ms, s.hedge_out_book_max_ms),
+            (300, 300)
+        );
+        assert_eq!(stats.snapshot_and_reset(), MinuteSnapshot::default());
+        stats.record_pm_book_resync(1, Some((1, 1, 0)), 5);
+        stats.record_hedge_book(crate::config::POLYMARKET, Some(true), 2);
+        let next = stats.snapshot_and_reset();
+        assert_eq!(next.pm_book_resync_max_ms, 5);
+        assert_eq!(next.hedge_pm_book_max_ms, 2);
+        assert_eq!(next.hedge_out_book_max_ms, 0);
+    }
+
+    #[test]
+    fn book_refresh_stats_accumulate_concurrent_updates() {
+        let stats = MinuteStats::new();
+        std::thread::scope(|scope| {
+            for elapsed_ms in 1..=8 {
+                let stats = &stats;
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        stats.record_pm_book_resync(2, Some((2, 1, 1)), elapsed_ms);
+                        stats.record_hedge_book(crate::config::OUTCOME, Some(true), elapsed_ms);
+                    }
+                });
+            }
+        });
+        let s = stats.snapshot_and_reset();
+        assert_eq!(s.pm_book_resync_batches, 800);
+        assert_eq!(s.pm_book_resync_requested, 1600);
+        assert_eq!(s.pm_book_resync_elapsed_ms, 3600);
+        assert_eq!(s.pm_book_resync_max_ms, 8);
+        assert_eq!(s.hedge_out_book_requests, 800);
+        assert_eq!(s.hedge_out_book_accepted, 800);
+        assert_eq!(s.hedge_out_book_elapsed_ms, 3600);
+        assert_eq!(s.hedge_out_book_max_ms, 8);
     }
 
     #[test]
