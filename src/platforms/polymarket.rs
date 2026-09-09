@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Mutex};
@@ -42,6 +43,9 @@ const MARKET_TAKER_DECIMALS: u32 = 5;
 // 官方 CLOB 客户端以 base64("0") 起始，以 base64("-1") 表示已读到末尾。
 const TRADES_INITIAL_CURSOR: &str = "MA==";
 const TRADES_END_CURSOR: &str = "LTE=";
+// 按操作限频而非按订单/成交缓存，避免两秒轮询和 maker 展开反复告警。
+static ORDER_STATUS_LAST_WARN_SECS: AtomicU64 = AtomicU64::new(0);
+static TRADE_STATUS_LAST_WARN_SECS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 pub struct PolymarketAccount {
@@ -715,17 +719,20 @@ impl PolymarketVenue {
                             .and_then(Value::as_str)
                             .is_some_and(|status| !status.trim().is_empty()))
                 {
-                    tracing::warn!(
-                        service = "polymarket",
-                        operation = "order_poll",
-                        endpoint = %path,
-                        funder,
-                        order_id,
-                        http_status = 200,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        reason = "invalid_order_body",
-                        "polymarket order response invalid"
-                    );
+                    if status_warning_due(&ORDER_STATUS_LAST_WARN_SECS, unix_secs()) {
+                        tracing::warn!(
+                            service = "polymarket",
+                            operation = "order_poll",
+                            endpoint = %path,
+                            funder,
+                            order_id,
+                            raw_status = ?status_log_value(raw.get("status")),
+                            http_status = 200,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            reason = "invalid_order_body",
+                            "polymarket order response invalid"
+                        );
+                    }
                     return Err(Error::msg("polymarket order missing or invalid status"));
                 }
                 parse_order_poll(raw, order_id)
@@ -1437,6 +1444,44 @@ fn parse_fee_schedule(raw: &Value, condition_id: &str, observed_at_ms: u64) -> R
     }))
 }
 
+/// 兼容 REST 的 ORDER_STATUS_ 枚举与既有裸值，只认完整白名单。
+/// SDK 8898914 的 OpenOrderSchema 原样透传状态，不负责业务终态判断。
+pub(crate) fn normalized_order_status(status: &str) -> Option<&'static str> {
+    match status.to_ascii_lowercase().as_str() {
+        "matched" | "order_status_matched" => Some("matched"),
+        "live" | "order_status_live" => Some("live"),
+        "invalid" | "order_status_invalid" => Some("invalid"),
+        "canceled"
+        | "order_status_canceled"
+        | "canceled_market_resolved"
+        | "order_status_canceled_market_resolved"
+        | "cancelled"
+        | "expired"
+        | "unmatched"
+        | "rejected" => Some("cancelled"),
+        _ => None,
+    }
+}
+
+fn status_warning_due(last_warn_secs: &AtomicU64, now: u64) -> bool {
+    let previous = last_warn_secs.load(Ordering::Relaxed);
+    if previous != 0 && now.saturating_sub(previous) < 60 {
+        return false;
+    }
+    // CAS 只争夺本轮告警资格，无业务状态发布；并发页最多一个调用者记录。
+    last_warn_secs
+        .compare_exchange(previous, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+fn status_log_value(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(status)) => status.chars().take(80).collect(),
+        None => "<missing>".into(),
+        Some(_) => "<invalid>".into(),
+    }
+}
+
 pub fn parse_order_poll(raw: Value, order_id: &str) -> OrderPoll {
     if raw.is_null() {
         return OrderPoll {
@@ -1446,6 +1491,26 @@ pub fn parse_order_poll(raw: Value, order_id: &str) -> OrderPoll {
             ..OrderPoll::default()
         };
     }
+    let raw_status = raw
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let status = match normalized_order_status(raw_status) {
+        Some(status) => status.to_string(),
+        None => {
+            if status_warning_due(&ORDER_STATUS_LAST_WARN_SECS, unix_secs()) {
+                tracing::warn!(
+                    service = "polymarket",
+                    operation = "order_poll",
+                    order_id,
+                    raw_status = ?status_log_value(raw.get("status")),
+                    reason = "unknown_order_status",
+                    "polymarket order status unknown"
+                );
+            }
+            raw_status.to_string()
+        }
+    };
     let shares = raw.get("size_matched").and_then(parse_decimal);
     let original_shares = raw.get("original_size").and_then(parse_decimal);
     let remaining_shares = original_shares.zip(shares).and_then(|(original, matched)| {
@@ -1455,7 +1520,7 @@ pub fn parse_order_poll(raw: Value, order_id: &str) -> OrderPoll {
     });
     OrderPoll {
         found: true,
-        status: json_str(&raw, &["status"]).unwrap_or_default(),
+        status,
         order_id: json_str(&raw, &["id"]).or_else(|| Some(order_id.to_string())),
         shares,
         price: raw.get("price").and_then(parse_decimal),
@@ -1600,9 +1665,32 @@ fn parse_trade_fill(item: &Value, maker: Option<&Value>) -> Result<TradeFill> {
         .filter(|value| *value > Decimal::ZERO && *value <= Decimal::ONE)
         .ok_or_else(|| Error::msg("polymarket trade missing or invalid price"))?;
     let finality = match item.get("status").and_then(Value::as_str) {
-        Some("CONFIRMED") => FillFinality::Confirmed,
-        Some("FAILED") => FillFinality::Failed,
-        _ => FillFinality::Pending,
+        Some("CONFIRMED" | "TRADE_STATUS_CONFIRMED") => FillFinality::Confirmed,
+        Some("FAILED" | "TRADE_STATUS_FAILED") => FillFinality::Failed,
+        Some(
+            "MATCHED"
+            | "TRADE_STATUS_MATCHED"
+            | "MATCHED_NOT_BROADCASTED"
+            | "TRADE_STATUS_MATCHED_NOT_BROADCASTED"
+            | "MINED"
+            | "TRADE_STATUS_MINED"
+            | "RETRYING"
+            | "TRADE_STATUS_RETRYING",
+        ) => FillFinality::Pending,
+        _ => {
+            if status_warning_due(&TRADE_STATUS_LAST_WARN_SECS, unix_secs()) {
+                tracing::warn!(
+                    service = "polymarket",
+                    operation = "trade_page",
+                    trade_id,
+                    order_id,
+                    raw_status = ?status_log_value(item.get("status")),
+                    reason = "unknown_trade_status",
+                    "polymarket trade status unknown"
+                );
+            }
+            FillFinality::Pending
+        }
     };
     // maker 的费率/实收费用必须来自子订单；不得套用 taker 金额或猜测为零。
     let fee = optional_trade_decimal(record, &["fee_amount", "fee"])?;
@@ -2380,6 +2468,127 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn status_warnings_are_rate_limited_per_operation() {
+        let order = AtomicU64::new(0);
+        let trade = AtomicU64::new(0);
+        assert!(status_warning_due(&order, 100));
+        assert!(status_warning_due(&trade, 100));
+        for now in [100, 102, 130, 159, 99] {
+            assert!(!status_warning_due(&order, now), "now={now}");
+            assert!(!status_warning_due(&trade, now), "now={now}");
+        }
+        assert!(status_warning_due(&order, 160));
+        assert!(!status_warning_due(&order, 160));
+        assert!(status_warning_due(&trade, 160));
+    }
+
+    #[test]
+    fn concurrent_status_warnings_have_one_winner() {
+        let last_warn_secs = AtomicU64::new(0);
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        status_warning_due(&last_warn_secs, 100)
+                    })
+                })
+                .collect();
+            let winners = threads
+                .into_iter()
+                .map(|thread| usize::from(thread.join().unwrap()))
+                .sum::<usize>();
+            assert_eq!(winners, 1);
+        });
+    }
+
+    #[test]
+    fn status_log_value_is_bounded_and_never_serializes_a_body() {
+        let long_status = "状".repeat(100);
+        assert_eq!(status_log_value(Some(&json!(long_status))), "状".repeat(80));
+        assert_eq!(status_log_value(None), "<missing>");
+        for invalid in [
+            Value::Null,
+            json!(true),
+            json!({"status": "body"}),
+            json!(["body"]),
+        ] {
+            assert_eq!(status_log_value(Some(&invalid)), "<invalid>");
+        }
+    }
+
+    #[test]
+    fn order_status_matrix_normalizes_only_known_full_values_and_preserves_raw() {
+        for (bare, prefixed, expected) in [
+            ("MATCHED", "ORDER_STATUS_MATCHED", "matched"),
+            ("LIVE", "ORDER_STATUS_LIVE", "live"),
+            ("INVALID", "ORDER_STATUS_INVALID", "invalid"),
+            ("CANCELED", "ORDER_STATUS_CANCELED", "cancelled"),
+            (
+                "CANCELED_MARKET_RESOLVED",
+                "ORDER_STATUS_CANCELED_MARKET_RESOLVED",
+                "cancelled",
+            ),
+        ] {
+            for status in [bare, prefixed] {
+                for status in [status.to_string(), status.to_ascii_lowercase()] {
+                    let raw = json!({"id": "remote-oid", "status": status});
+                    let poll = parse_order_poll(raw.clone(), "requested-oid");
+                    assert!(poll.found);
+                    assert_eq!(poll.status, expected, "status={status}");
+                    assert_eq!(normalized_order_status(&status), Some(expected));
+                    assert_eq!(poll.raw, raw);
+                }
+            }
+        }
+        for status in ["cancelled", "canceled", "expired", "unmatched", "rejected"] {
+            for status in [status.to_string(), status.to_ascii_uppercase()] {
+                let raw = json!({"status": status});
+                let poll = parse_order_poll(raw.clone(), "oid-1");
+                assert_eq!(poll.status, "cancelled", "status={status}");
+                assert_eq!(normalized_order_status(&status), Some("cancelled"));
+                assert_eq!(poll.raw, raw);
+            }
+        }
+    }
+
+    #[test]
+    fn order_status_matrix_preserves_unknown_and_invalid_values() {
+        for status in [
+            json!("UNKNOWN"),
+            json!("ORDER_STATUS_UNKNOWN"),
+            json!("FUTURE_CANCELED"),
+            json!("NOT_CANCELLED"),
+            json!("ORDER_STATUS_REJECTED_FUTURE"),
+            json!("ORDER_STATUS_REJECTED"),
+            json!("ORDER_STATUS_EXPIRED"),
+            json!("ORDER_STATUS_UNMATCHED"),
+            json!("ORDER_STATUS_CANCELLED"),
+            json!("ORDER_STATUS_ORDER_STATUS_MATCHED"),
+            json!("TRADE_STATUS_CONFIRMED"),
+            json!(" MATCHED "),
+            json!(""),
+            Value::Null,
+            json!(true),
+            json!(17),
+            json!({"status": "MATCHED"}),
+            json!(["MATCHED"]),
+        ] {
+            let raw = json!({"status": status});
+            let poll = parse_order_poll(raw.clone(), "oid-1");
+            assert!(poll.found);
+            assert_eq!(poll.status, status.as_str().unwrap_or_default());
+            assert_eq!(normalized_order_status(&poll.status), None);
+            assert_eq!(poll.raw, raw);
+        }
+        let raw = json!({"id": "oid-1"});
+        let poll = parse_order_poll(raw.clone(), "oid-1");
+        assert!(poll.status.is_empty());
+        assert_eq!(poll.raw, raw);
+    }
+
+    #[test]
     fn parse_order_poll_keeps_identity_and_matched_quantity_separate() {
         let raw = json!({
             "id": "remote-oid", "status": "MATCHED", "asset_id": "yes",
@@ -2429,22 +2638,53 @@ pub(crate) mod tests {
     fn trade_status_matrix_requires_explicit_confirmation() {
         for (status, expected) in [
             (json!("CONFIRMED"), FillFinality::Confirmed),
+            (json!("TRADE_STATUS_CONFIRMED"), FillFinality::Confirmed),
             (json!("FAILED"), FillFinality::Failed),
+            (json!("TRADE_STATUS_FAILED"), FillFinality::Failed),
             (json!("MATCHED"), FillFinality::Pending),
+            (json!("TRADE_STATUS_MATCHED"), FillFinality::Pending),
+            (json!("MATCHED_NOT_BROADCASTED"), FillFinality::Pending),
+            (
+                json!("TRADE_STATUS_MATCHED_NOT_BROADCASTED"),
+                FillFinality::Pending,
+            ),
             (json!("MINED"), FillFinality::Pending),
+            (json!("TRADE_STATUS_MINED"), FillFinality::Pending),
             (json!("RETRYING"), FillFinality::Pending),
+            (json!("TRADE_STATUS_RETRYING"), FillFinality::Pending),
             (json!("UNKNOWN"), FillFinality::Pending),
+            (json!("TRADE_STATUS_UNKNOWN"), FillFinality::Pending),
+            (json!("FUTURE_CONFIRMED"), FillFinality::Pending),
+            (json!("NOT_FAILED"), FillFinality::Pending),
+            (
+                json!("TRADE_STATUS_TRADE_STATUS_CONFIRMED"),
+                FillFinality::Pending,
+            ),
+            (json!("ORDER_STATUS_CONFIRMED"), FillFinality::Pending),
             (json!("confirmed"), FillFinality::Pending),
+            (json!("trade_status_confirmed"), FillFinality::Pending),
+            (json!(" CONFIRMED "), FillFinality::Pending),
+            (json!(""), FillFinality::Pending),
             (Value::Null, FillFinality::Pending),
             (json!(true), FillFinality::Pending),
+            (json!(17), FillFinality::Pending),
+            (json!({"status": "CONFIRMED"}), FillFinality::Pending),
+            (json!(["CONFIRMED"]), FillFinality::Pending),
         ] {
             let mut trade = trade_fixture("t1");
-            trade["status"] = status;
+            trade["status"] = status.clone();
+            trade["maker_orders"] = json!([{
+                "order_id": "maker-1", "asset_id": "yes",
+                "matched_amount": "5", "price": "0.4"
+            }]);
             let fills = parse_trades(&json!([trade])).unwrap();
-            assert_eq!(fills.len(), 1);
-            assert_eq!(fills[0].finality, expected);
-            assert_eq!(fills[0].fee, None);
-            assert_eq!(fills[0].fee_token, None);
+            assert_eq!(fills.len(), 2);
+            for fill in fills {
+                assert_eq!(fill.finality, expected, "status={status}");
+                assert_eq!(fill.raw["status"], status);
+                assert_eq!(fill.fee, None);
+                assert_eq!(fill.fee_token, None);
+            }
         }
         let mut missing = trade_fixture("missing-status");
         missing.as_object_mut().unwrap().remove("status");
@@ -3339,7 +3579,8 @@ pub(crate) mod tests {
         assert!(!err.to_string().contains("do not expose payload"));
         let found = venue.poll_order("test-funder", "order-id").await.unwrap();
         assert!(found.found);
-        assert_eq!(found.status, "MATCHED");
+        assert_eq!(found.status, "matched");
+        assert_eq!(found.raw["status"], "MATCHED");
         assert_eq!(found.order_id.as_deref(), Some("order-id"));
         assert!(found.shares.is_none() && found.associated_trades.is_empty());
         let requests = server.await.unwrap();

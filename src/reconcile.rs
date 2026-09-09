@@ -3,7 +3,8 @@ use crate::error::{Error, Result};
 use crate::platforms::{FillFinality, OrderPoll, TradeFill};
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FillEvidence {
@@ -13,6 +14,132 @@ pub struct FillEvidence {
     pub expected_shares: Option<Decimal>,
     #[serde(default)]
     pub pm_scan: Option<PmTradeScan>,
+    #[serde(default)]
+    pub pm_order_constraints: Option<PmOrderConstraints>,
+}
+
+/// 已查到的成交事实只能增加；缺单响应不能抹掉尚未取齐的关联成交。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PmOrderConstraints {
+    pub version: u8,
+    pub order_id: String,
+    pub asset_id: String,
+    pub funder: String,
+    pub associated_trade_ids: BTreeSet<String>,
+    pub matched_shares_lower_bound: Option<Decimal>,
+}
+
+impl PmOrderConstraints {
+    pub fn has_execution(&self) -> bool {
+        !self.associated_trade_ids.is_empty()
+            || self
+                .matched_shares_lower_bound
+                .is_some_and(|qty| qty > Decimal::ZERO)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.version != 1
+            || self.order_id.trim().is_empty()
+            || self.asset_id.trim().is_empty()
+            || self.funder.trim().is_empty()
+            || self
+                .associated_trade_ids
+                .iter()
+                .any(|id| id.trim().is_empty() || id.starts_with("ack:"))
+            || self
+                .matched_shares_lower_bound
+                .is_some_and(|qty| qty < Decimal::ZERO)
+        {
+            return Err(Error::msg("invalid polymarket order constraints"));
+        }
+        Ok(())
+    }
+
+    fn absorb_poll(&mut self, poll: &OrderPoll) -> Result<()> {
+        if !poll.found || poll.order_id.as_deref() != Some(self.order_id.as_str()) {
+            return Ok(());
+        }
+        if poll
+            .coin
+            .as_deref()
+            .is_some_and(|coin| coin != self.asset_id)
+        {
+            return Err(Error::msg("polymarket order constraint asset mismatch"));
+        }
+        if let Some(ids) = poll.raw.get("associate_trades").and_then(Value::as_array) {
+            // 两类字段分别吸收；畸形关联列表不能削弱此前的合法约束。
+            if ids.iter().all(|id| {
+                id.as_str()
+                    .is_some_and(|id| !id.trim().is_empty() && !id.starts_with("ack:"))
+            }) {
+                self.associated_trade_ids
+                    .extend(ids.iter().filter_map(Value::as_str).map(str::to_owned));
+            }
+        }
+        if let Some(qty) = poll.shares.filter(|qty| *qty >= Decimal::ZERO) {
+            self.matched_shares_lower_bound = Some(
+                self.matched_shares_lower_bound
+                    .map_or(qty, |old| old.max(qty)),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// 必须基于锁内快照调用；旧 JSON 中仍可验证的同单证据在覆盖前恢复。
+pub fn pm_order_constraints(
+    info: Option<&Value>,
+    order_id: &str,
+    asset_id: &str,
+    funder: &str,
+    poll: Option<&OrderPoll>,
+) -> Result<PmOrderConstraints> {
+    let mut constraints = PmOrderConstraints {
+        version: 1,
+        order_id: order_id.into(),
+        asset_id: asset_id.into(),
+        funder: funder.to_ascii_lowercase(),
+        associated_trade_ids: BTreeSet::new(),
+        matched_shares_lower_bound: None,
+    };
+    constraints.validate()?;
+    if let Some(info) = info {
+        for path in [
+            "/pm_order_constraints",
+            "/fill_evidence/pm_order_constraints",
+        ] {
+            if let Some(value) = info.pointer(path).filter(|value| !value.is_null()) {
+                let previous: PmOrderConstraints = serde_json::from_value(value.clone())?;
+                previous.validate()?;
+                if previous.order_id != order_id
+                    || previous.asset_id != asset_id
+                    || !previous.funder.eq_ignore_ascii_case(funder)
+                {
+                    return Err(Error::msg("polymarket order constraint identity mismatch"));
+                }
+                constraints
+                    .associated_trade_ids
+                    .extend(previous.associated_trade_ids);
+                if let Some(qty) = previous.matched_shares_lower_bound {
+                    constraints.matched_shares_lower_bound = Some(
+                        constraints
+                            .matched_shares_lower_bound
+                            .map_or(qty, |old| old.max(qty)),
+                    );
+                }
+            }
+        }
+        for path in ["/order_poll", "/fill_evidence/poll"] {
+            if let Some(value) = info.pointer(path).filter(|value| !value.is_null()) {
+                let previous: OrderPoll = serde_json::from_value(value.clone())?;
+                constraints.absorb_poll(&previous)?;
+            }
+        }
+    }
+    if let Some(poll) = poll {
+        constraints.absorb_poll(poll)?;
+    }
+    Ok(constraints)
 }
 
 /// 本次固定窗口扫描的证据；旧 fills 不能替代本轮实际查到的成交集合。
@@ -131,8 +258,18 @@ pub fn resolve_leg(
         };
         trades.insert(fill.trade_id.clone(), merged);
     }
-    let state = poll.status.to_ascii_lowercase();
-    let cancelled = cancellation_status(&state);
+    let state = if platform == POLYMARKET {
+        crate::platforms::polymarket::normalized_order_status(&poll.status)
+            .unwrap_or("unknown")
+            .to_string()
+    } else {
+        poll.status.to_ascii_lowercase()
+    };
+    let cancelled = if platform == POLYMARKET {
+        state == "cancelled"
+    } else {
+        cancellation_status(&state)
+    };
     let successful: Vec<_> = trades
         .values()
         .filter(|fill| fill.finality == FillFinality::Confirmed)
@@ -225,6 +362,34 @@ pub fn resolve_leg(
         }
     } else {
         return Err(Error::msg("unsupported reconciliation platform"));
+    }
+    if platform == POLYMARKET {
+        if let Some(known) = &evidence.pm_order_constraints {
+            known.validate()?;
+            if poll.order_id.as_deref() != Some(known.order_id.as_str())
+                || trades
+                    .values()
+                    .any(|fill| fill.coin.as_deref() != Some(known.asset_id.as_str()))
+            {
+                return Err(Error::msg(
+                    "polymarket order constraints do not match trades",
+                ));
+            }
+            if known
+                .associated_trade_ids
+                .iter()
+                .any(|id| !trades.contains_key(id))
+            {
+                return Ok(LegResolution::Pending("known_associated_trade_missing"));
+            }
+            let observed: Decimal = trades.values().map(|fill| fill.shares).sum();
+            if known
+                .matched_shares_lower_bound
+                .is_some_and(|lower| observed < lower)
+            {
+                return Ok(LegResolution::Pending("known_matched_quantity_incomplete"));
+            }
+        }
     }
     if shares.is_zero() {
         return Ok(LegResolution::Terminal {
@@ -349,6 +514,7 @@ mod tests {
             history_complete: true,
             expected_shares: Some(d("10")),
             pm_scan: None,
+            pm_order_constraints: None,
         }
     }
 
@@ -428,6 +594,153 @@ mod tests {
             trade_ids: ids.iter().map(|id| (*id).into()).collect(),
         });
         evidence
+    }
+
+    #[test]
+    fn missing_order_retains_previously_known_trade_constraints() {
+        let known = pm_evidence().poll;
+        let constraints =
+            pm_order_constraints(None, "777", "token", "funder", Some(&known)).unwrap();
+        let mut evidence = missing_pm_evidence("null_body", &["one"]);
+        evidence.pm_order_constraints = Some(constraints);
+        let one = fill("one", "6", FillFinality::Confirmed);
+        assert_eq!(
+            resolve_leg(POLYMARKET, &[one.clone()], &evidence).unwrap(),
+            LegResolution::Pending("known_associated_trade_missing")
+        );
+        evidence
+            .pm_scan
+            .as_mut()
+            .unwrap()
+            .trade_ids
+            .push("two".into());
+        let two = fill("two", "4", FillFinality::Failed);
+        assert!(
+            matches!(resolve_leg(POLYMARKET, &[one, two], &evidence).unwrap(),
+            LegResolution::Terminal { status: "matched", shares, .. } if shares == d("6"))
+        );
+    }
+
+    #[test]
+    fn order_constraints_restore_and_only_accumulate_reliable_fields() {
+        let known = pm_evidence().poll;
+        let mut partial = known.clone();
+        partial.shares = Some(d("6"));
+        partial.raw = json!({"associate_trades":["one"]});
+        let info = json!({"order_poll": known, "fill_evidence":{"poll":partial}});
+        let first = pm_order_constraints(Some(&info), "777", "token", "FUNDER", None).unwrap();
+        assert_eq!(
+            first.associated_trade_ids,
+            BTreeSet::from(["one".into(), "two".into()])
+        );
+        assert_eq!(first.matched_shares_lower_bound, Some(d("10")));
+        let mut weaker = partial.clone();
+        weaker.raw = json!({"associate_trades":["three",null]});
+        weaker.shares = Some(d("-1"));
+        let stored = json!({"pm_order_constraints":first});
+        assert_eq!(
+            pm_order_constraints(Some(&stored), "777", "token", "funder", Some(&weaker)).unwrap(),
+            first
+        );
+        weaker.raw = json!({"associate_trades":["three"]});
+        weaker.shares = None;
+        let grown =
+            pm_order_constraints(Some(&stored), "777", "token", "funder", Some(&weaker)).unwrap();
+        assert!(grown.associated_trade_ids.contains("three"));
+        assert_eq!(grown.matched_shares_lower_bound, Some(d("10")));
+        weaker.order_id = Some("other".into());
+        assert_eq!(
+            pm_order_constraints(Some(&stored), "777", "token", "funder", Some(&weaker)).unwrap(),
+            first
+        );
+        for invalid in [json!({"version":99}), json!(false), json!({"version":1})] {
+            assert!(pm_order_constraints(
+                Some(&json!({"pm_order_constraints":invalid})),
+                "777",
+                "token",
+                "funder",
+                None
+            )
+            .is_err());
+        }
+        assert!(pm_order_constraints(Some(&stored), "other", "token", "funder", None).is_err());
+        let empty = pm_order_constraints(
+            Some(&json!({"pm_order_constraints":null})),
+            "777",
+            "token",
+            "funder",
+            None,
+        )
+        .unwrap();
+        assert!(!empty.has_execution());
+        let mut legacy: Value = serde_json::to_value(pm_evidence()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("pm_order_constraints");
+        assert!(serde_json::from_value::<FillEvidence>(legacy)
+            .unwrap()
+            .pm_order_constraints
+            .is_none());
+    }
+
+    #[test]
+    fn known_matched_lower_bound_is_not_ack_or_original_quantity() {
+        let mut known = pm_evidence().poll;
+        known.raw = json!({});
+        known.status = "live".into();
+        let mut evidence = missing_pm_evidence("http_404", &["one"]);
+        evidence.pm_order_constraints =
+            Some(pm_order_constraints(None, "777", "token", "funder", Some(&known)).unwrap());
+        let one = fill("one", "6", FillFinality::Confirmed);
+        assert_eq!(
+            resolve_leg(POLYMARKET, &[one.clone()], &evidence).unwrap(),
+            LegResolution::Pending("known_matched_quantity_incomplete")
+        );
+        evidence
+            .pm_scan
+            .as_mut()
+            .unwrap()
+            .trade_ids
+            .push("two".into());
+        assert!(
+            matches!(resolve_leg(POLYMARKET,&[one.clone(),fill("two","4",FillFinality::Failed)],&evidence).unwrap(),LegResolution::Terminal{shares,..} if shares==d("6"))
+        );
+        evidence.pm_scan.as_mut().unwrap().trade_ids.pop();
+        evidence.pm_order_constraints = None;
+        evidence.expected_shares = Some(d("100"));
+        evidence.poll.original_shares = Some(d("100"));
+        assert!(
+            matches!(resolve_leg(POLYMARKET,&[one],&evidence).unwrap(),LegResolution::Terminal{shares,..} if shares==d("6"))
+        );
+    }
+
+    #[test]
+    fn pm_order_terminal_whitelist_does_not_change_outcome_cancellation() {
+        for (status, terminal) in [
+            ("ORDER_STATUS_MATCHED", true),
+            ("ORDER_STATUS_CANCELED_MARKET_RESOLVED", true),
+            ("FUTURE_CANCELED", false),
+            ("ORDER_STATUS_INVALID", false),
+        ] {
+            let mut evidence = pm_evidence();
+            evidence.poll.status = status.into();
+            let result = resolve_leg(
+                POLYMARKET,
+                &[
+                    fill("one", "6", FillFinality::Confirmed),
+                    fill("two", "4", FillFinality::Confirmed),
+                ],
+                &evidence,
+            )
+            .unwrap();
+            assert_eq!(
+                matches!(result, LegResolution::Terminal { .. }),
+                terminal,
+                "{status}"
+            );
+        }
+        assert!(cancellation_status("futureCanceled"));
     }
 
     #[test]
@@ -598,6 +911,7 @@ mod tests {
             history_complete: false,
             expected_shares: None,
             pm_scan: None,
+            pm_order_constraints: None,
         };
         assert_eq!(
             resolve_leg(OUTCOME, &[], &evidence).unwrap(),

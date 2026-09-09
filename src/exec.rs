@@ -1047,55 +1047,9 @@ impl Engine {
         poll: OrderPoll,
         page: FillPage,
     ) -> Result<()> {
-        let mut matched: Vec<TradeFill> =
-            filter_trades(&page.fills, poll.order_id.as_deref(), None)
-                .into_iter()
-                .map(Clone::clone)
-                .collect();
-        if matched.iter().any(|fill| {
-            fill.coin
-                .as_deref()
-                .is_some_and(|coin| coin != leg.token_id)
-        }) {
-            return Err(Error::msg("matched trade token does not match leg"));
-        }
-        if leg.platform == POLYMARKET && matched.iter().any(needs_pm_fee_snapshot) {
-            let identities = self.store.market_identities_for_order(leg.order_id).await?;
-            let market_id = identities.require(POLYMARKET)?;
-            // 估算政策经用户明确选择；快照保存在每条成交中，不以策略先验冒充实收。
-            let schedule = self.pm.fee_schedule(market_id).await?;
-            for fill in matched
-                .iter_mut()
-                .filter(|fill| needs_pm_fee_snapshot(fill))
-            {
-                fill.raw["fee_calculation"] = schedule.clone();
-            }
-        }
-        let expected_shares = leg
-            .last_order_info
-            .as_ref()
-            .and_then(|info| info.pointer("/submission/expected_shares"))
-            .and_then(crate::platforms::parse_decimal);
-        let pm_scan = if leg.platform == POLYMARKET {
-            Some(serde_json::from_value::<PmTradeScan>(
-                page.progress.clone(),
-            )?)
-        } else {
-            None
-        };
         let trades_only = leg.platform == POLYMARKET && !poll.found;
-        let evidence = FillEvidence {
-            poll,
-            page_complete: page.complete,
-            history_complete: page.history_complete,
-            expected_shares,
-            pm_scan,
-        };
         let started = Instant::now();
-        let resolution = self
-            .store
-            .record_reconciliation(leg, &matched, &evidence, &page.progress)
-            .await?;
+        let resolution = apply_reconciliation_page(&self.pm, &self.store, leg, poll, page).await?;
         match resolution {
             LegResolution::Pending(reason) => tracing::debug!(
                 platform=%leg.platform,leg_id=leg.id,order_id=leg.order_id,reason,
@@ -2525,6 +2479,94 @@ pub fn book_recv_skew_ok(a: Instant, b: Instant, max: Duration) -> bool {
     book_recv_skew(a, b) <= max
 }
 
+async fn apply_reconciliation_page(
+    pm: &PolymarketVenue,
+    store: &Store,
+    leg: &crate::store::LegRow,
+    poll: OrderPoll,
+    page: FillPage,
+) -> Result<LegResolution> {
+    let mut matched: Vec<TradeFill> = filter_trades(&page.fills, poll.order_id.as_deref(), None)
+        .into_iter()
+        .cloned()
+        .collect();
+    if matched.iter().any(|fill| {
+        fill.coin
+            .as_deref()
+            .is_some_and(|coin| coin != leg.token_id)
+    }) {
+        return Err(Error::msg("matched trade token does not match leg"));
+    }
+    if leg.platform == POLYMARKET && !matched.is_empty() {
+        let oid = poll
+            .order_id
+            .as_deref()
+            .ok_or_else(|| Error::msg("missing reconciliation order id"))?;
+        let ids: Vec<_> = matched
+            .iter()
+            .map(|fill| fill.trade_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let stored = store.reconciliation_observations(leg, oid, &ids).await?;
+        matched = merge_page_observations(&matched, stored)?;
+    }
+    if leg.platform == POLYMARKET && matched.iter().any(needs_pm_fee_snapshot) {
+        let identities = store.market_identities_for_order(leg.order_id).await?;
+        let market_id = identities.require(POLYMARKET)?;
+        // HTTP 不持锁，仅真正缺少可靠证据者才需要新快照，最终仍锁内重新合并。
+        let schedule = pm.fee_schedule(market_id).await?;
+        for fill in matched
+            .iter_mut()
+            .filter(|fill| needs_pm_fee_snapshot(fill))
+        {
+            fill.raw["fee_calculation"] = schedule.clone();
+        }
+    }
+    let expected_shares = leg
+        .last_order_info
+        .as_ref()
+        .and_then(|info| info.pointer("/submission/expected_shares"))
+        .and_then(crate::platforms::parse_decimal);
+    let pm_scan = if leg.platform == POLYMARKET {
+        Some(serde_json::from_value::<PmTradeScan>(
+            page.progress.clone(),
+        )?)
+    } else {
+        None
+    };
+    let evidence = FillEvidence {
+        poll,
+        page_complete: page.complete,
+        history_complete: page.history_complete,
+        expected_shares,
+        pm_scan,
+        pm_order_constraints: None,
+    };
+    store
+        .record_reconciliation(leg, &matched, &evidence, &page.progress)
+        .await
+}
+
+fn merge_page_observations(page: &[TradeFill], stored: Vec<TradeFill>) -> Result<Vec<TradeFill>> {
+    let stored: HashMap<_, _> = stored
+        .into_iter()
+        .map(|fill| (fill.trade_id.clone(), fill))
+        .collect();
+    let mut merged = std::collections::BTreeMap::new();
+    for incoming in page {
+        let previous = merged
+            .get(&incoming.trade_id)
+            .or_else(|| stored.get(&incoming.trade_id));
+        let fill = match previous {
+            Some(previous) => crate::reconcile::merge_observation(previous, incoming)?,
+            None => incoming.clone(),
+        };
+        merged.insert(fill.trade_id.clone(), fill);
+    }
+    Ok(merged.into_values().collect())
+}
+
 async fn reconcile_pm_page(
     pm: &PolymarketVenue,
     store: &Store,
@@ -2777,6 +2819,145 @@ mod tests {
             .unwrap();
         let search_path = schema.clone();
         let exercised: anyhow::Result<()> = async {
+            let pool = PgPoolOptions::new()
+                .max_connections(2)
+                .after_connect(move |conn, _| {
+                    let path = search_path.clone();
+                    Box::pin(async move {
+                        sqlx::query("SELECT set_config('search_path', $1, false)")
+                            .bind(path)
+                            .execute(conn)
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .connect(&uri)
+                .await?;
+            let store = Store { pool };
+            store.migrate().await?;
+            for (http_status, body, missing_time) in [
+                (404, json!({}), false),
+                (200, Value::Null, false),
+                (404, json!({}), true),
+            ] {
+                let identity = MarketIdentity::new(POLYMARKET, "test-condition")?;
+                let (_, ids) = store
+                    .insert_actived_order_with_legs(
+                        TopicKey::new(uuid::Uuid::new_v4(), 0),
+                        &identity,
+                        "PM window test",
+                        "PM window test",
+                        None,
+                        d("10"),
+                        d("1"),
+                        d("9"),
+                        &json!([]),
+                        &[NewLeg {
+                            platform: POLYMARKET,
+                            token_id: "yes",
+                            label: "yes",
+                            side: "BUY",
+                            intent: "arb_buy",
+                            funder: Some("test-funder"),
+                            wallet: None,
+                            service: None,
+                            req_price: d("0.5"),
+                            req_shares: d("10"),
+                            req_fee: Decimal::ZERO,
+                            client_order_id: None,
+                        }],
+                    )
+                    .await?;
+                let oid = format!("taker-{}", ids[0]);
+                store
+                    .insert_envelope(ids[0], &oid, &json!({}), &json!({"test":true}), None)
+                    .await?;
+                if missing_time {
+                    sqlx::query("UPDATE legs SET submitted_at=NULL WHERE id=$1")
+                        .bind(ids[0])
+                        .execute(&store.pool)
+                        .await?;
+                }
+                let leg = store
+                    .open_legs()
+                    .await?
+                    .into_iter()
+                    .find(|leg| leg.id == ids[0])
+                    .unwrap();
+                let mut responses = vec![(http_status, body)];
+                if !missing_time {
+                    responses.push((
+                        200,
+                        json!({"data":[{
+                        "id":"confirmed-trade","taker_order_id":oid,"asset_id":"yes",
+                        "size":"6","price":"0.5","status":"CONFIRMED",
+                        "fee_amount":"0.01","fee_token":"USDC","maker_orders":[]
+                    }], "next_cursor":"LTE="}),
+                    ));
+                }
+                let (pm, server) = poll_stub(responses).await;
+                let page_result = reconcile_pm_page(&pm, &store, &leg).await?;
+                let requests = tokio::time::timeout(Duration::from_secs(5), server).await??;
+                if missing_time {
+                    assert!(page_result.is_none());
+                    assert_eq!(requests.len(), 1);
+                    let info: Value =
+                        sqlx::query_scalar("SELECT last_order_info FROM legs WHERE id=$1")
+                            .bind(leg.id)
+                            .fetch_one(&store.pool)
+                            .await?;
+                    assert_eq!(info["waiting_reason"], "submission_time_missing");
+                    continue;
+                }
+                assert_eq!(requests.len(), 2);
+                assert!(requests[0].starts_with(&format!("GET /data/order/{oid} ")));
+                let after = leg.submitted_at.unwrap().timestamp();
+                let url = url::Url::parse(&format!(
+                    "http://localhost{}",
+                    requests[1].split_whitespace().nth(1).unwrap()
+                ))?;
+                let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+                assert_eq!(query.get("after"), Some(&after.to_string()));
+                assert_eq!(query.get("before"), Some(&(after + 300).to_string()));
+                let (current, poll, page) = page_result.unwrap();
+                assert!(!poll.found);
+                assert_eq!(current.submitted_at, leg.submitted_at);
+                assert_eq!(current.third_order_id.as_deref(), Some(oid.as_str()));
+                assert!(
+                    matches!(apply_reconciliation_page(&pm, &store, &current, poll, page).await?,
+                    LegResolution::Terminal { status:"matched", shares, .. } if shares == d("6"))
+                );
+            }
+            store.pool.close().await;
+            Ok(())
+        }
+        .await;
+        let cleanup = sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&admin)
+            .await;
+        admin.close().await;
+        cleanup.unwrap();
+        exercised.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+    async fn pm_fee_recovery_uses_persisted_observations_before_http() {
+        use crate::platforms::polymarket::tests::poll_stub;
+        use sqlx::postgres::PgPoolOptions;
+        let uri = std::env::var("APP_POSTGRES_URI").expect("requires a test database");
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&uri)
+            .await
+            .unwrap();
+        let schema = format!("pm_fee_recovery_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let search_path = schema.clone();
+        let exercised: anyhow::Result<()> = async {
             let pool = PgPoolOptions::new().max_connections(2).after_connect(move |conn, _| {
                 let path = search_path.clone();
                 Box::pin(async move {
@@ -2786,60 +2967,74 @@ mod tests {
             }).connect(&uri).await?;
             let store = Store { pool };
             store.migrate().await?;
-            for (http_status, body, missing_time) in [(404, json!({}), false), (200, Value::Null, false), (404, json!({}), true)] {
+            // 复用、混合新旧快照、真正缺费失败、以及预读后的并发更新。
+            for mode in ["reuse", "mixed", "fee_failure", "stale"] {
                 let identity = MarketIdentity::new(POLYMARKET, "test-condition")?;
-                let (_, ids) = store.insert_actived_order_with_legs(
-                    TopicKey::new(uuid::Uuid::new_v4(), 0), &identity, "PM window test", "PM window test", None,
+                let (parent_id, ids) = store.insert_actived_order_with_legs(
+                    TopicKey::new(uuid::Uuid::new_v4(),0), &identity, "PM fee recovery", "PM fee recovery", None,
                     d("10"), d("1"), d("9"), &json!([]), &[NewLeg {
-                        platform: POLYMARKET, token_id: "yes", label: "yes", side: "BUY", intent: "arb_buy",
-                        funder: Some("test-funder"), wallet: None, service: None,
-                        req_price: d("0.5"), req_shares: d("10"), req_fee: Decimal::ZERO, client_order_id: None,
+                        platform:POLYMARKET,token_id:"yes",label:"yes",side:"BUY",intent:"arb_buy",
+                        funder:Some("test-funder"),wallet:None,service:None,req_price:d("0.5"),req_shares:d("10"),
+                        req_fee:Decimal::ZERO,client_order_id:None,
                     }],
                 ).await?;
-                let oid = format!("taker-{}", ids[0]);
-                store.insert_envelope(ids[0], &oid, &json!({}), &json!({"test":true}), None).await?;
-                if missing_time {
-                    sqlx::query("UPDATE legs SET submitted_at=NULL WHERE id=$1").bind(ids[0]).execute(&store.pool).await?;
+                let id=ids[0];
+                let oid=format!("fee-oid-{id}");
+                store.insert_envelope(id,&oid,&json!({}),&json!({"test":true}),None).await?;
+                let trade = |trade_id:&str, size:&str, status:&str| json!({
+                    "id":trade_id,"taker_order_id":oid,"asset_id":"yes","size":size,"price":"0.5",
+                    "status":status,"maker_orders":[]
+                });
+                let a=trade("a","6","TRADE_STATUS_CONFIRMED");
+                let b=trade("b","4","TRADE_STATUS_MATCHED_NOT_BROADCASTED");
+                let order=json!({"id":oid,"status":"ORDER_STATUS_MATCHED","asset_id":"yes","original_size":"10",
+                    "size_matched":"10","associate_trades":["a","b"]});
+                let (pm,server)=poll_stub(vec![(200,order),(200,json!({"data":[a.clone(),b],"next_cursor":"LTE="})),
+                    (200,json!({"c":"test-condition","fd":{"r":"0.07"}}))]).await;
+                let leg=store.open_legs().await?.into_iter().find(|leg|leg.id==id).unwrap();
+                let (current,poll,page)=reconcile_pm_page(&pm,&store,&leg).await?.unwrap();
+                assert!(matches!(apply_reconciliation_page(&pm,&store,&current,poll,page).await?,LegResolution::Pending(_)));
+                let requests=tokio::time::timeout(Duration::from_secs(5),server).await??;
+                assert_eq!(requests.len(),3);
+                assert!(requests[2].starts_with("GET /clob-markets/test-condition "));
+                let saved:Value=sqlx::query_scalar("SELECT raw FROM fills WHERE leg_id=$1 AND trade_id='a'").bind(id).fetch_one(&store.pool).await?;
+                let snapshot=saved["reconciliation_v1"]["raw"]["fee_calculation"].clone();
+                assert_eq!(snapshot["rate"],"0.07");
+                let next_b=trade("b","4",if mode=="reuse" || mode=="stale" {"TRADE_STATUS_FAILED"}else{"TRADE_STATUS_CONFIRMED"});
+                let mut responses=vec![(200,Value::Null),(200,json!({"data":[a.clone(),a.clone(),next_b],"next_cursor":"LTE="}))];
+                if mode=="mixed" {responses.push((200,json!({"c":"test-condition","fd":{"r":"0.05"}})));}
+                if mode=="fee_failure" {responses.push((503,json!({"error":"unavailable"})));}
+                let (pm,server)=poll_stub(responses).await;
+                let leg=store.open_legs().await?.into_iter().find(|leg|leg.id==id).unwrap();
+                let (current,poll,page)=reconcile_pm_page(&pm,&store,&leg).await?.unwrap();
+                let before:Value=sqlx::query_scalar("SELECT to_jsonb(l) FROM legs l WHERE id=$1").bind(id).fetch_one(&store.pool).await?;
+                if mode=="stale" {store.record_reconciliation_wait(&current,"concurrent_update").await?;}
+                let resolution=apply_reconciliation_page(&pm,&store,&current,poll,page).await;
+                let requests=tokio::time::timeout(Duration::from_secs(5),server).await??;
+                assert_eq!(requests.len(),if mode=="mixed" || mode=="fee_failure" {3}else{2});
+                let after:Value=sqlx::query_scalar("SELECT to_jsonb(l) FROM legs l WHERE id=$1").bind(id).fetch_one(&store.pool).await?;
+                if mode=="fee_failure" {
+                    assert!(resolution.is_err());
+                    assert_eq!(after,before);
+                } else if mode=="stale" {
+                    assert_eq!(resolution?,LegResolution::Pending("stale_leg_snapshot"));
+                    assert_eq!(after["last_order_info"]["waiting_reason"],"concurrent_update");
+                    assert_eq!(after["last_order_info"]["fill_progress"],before["last_order_info"]["fill_progress"]);
+                } else {
+                    let (shares,fee)=if mode=="reuse" {(d("6"),d("0.105"))}else{(d("10"),d("0.155"))};
+                    assert!(matches!(resolution?,LegResolution::Terminal{status:"matched",shares:s,fee:f,..} if s==shares && f==fee));
+                    let parent:Value=sqlx::query_scalar("SELECT to_jsonb(o) FROM arb_orders o WHERE id=$1").bind(parent_id).fetch_one(&store.pool).await?;
+                    assert_eq!(parent["status"],"completed");
+                    let cost:Decimal=sqlx::query_scalar("SELECT actual_cost FROM arb_orders WHERE id=$1").bind(parent_id).fetch_one(&store.pool).await?;
+                    assert_eq!(cost,shares*d("0.5")+fee);
                 }
-                let leg = store.open_legs().await?.into_iter().find(|leg| leg.id == ids[0]).unwrap();
-                let mut responses = vec![(http_status, body)];
-                if !missing_time {
-                    responses.push((200, json!({"data":[{
-                        "id":"confirmed-trade","taker_order_id":oid,"asset_id":"yes",
-                        "size":"6","price":"0.5","status":"CONFIRMED",
-                        "fee_amount":"0.01","fee_token":"USDC","maker_orders":[]
-                    }], "next_cursor":"LTE="})));
-                }
-                let (pm, server) = poll_stub(responses).await;
-                let page_result = reconcile_pm_page(&pm, &store, &leg).await?;
-                let requests = tokio::time::timeout(Duration::from_secs(5), server).await??;
-                if missing_time {
-                    assert!(page_result.is_none());
-                    assert_eq!(requests.len(), 1);
-                    let info: Value = sqlx::query_scalar("SELECT last_order_info FROM legs WHERE id=$1")
-                        .bind(leg.id).fetch_one(&store.pool).await?;
-                    assert_eq!(info["waiting_reason"], "submission_time_missing");
-                    continue;
-                }
-                assert_eq!(requests.len(), 2);
-                assert!(requests[0].starts_with(&format!("GET /data/order/{oid} ")));
-                let after = leg.submitted_at.unwrap().timestamp();
-                let url = url::Url::parse(&format!("http://localhost{}", requests[1].split_whitespace().nth(1).unwrap()))?;
-                let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
-                assert_eq!(query.get("after"), Some(&after.to_string()));
-                assert_eq!(query.get("before"), Some(&(after + 300).to_string()));
-                let (current, poll, page) = page_result.unwrap();
-                assert!(!poll.found);
-                assert_eq!(current.submitted_at, leg.submitted_at);
-                assert_eq!(current.third_order_id.as_deref(), Some(oid.as_str()));
-                let evidence = FillEvidence {
-                    poll, page_complete: page.complete, history_complete: page.history_complete,
-                    expected_shares: None,
-                    pm_scan: Some(serde_json::from_value(page.progress.clone())?),
-                };
-                let matched: Vec<_> = filter_trades(&page.fills, Some(&oid), None).into_iter().cloned().collect();
-                assert!(matches!(store.record_reconciliation(&current, &matched, &evidence, &page.progress).await?,
-                    LegResolution::Terminal { status:"matched", shares, .. } if shares == d("6")));
+                let latest:Value=sqlx::query_scalar("SELECT raw FROM fills WHERE leg_id=$1 AND trade_id='a'").bind(id).fetch_one(&store.pool).await?;
+                assert_eq!(latest["reconciliation_v1"]["raw"]["fee_calculation"],snapshot);
+                let b_value:Value=sqlx::query_scalar("SELECT raw FROM fills WHERE leg_id=$1 AND trade_id='b'").bind(id).fetch_one(&store.pool).await?;
+                if mode=="mixed" {assert_eq!(b_value["reconciliation_v1"]["raw"]["fee_calculation"]["rate"],"0.05");}
+                if mode=="fee_failure" || mode=="stale" {assert_eq!(b_value["reconciliation_v1"]["finality"],"pending");}
+                let count:i64=sqlx::query_scalar("SELECT count(*) FROM fills WHERE leg_id=$1").bind(id).fetch_one(&store.pool).await?;
+                assert_eq!(count,2);
             }
             store.pool.close().await;
             Ok(())
@@ -2850,6 +3045,40 @@ mod tests {
         admin.close().await;
         cleanup.unwrap();
         exercised.unwrap();
+    }
+
+    #[test]
+    fn page_fee_merge_preserves_evidence_without_inventing_scan_members() {
+        let mut stored = fill("a", "oid", "6", &[]);
+        stored.fee = None;
+        stored.raw =
+            json!({"role":"taker","fee_calculation":{"source":"clob-markets","rate":"0.07"}});
+        let mut incoming = stored.clone();
+        incoming.raw = json!({"role":"taker"});
+        assert!(needs_pm_fee_snapshot(&incoming));
+        let extra = fill("not_in_page", "oid", "4", &[]);
+        let merged = merge_page_observations(
+            &[incoming.clone(), incoming.clone()],
+            vec![stored.clone(), extra],
+        )
+        .unwrap();
+        assert_eq!(merged.len(), 1);
+        assert!(!needs_pm_fee_snapshot(&merged[0]));
+        assert_eq!(
+            merged[0].raw["fee_calculation"],
+            stored.raw["fee_calculation"]
+        );
+        incoming.fee = Some(Decimal::ZERO);
+        assert!(!needs_pm_fee_snapshot(
+            &merge_page_observations(&[incoming.clone()], vec![stored.clone()]).unwrap()[0]
+        ));
+        incoming.fee_token = Some("OTHER".into());
+        let other = merge_page_observations(&[incoming.clone()], vec![stored.clone()]).unwrap();
+        assert!(crate::reconcile::accounting_fee(POLYMARKET, &other[0])
+            .unwrap()
+            .is_none());
+        incoming.finality = crate::platforms::FillFinality::Failed;
+        assert!(merge_page_observations(&[incoming], vec![stored]).is_err());
     }
 
     #[test]

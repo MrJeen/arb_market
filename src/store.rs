@@ -3,7 +3,10 @@ use crate::domain::{MarketIdentity, TopicKey};
 use crate::error::{Error, Result};
 use crate::hedge::Positions;
 use crate::platforms::{OrderPoll, TradeFill};
-use crate::reconcile::{merge_observation, resolve_leg, FillEvidence, LegResolution, PmTradeScan};
+use crate::reconcile::{
+    merge_observation, pm_order_constraints, resolve_leg, FillEvidence, LegResolution,
+    PmOrderConstraints, PmTradeScan,
+};
 use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -435,11 +438,18 @@ impl Store {
                 .bind(leg_id)
                 .fetch_one(&mut *tx)
                 .await?;
-        let known = current.third_order_id.as_deref();
+        let known_constraints = leg_pm_order_constraints(&current, None)?;
+        let has_known_execution = known_constraints
+            .as_ref()
+            .is_some_and(PmOrderConstraints::has_execution);
+        let known = current
+            .third_order_id
+            .as_deref()
+            .or(current.client_order_id.as_deref());
         if let (Some(known), Some(incoming)) = (known, order_id) {
             if known != incoming
                 && (Some(known) != current.client_order_id.as_deref()
-                    || (current.platform == POLYMARKET && has_observation))
+                    || (current.platform == POLYMARKET && (has_observation || has_known_execution)))
             {
                 return Err(Error::msg(
                     "submit response conflicts with recovered order id",
@@ -448,7 +458,9 @@ impl Store {
         }
         let terminal = status == "cancelled" || status == "failed";
         // 找到订单或已有撮合证据后，晚到的拒单不能证明零成交。
-        let next_status = if terminal && (has_observation || current.status == "actived") {
+        let next_status = if terminal
+            && (has_observation || has_known_execution || current.status == "actived")
+        {
             current.status.as_str()
         } else if status == "unknown" && current.status == "actived" {
             "actived"
@@ -466,6 +478,14 @@ impl Store {
             // 尚无成交时允许恢复远端 oid，但旧候选订单的窗口进度不能沿用。
             info["fill_progress"] = Value::Null;
             info["fill_evidence"] = Value::Null;
+        }
+        if let Some(constraints) = known_constraints {
+            info["pm_order_constraints"] =
+                if known.zip(order_id).is_some_and(|(old, new)| old != new) {
+                    Value::Null
+                } else {
+                    serde_json::to_value(constraints)?
+                };
         }
         if info.pointer("/submission/kind").and_then(Value::as_str) != Some("ack")
             || evidence.get("kind").and_then(Value::as_str) == Some("ack")
@@ -498,9 +518,17 @@ impl Store {
             tx.rollback().await?;
             return Ok(None);
         }
-        if let (Some(known), Some(incoming)) =
-            (current.third_order_id.as_deref(), poll.order_id.as_deref())
-        {
+        let known_constraints = leg_pm_order_constraints(&current, None)?;
+        let has_known_execution = known_constraints
+            .as_ref()
+            .is_some_and(PmOrderConstraints::has_execution);
+        if let (Some(known), Some(incoming)) = (
+            current
+                .third_order_id
+                .as_deref()
+                .or(current.client_order_id.as_deref()),
+            poll.order_id.as_deref(),
+        ) {
             if known != incoming {
                 let has_pm_observation = if current.platform == POLYMARKET {
                     sqlx::query_scalar::<_, bool>(
@@ -515,6 +543,7 @@ impl Store {
                 // 按本地订单哈希落过真实成交后，不能让迟到查单把腿与明细分离。
                 if Some(known) != current.client_order_id.as_deref()
                     || has_pm_observation
+                    || has_known_execution
                     || (current.platform == POLYMARKET && !poll.found)
                 {
                     return Err(Error::msg(
@@ -546,11 +575,29 @@ impl Store {
             && current
                 .third_order_id
                 .as_deref()
+                .or(current.client_order_id.as_deref())
                 .zip(poll.order_id.as_deref())
                 .is_some_and(|(known, incoming)| known != incoming)
         {
             info["fill_progress"] = Value::Null;
             info["fill_evidence"] = Value::Null;
+            info["pm_order_constraints"] = Value::Null;
+        }
+        if current.platform == POLYMARKET {
+            if let Some(oid) = poll
+                .order_id
+                .as_deref()
+                .or(current.third_order_id.as_deref())
+                .or(current.client_order_id.as_deref())
+            {
+                let funder = current
+                    .funder_address
+                    .as_deref()
+                    .ok_or_else(|| Error::msg("missing polymarket funder"))?;
+                let constraints =
+                    pm_order_constraints(Some(&info), oid, &current.token_id, funder, Some(poll))?;
+                info["pm_order_constraints"] = serde_json::to_value(constraints)?;
+            }
         }
         info["order_poll"] = serde_json::to_value(poll)?;
         sqlx::query(
@@ -588,6 +635,42 @@ impl Store {
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// 只恢复本页实际出现的同腿成交，不能用缓存补造扫描覆盖；末端事务仍须重新校验。
+    pub async fn reconciliation_observations(
+        &self,
+        leg: &LegRow,
+        order_id: &str,
+        trade_ids: &[String],
+    ) -> Result<Vec<TradeFill>> {
+        if trade_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<(String, Value)> = sqlx::query_as(
+            "SELECT trade_id,raw->'reconciliation_v1' FROM fills
+             WHERE leg_id=$1 AND third_order_id=$2 AND trade_id=ANY($3)
+               AND raw ? 'reconciliation_v1' AND trade_id NOT LIKE 'ack:%'",
+        )
+        .bind(leg.id)
+        .bind(order_id)
+        .bind(trade_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(id, value)| {
+                let fill: TradeFill = serde_json::from_value(value)?;
+                if fill.trade_id != id
+                    || fill.order_id.as_deref() != Some(order_id)
+                    || fill.coin.as_deref() != Some(leg.token_id.as_str())
+                {
+                    return Err(Error::msg(
+                        "stored reconciliation observation identity mismatch",
+                    ));
+                }
+                Ok(fill)
+            })
+            .collect()
     }
 
     /// 明细、分页进度、腿最终账务和父单完成在同一事务提交。
@@ -692,12 +775,18 @@ impl Store {
             .into_iter()
             .map(serde_json::from_value)
             .collect::<std::result::Result<_, _>>()?;
-        let resolution = resolve_leg(&current.platform, &fills, evidence)?;
+        let mut effective = evidence.clone();
+        // 调用者提供的约束不具权威性，避免遗漏字段或旧快照削弱已持久化事实。
+        effective.pm_order_constraints = leg_pm_order_constraints(&current, Some(&evidence.poll))?;
+        let resolution = resolve_leg(&current.platform, &fills, &effective)?;
         let mut info = current
             .last_order_info
             .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(constraints) = &effective.pm_order_constraints {
+            info["pm_order_constraints"] = serde_json::to_value(constraints)?;
+        }
         info["fill_progress"] = progress.clone();
-        info["fill_evidence"] = serde_json::to_value(evidence)?;
+        info["fill_evidence"] = serde_json::to_value(&effective)?;
         match &resolution {
             LegResolution::Pending(reason) => {
                 info["waiting_reason"] = serde_json::json!(reason);
@@ -1397,6 +1486,34 @@ impl Store {
 
 fn leg_open(status: &str) -> bool {
     matches!(status, "pending" | "unknown" | "actived")
+}
+
+fn leg_pm_order_constraints(
+    leg: &LegRow,
+    poll: Option<&OrderPoll>,
+) -> Result<Option<PmOrderConstraints>> {
+    if leg.platform != POLYMARKET {
+        return Ok(None);
+    }
+    let Some(oid) = leg
+        .third_order_id
+        .as_deref()
+        .or(leg.client_order_id.as_deref())
+    else {
+        return Ok(None);
+    };
+    let funder = leg
+        .funder_address
+        .as_deref()
+        .ok_or_else(|| Error::msg("missing polymarket funder"))?;
+    pm_order_constraints(
+        leg.last_order_info.as_ref(),
+        oid,
+        &leg.token_id,
+        funder,
+        poll,
+    )
+    .map(Some)
 }
 
 async fn lock_leg_parent(

@@ -34,7 +34,9 @@ cargo run --release
 
 ## 成交确认与恢复
 
-ACK 仅记录已受理及预期撮合量，交易腿保留 `actived`，不生成 `ack:` 伪成交或暂估实际费用。Polymarket 必须取齐订单关联的成交并等待 `CONFIRMED`／`FAILED` 最终状态；只有 `CONFIRMED` 部分计入仓位，`MATCHED`、`MINED`、`RETRYING` 和未知状态继续等待。订单查询中的正撮合量不替代成交确认。
+ACK 仅记录已受理及预期撮合量，交易腿保留 `actived`，不生成 `ack:` 伪成交或暂估实际费用。Polymarket 必须取齐订单关联的成交并等待 `CONFIRMED`／`FAILED` 最终状态；兼容 REST 的 `TRADE_STATUS_*` 和既有裸值，只有 Confirmed 部分计入仓位，`MATCHED`、`MATCHED_NOT_BROADCASTED`、`MINED`、`RETRYING` 和未知状态继续等待。订单状态兼容明确的 `ORDER_STATUS_*` 枚举及裸值，未知状态不能靠后缀猜为取消；原始状态保留在证据中。订单查询中的正撮合量不替代成交确认。
+
+PM trades 固定查询首次提交起 300 秒的时间窗口；分页完成后仍待确认时重扫相同窗口，五分钟不是确认时限。order 返回 404／JSON null 时继续查 trades，但须完整、非空、精确匹配本单且全终态，费用证据齐全后才能收尾；空集合继续等待。曾经查到的关联成交 ID 持续取并集、撮合量持续取最大值作为下界，后续缺单或较旧快照不能抹掉这些约束。即使尚未拿到 fills，已知正成交证据也禁止随意换绑订单 ID。旧 JSON 中仍在的同单证据可自动恢复，已被旧版本完全覆盖的证据无法凭空找回，历史终态不会自动重开。
 
 Outcome 丢失 ACK 时使用已持久化的 cloid 查询真实 oid；数字 oid 以 JSON 整数发送，cloid 以字符串发送。成交历史使用首次提交前 30 秒到本轮固定终点的时间窗口查询，每次最多读一页，已成功页面和下一游标一起落库。同毫秒饱和、历史保留窗口不足或无法证明零成交时继续核对，不把查询不到／空页／超时解释成零成交。
 
@@ -42,7 +44,7 @@ Outcome 丢失 ACK 时使用已持久化的 cloid 查询真实 oid；数字 oid 
 
 `UNKNOWN_LEG_TIMEOUT_SECS` 同时覆盖 `unknown` 和确认中的 `actived`，按首次提交时间计时，已有部分成交或持续重试不会推迟告警。超时仅告警、暂停新套利并继续回填，不清零成交。等待 PM 链上确认也会延后父单完成和生命周期 claim 释放。
 
-**费用口径：** 明确提供金额且币种为 USDC（PM 也接受 pUSD）的费用按原值入账，包含显式 0；Outcome `fee` 已含 builderFee，不重复叠加。PM maker 的官方零费规则记录为 `calculated_maker_zero`。PM taker 未返回实扣金额时，查询 `/clob-markets/{condition_id}` 的 `fd.r`，按[官方费用公式](https://docs.polymarket.com/trading/fees) `shares × rate × price × (1-price)` 逐笔计算，不读取或使用指数参数，五位小数四舍五入，不乘策略 1.3 安全倍率，来源记录为 `calculated`。该政策明确假设所查 schedule 适用于该成交、pUSD 按 1 美元计价；计算金额不是交易所实扣证明。费率、查询时点及币种／舍入政策保存在成交证据中，`fills.fee` 没有实扣值时保持 NULL；终态后不自动重新估费。缺少／畸形 schedule、非支持币种等仍保留 `fee_evidence_missing` 或查询错误并告警，不用缺字段推断零费。
+**费用口径：** 明确提供金额且币种为 USDC（PM 也接受 pUSD）的费用按原值入账，包含显式 0；Outcome `fee` 已含 builderFee，不重复叠加。PM maker 的官方零费规则记录为 `calculated_maker_zero`。PM taker 未返回实扣金额时，查询 `/clob-markets/{condition_id}` 的 `fd.r`，按[官方费用公式](https://docs.polymarket.com/trading/fees) `shares × rate × price × (1-price)` 逐笔计算，不读取或使用指数参数，五位小数四舍五入，不乘策略 1.3 安全倍率，来源记录为 `calculated`。该政策明确假设所查 schedule 适用于该成交、pUSD 按 1 美元计价；计算金额不是交易所实扣证明。费率、查询时点及币种／舍入政策保存在成交证据中，`fills.fee` 没有实扣值时保持 NULL；重扫先批量合并本页同单已存成交，复用已确定快照，仅为真正缺少证据的成交查询费用接口，不用新费率覆盖旧快照；终态后不自动重新估费。缺少／畸形 schedule、非支持币种等仍保留 `fee_evidence_missing` 或查询错误并告警，不用缺字段推断零费。
 
 ## 市场与结算口径
 
