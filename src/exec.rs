@@ -257,10 +257,11 @@ impl Engine {
     async fn execute_plan(&self, topic: &Topic, plan: ArbPlan) -> Result<()> {
         self.ensure_trading_enabled(TradingIntent::Arbitrage)?;
         let fees = self.fee_context(topic);
-        let pm_need = plan.pm.cost + plan.pm.fee;
-        let out_need = plan.outcome.cost + plan.outcome.fee;
-        let (pm_bal, out_bal) =
-            tokio::join!(self.select_funder(pm_need), self.outcome.user_state());
+        let Some(out_need) = plan.outcome_required() else {
+            tracing::warn!(topic = %topic.key.as_str(), "arb exact valuation unavailable");
+            return Ok(());
+        };
+        let (pm_bal, out_bal) = tokio::join!(self.select_funder(&plan), self.outcome.user_state());
         let (funder, pm_balance) = match pm_bal {
             Ok(pair) => pair,
             Err(err) => {
@@ -274,7 +275,7 @@ impl Engine {
             }
         };
         let out_balance = match out_bal {
-            Ok(bal) if bal >= out_need => bal,
+            Ok(bal) if plan.outcome_balance_sufficient(bal) => bal,
             Ok(bal) => {
                 tracing::info!(
                     topic = %topic.key.as_str(),
@@ -313,9 +314,11 @@ impl Engine {
         else {
             return Ok(());
         };
-        let pm_need = plan.pm.cost + plan.pm.fee;
-        let out_need = plan.outcome.cost + plan.outcome.fee;
-        if pm_need > pm_balance {
+        let (Some(pm_need), Some(out_need)) = (plan.pm_required(), plan.outcome_required()) else {
+            tracing::warn!(topic = %topic.key.as_str(), "confirmed exact valuation unavailable");
+            return Ok(());
+        };
+        if !plan.pm_balance_sufficient(pm_balance) {
             tracing::info!(
                 topic = %topic.key.as_str(),
                 required = %pm_need,
@@ -325,7 +328,7 @@ impl Engine {
             self.stats.exceed_bal();
             return Ok(());
         }
-        if out_need > out_balance {
+        if !plan.outcome_balance_sufficient(out_balance) {
             tracing::info!(
                 topic = %topic.key.as_str(),
                 required = %out_need,
@@ -346,6 +349,15 @@ impl Engine {
         }
 
         self.ensure_trading_enabled(TradingIntent::Arbitrage)?;
+        let pm_tick = self.ensure_pm_tick(&plan.pm.token_id).await;
+        if !pm_tick.is_some_and(|tick| {
+            tick > Decimal::ZERO
+                && tick <= Decimal::ONE
+                && crate::calc::align_polymarket_price(plan.pm.cap_price, tick) == plan.pm.cap_price
+        }) {
+            tracing::info!(topic = %topic.key.as_str(), "polymarket tick unavailable or cap changed before admission");
+            return Ok(());
+        }
         let fills = json!([
             {"platform": POLYMARKET, "token": plan.pm.token_id, "label": plan.pm.label, "shares": plan.pm.shares, "price": plan.pm.cap_price},
             {"platform": OUTCOME, "token": plan.outcome.token_id, "label": plan.outcome.label, "shares": plan.outcome.shares, "price": plan.outcome.cap_price}
@@ -423,7 +435,6 @@ impl Engine {
         let [pm_leg, out_leg] = <[i64; 2]>::try_from(leg_ids)
             .map_err(|_| Error::msg("arb order must be created with both initial legs"))?;
         self.stats.orders();
-        let pm_tick = self.ensure_pm_tick(&plan.pm.token_id).await;
         let pm_req = MarketOrderRequest {
             token_id: plan.pm.token_id.clone(),
             shares: plan.pm.shares,
@@ -434,6 +445,7 @@ impl Engine {
             asset_id: None,
             funder_address: Some(funder.clone()),
         };
+        validate_pm_request_tick(&pm_req)?;
         let out_req = MarketOrderRequest {
             token_id: plan.outcome.token_id.clone(),
             shares: plan.outcome.shares,
@@ -539,7 +551,7 @@ impl Engine {
         let (pm_snap, pm_at, pm_elapsed) = pm_res;
         let (out_snap, out_at, out_elapsed) = out_res;
         let skew = book_recv_skew(pm_at, out_at);
-        let (pm_bids, pm_asks, pm_ts) = match pm_snap {
+        let (pm_bids, pm_asks, pm_ts, pm_tick) = match pm_snap {
             Ok(snap) => {
                 tracing::info!(
                     platform = POLYMARKET,
@@ -547,7 +559,7 @@ impl Engine {
                     elapsed_ms = pm_elapsed.as_millis() as u64,
                     "polymarket rest book fetched"
                 );
-                snap
+                (snap.bids, snap.asks, snap.exchange_ts_ms, snap.tick_size)
             }
             Err(err) => {
                 tracing::warn!(
@@ -595,7 +607,7 @@ impl Engine {
             accept_confirmation_books(
                 &mut books,
                 &pm_ticket,
-                (pm_bids, pm_asks, pm_ts, pm_at),
+                (pm_bids, pm_asks, pm_ts, pm_at, pm_tick),
                 &out_ticket,
                 (out_bids, out_asks, out_ts, out_at),
                 self.cfg.book_stale,
@@ -669,7 +681,10 @@ impl Engine {
         }
     }
 
-    async fn select_funder(&self, required: Decimal) -> Result<(String, Decimal)> {
+    async fn select_funder(&self, plan: &ArbPlan) -> Result<(String, Decimal)> {
+        let required = plan
+            .pm_required()
+            .ok_or_else(|| Error::msg("arb exact valuation unavailable"))?;
         let mut current = self
             .pm
             .next_funder()
@@ -677,7 +692,7 @@ impl Engine {
             .ok_or_else(|| Error::msg("no polymarket funder configured"))?;
         for _ in 0..3 {
             match self.pm.balance(&current).await {
-                Ok(bal) if bal >= required => return Ok((current, bal)),
+                Ok(bal) if plan.pm_balance_sufficient(bal) => return Ok((current, bal)),
                 Ok(bal) => {
                     tracing::warn!(funder = %current, %bal, %required, "polymarket balance low")
                 }
@@ -790,6 +805,7 @@ impl Engine {
         intent: TradingIntent,
     ) -> Result<SubmitResult> {
         self.ensure_trading_enabled(intent)?;
+        validate_pm_request_tick(req)?;
         let prepared = self.pm.prepare_market_order(funder, req).await?;
         let book_snapshot = self.token_book_snapshot(POLYMARKET, &req.token_id).await;
         self.store
@@ -1689,8 +1705,8 @@ impl Engine {
         let (pm_result, pm_at, pm_elapsed) = pm;
         let (out_result, out_at, out_elapsed) = outcome;
         let skew = book_recv_skew(pm_at, out_at);
-        let (pm_bids, pm_asks, pm_ts) = match pm_result {
-            Ok(book) => book,
+        let (pm_bids, pm_asks, pm_ts, pm_tick) = match pm_result {
+            Ok(book) => (book.bids, book.asks, book.exchange_ts_ms, book.tick_size),
             Err(err) => {
                 tracing::warn!(
                     topic = %topic.key.as_str(),
@@ -1744,7 +1760,7 @@ impl Engine {
             accept_confirmation_books(
                 &mut books,
                 &pm_ticket,
-                (pm_bids, pm_asks, pm_ts, pm_at),
+                (pm_bids, pm_asks, pm_ts, pm_at, pm_tick),
                 &out_ticket,
                 (out_bids, out_asks, out_ts, out_at),
                 self.cfg.book_stale,
@@ -1817,6 +1833,7 @@ impl Engine {
             .take_profit_request(topic, pm_action, Some(&funder))
             .await;
         let out_req = self.take_profit_request(topic, out_action, None).await;
+        validate_pm_request_tick(&pm_req)?;
         let leg_ids = self
             .store
             .insert_legs_atomic(
@@ -1974,6 +1991,7 @@ impl Engine {
                 asset_id: None,
                 funder_address: Some(funder.clone()),
             };
+            validate_pm_request_tick(&req)?;
             let leg_id = self
                 .store
                 .insert_leg_for_claim(
@@ -2127,9 +2145,15 @@ impl Engine {
             let ticket = self.books.lock().await.begin_rest(&platform, &token_id);
             let started = Instant::now();
             let result = if platform == POLYMARKET {
-                self.pm.rest_book(&token_id).await
+                self.pm
+                    .rest_book(&token_id)
+                    .await
+                    .map(|book| (book.bids, book.asks, book.exchange_ts_ms, book.tick_size))
             } else {
-                self.outcome.rest_book(&token_id).await
+                self.outcome
+                    .rest_book(&token_id)
+                    .await
+                    .map(|(bids, asks, ts)| (bids, asks, ts, None))
             };
             (
                 platform,
@@ -2144,14 +2168,14 @@ impl Engine {
             futures_util::future::join_all(fetches).await
         {
             match result {
-                Ok((bids, asks, exchange_ts_ms)) => {
+                Ok((bids, asks, exchange_ts_ms, tick)) => {
                     let accepted = self.books.lock().await.accept_rest(
                         &ticket,
                         bids,
                         asks,
                         exchange_ts_ms,
                         received_at,
-                        None,
+                        tick,
                     );
                     tracing::info!(
                         order_id,
@@ -2187,29 +2211,39 @@ impl Engine {
 
     /// 盘口已有 tick 则直接用；没有才请求一次 `/tick-size` 并写回订单簿。
     async fn ensure_pm_tick(&self, token_id: &str) -> Option<Decimal> {
-        {
+        let ticket = {
             let books = self.books.lock().await;
-            if let Some(tick) = books
-                .get(POLYMARKET, token_id)
-                .and_then(|book| book.tick_size)
-            {
+            if let Some(tick) = books.tick_size(POLYMARKET, token_id) {
                 return Some(tick);
             }
-        }
+            books.begin_rest(POLYMARKET, token_id)
+        };
         match self.pm.fetch_tick_size(token_id).await {
-            Ok(tick) => {
-                self.books
-                    .lock()
-                    .await
-                    .set_tick_size(POLYMARKET, token_id, tick);
-                Some(tick)
-            }
+            Ok(tick) => self.books.lock().await.seed_tick_size(&ticket, tick),
             Err(err) => {
                 tracing::warn!(token_id, error = %err, "polymarket tick_size fetch failed");
                 None
             }
         }
     }
+}
+
+// 自动交易不能在 tick 缺失/冲突时借 venue 的人工入口 fallback 重新取值下单。
+fn validate_pm_request_tick(req: &MarketOrderRequest) -> Result<()> {
+    let tick = req
+        .tick_size
+        .ok_or_else(|| Error::msg("polymarket tick unavailable"))?;
+    if tick <= Decimal::ZERO || tick > Decimal::ONE {
+        return Err(Error::msg("invalid accepted polymarket tick"));
+    }
+    let aligned = match req.side {
+        OrderSide::Buy => crate::calc::align_polymarket_price(req.cap_price, tick),
+        OrderSide::Sell => crate::calc::align_polymarket_sell_price(req.cap_price, tick),
+    };
+    if aligned != req.cap_price {
+        return Err(Error::msg("polymarket cap incompatible with accepted tick"));
+    }
+    Ok(())
 }
 
 /// 不使用全局 get 的 WS 优先策略：HTTP 硬确认只能用这次通过票据验证的完整副本。
@@ -2221,6 +2255,7 @@ fn accept_confirmation_books(
         Vec<crate::book::Level>,
         i64,
         Instant,
+        Option<Decimal>,
     ),
     out_ticket: &crate::book::RestTicket,
     out: (
@@ -2232,7 +2267,7 @@ fn accept_confirmation_books(
     max_age: Duration,
     now: Instant,
 ) -> Option<(OrderBook, OrderBook)> {
-    let pm_book = books.accept_rest(pm_ticket, pm.0, pm.1, pm.2, pm.3, None);
+    let pm_book = books.accept_rest(pm_ticket, pm.0, pm.1, pm.2, pm.3, pm.4);
     let out_book = books.accept_rest(out_ticket, out.0, out.1, out.2, out.3, None);
     let (Ok(pm_book), Ok(out_book)) = (pm_book, out_book) else {
         return None;
@@ -2781,6 +2816,142 @@ mod tests {
     }
 
     #[test]
+    fn arb_http_confirmation_refreshes_exact_funding_before_admission() {
+        let token = |platform: &str, id: &str, label: &str| crate::domain::TokenRef {
+            platform: platform.into(),
+            token_id: id.into(),
+            label: label.into(),
+            option_id: "market".into(),
+            condition_id: None,
+            asset_id: None,
+            side_index: None,
+            neg_risk: None,
+            fees_enabled: None,
+            fee_rate: None,
+        };
+        let pm = token(POLYMARKET, "pm", "yes");
+        let out = token(OUTCOME, "out", "no");
+        let topic = Topic {
+            key: TopicKey::new(uuid::Uuid::nil(), 0),
+            title: "test".into(),
+            market_title: "test".into(),
+            end_date: None,
+            tokens: vec![pm.clone(), out.clone()],
+        };
+        let levels = |rows: &[(&str, &str)]| {
+            rows.iter()
+                .map(|(price, size)| crate::book::Level {
+                    price: d(price),
+                    size: d(size),
+                })
+                .collect()
+        };
+        let now = Instant::now();
+        let mut books = BookStore::default();
+        books.set_tick_size(POLYMARKET, "pm", d("0.01"));
+        books.replace_snapshot(
+            POLYMARKET,
+            "pm",
+            vec![],
+            levels(&[("0.30", "4.5"), ("0.40", "95.5")]),
+            100,
+            now,
+        );
+        books.replace_snapshot(OUTCOME, "out", vec![], levels(&[("0.40", "200")]), 100, now);
+        let fees = FeeContext {
+            polymarket_fee_rate: Decimal::ZERO,
+            outcome_taker_rate: Decimal::ZERO,
+        };
+        let limits = ArbLimits {
+            cost_limit: d("100"),
+            min_profit: d("1"),
+            min_apr: Decimal::ZERO,
+            days: 1,
+        };
+        let first = crate::calc::plan_arbitrage(
+            &topic,
+            books.get(POLYMARKET, "pm").unwrap(),
+            books.get(OUTCOME, "out").unwrap(),
+            &pm,
+            &out,
+            &fees,
+            &limits,
+        )
+        .unwrap();
+        assert!(first.pm_balance_sufficient(d("39.70")));
+        let pm_ticket = books.begin_rest(POLYMARKET, "pm");
+        let out_ticket = books.begin_rest(OUTCOME, "out");
+        let (pm_book, out_book) = accept_confirmation_books(
+            &mut books,
+            &pm_ticket,
+            (
+                vec![],
+                levels(&[("0.40", "100")]),
+                101,
+                now,
+                Some(d("0.01")),
+            ),
+            &out_ticket,
+            (vec![], levels(&[("0.40", "200")]), 101, now),
+            Duration::from_secs(5),
+            now,
+        )
+        .unwrap();
+        let confirmed = confirm_plan(&topic, &first, &pm_book, &out_book, &fees, &limits).unwrap();
+        assert_eq!(confirmed.pm.shares, first.pm.shares);
+        assert_eq!(confirmed.pm.cap_price, first.pm.cap_price);
+        assert_eq!(confirmed.pm_required(), Some(d("40")));
+        assert!(!confirmed.pm_balance_sufficient(d("39.70")));
+        assert!(confirmed.pm_balance_sufficient(d("40")));
+        assert!(confirmed.outcome_balance_sufficient(d("40")));
+    }
+
+    #[test]
+    fn automatic_pm_submission_requires_accepted_tick_and_unchanged_cap() {
+        let mut req = MarketOrderRequest {
+            token_id: "pm".into(),
+            shares: d("10"),
+            cap_price: d("0.451"),
+            side: OrderSide::Buy,
+            neg_risk: None,
+            tick_size: None,
+            asset_id: None,
+            funder_address: None,
+        };
+        assert!(validate_pm_request_tick(&req).is_err());
+        for tick in ["0", "-0.01", "1.1", "0.01"] {
+            req.tick_size = Some(d(tick));
+            assert!(validate_pm_request_tick(&req).is_err());
+        }
+        req.tick_size = Some(d("0.001"));
+        assert!(validate_pm_request_tick(&req).is_ok());
+        req.side = OrderSide::Sell;
+        assert!(validate_pm_request_tick(&req).is_ok());
+        req.tick_size = Some(d("0.01"));
+        assert!(validate_pm_request_tick(&req).is_err());
+    }
+
+    #[test]
+    fn hard_http_confirmation_carries_single_rest_tick() {
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        let pm = books.begin_rest(POLYMARKET, "pm");
+        let out = books.begin_rest(OUTCOME, "out");
+        let (pm_book, _) = accept_confirmation_books(
+            &mut books,
+            &pm,
+            (vec![], vec![], 100, now, Some(d("0.001"))),
+            &out,
+            (vec![], vec![], 100, now),
+            Duration::from_secs(5),
+            now,
+        )
+        .unwrap();
+        assert_eq!(pm_book.tick_size, Some(d("0.001")));
+        assert_eq!(books.tick_size(POLYMARKET, "pm"), Some(d("0.001")));
+    }
+
+    #[test]
     fn hard_http_confirmation_rejects_conflict_without_ws_fallback_then_recovers() {
         let now = Instant::now();
         let level = || {
@@ -2812,7 +2983,7 @@ mod tests {
                 assert!(accept_confirmation_books(
                     &mut books,
                     &pm,
-                    (vec![], level(), 100, now),
+                    (vec![], level(), 100, now, None),
                     &out,
                     (vec![], level(), 100, now),
                     Duration::from_secs(5),
@@ -2833,7 +3004,7 @@ mod tests {
             assert!(accept_confirmation_books(
                 &mut books,
                 &pm,
-                (vec![], level(), 100, now),
+                (vec![], level(), 100, now, None),
                 &out,
                 (vec![], level(), 100, now),
                 Duration::from_secs(5),
@@ -2871,7 +3042,7 @@ mod tests {
             assert!(accept_confirmation_books(
                 &mut books,
                 &pm,
-                (vec![], level(), 101, now),
+                (vec![], level(), 101, now, None),
                 &out,
                 (vec![], level(), 101, now),
                 Duration::from_secs(5),

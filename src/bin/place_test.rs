@@ -147,7 +147,10 @@ async fn run_job(
         let venue = pm.ok_or_else(|| Error::msg("polymarket venue not connected"))?;
         let funder = resolve_pm_funder(venue, args.funder.as_deref()).await?;
         print_venue_book(
-            venue.rest_book(&job.token_id).await,
+            venue
+                .rest_book(&job.token_id)
+                .await
+                .map(|book| (book.bids, book.asks, book.exchange_ts_ms)),
             POLYMARKET,
             job,
             args.shares,

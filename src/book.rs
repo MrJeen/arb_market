@@ -122,8 +122,16 @@ pub struct RestTicket {
     pub revision: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TickObservation {
+    value: Decimal,
+    exchange_ts_ms: Option<i64>,
+    trusted: bool,
+}
+
 #[derive(Debug, Default)]
 struct SyncState {
+    tick: Option<TickObservation>,
     revision: u64,
     ws_epoch: Option<u64>,
     // 候选失效后仍保留最后全量高水位，防止断线或删除后旧档复活。
@@ -182,6 +190,15 @@ impl BookStore {
         asks: &[Level],
         ts: i64,
     ) -> Result<(), BookReject> {
+        if self
+            .sync
+            .get(key)
+            .and_then(|state| state.tick)
+            .and_then(|tick| tick.exchange_ts_ms)
+            .is_some_and(|high| ts < high)
+        {
+            return Err(BookReject::OlderTimestamp);
+        }
         for prior in self
             .books
             .get(key)
@@ -202,31 +219,46 @@ impl BookStore {
         &mut self,
         platform: &str,
         token_id: &str,
+        bids: Vec<Level>,
+        asks: Vec<Level>,
+        exchange_ts_ms: i64,
+        now: Instant,
+    ) -> BookUpdate {
+        self.replace_snapshot_with_tick(platform, token_id, bids, asks, exchange_ts_ms, now, None)
+    }
+
+    pub fn replace_snapshot_with_tick(
+        &mut self,
+        platform: &str,
+        token_id: &str,
         mut bids: Vec<Level>,
         mut asks: Vec<Level>,
         exchange_ts_ms: i64,
         now: Instant,
+        tick: Option<Decimal>,
     ) -> BookUpdate {
         let key = TokenBookKey::new(platform, token_id);
         if token_id.is_empty()
             || exchange_ts_ms <= 0
             || !valid_levels(&bids)
             || !valid_levels(&asks)
+            || tick.is_some_and(|value| value <= Decimal::ZERO || value > Decimal::ONE)
         {
             return self.invalidate_ws(platform, token_id, BookReject::InvalidPayload);
         }
         sort_levels(&mut bids, &mut asks);
         if let Err(reason) = self.snapshot_conflict(&key, &bids, &asks, exchange_ts_ms) {
-            // 同毫秒不同内容无法证明哪本完整；保留删除但撤销 WS 完整性。
-            // REST CAS 拒绝不走此入口，不能损坏正常 WS。
+            // 盘口与 tick 均预检完才提交；坏快照不能借携带的新 tick 改写观察高水位。
             if reason == BookReject::TimestampConflict {
                 return self.invalidate_ws(platform, token_id, reason);
             }
             return BookUpdate::Rejected(reason);
         }
-        let old = self.books.get(&key);
         let epoch = self.epochs.get(platform).copied().unwrap_or(0);
-        if old.is_some_and(|book| book.stale && book.exchange_ts_ms == exchange_ts_ms)
+        if self
+            .books
+            .get(&key)
+            .is_some_and(|book| book.stale && book.exchange_ts_ms == exchange_ts_ms)
             && self
                 .sync
                 .get(&key)
@@ -234,15 +266,32 @@ impl BookStore {
         {
             return BookUpdate::Rejected(BookReject::TimestampConflict);
         }
-        if old.is_some_and(|book| !book.stale && book.bids == bids && book.asks == asks) {
-            if old.unwrap().exchange_ts_ms != exchange_ts_ms {
-                self.books.get_mut(&key).unwrap().exchange_ts_ms = exchange_ts_ms;
+        let tick_changed = match self.check_snapshot_tick(&key, tick, exchange_ts_ms) {
+            Ok(changed) => changed,
+            Err(reason) => return BookUpdate::Rejected(reason),
+        };
+        let unchanged = self
+            .books
+            .get(&key)
+            .is_some_and(|book| !book.stale && book.bids == bids && book.asks == asks);
+        let restored = self.books.get(&key).is_none_or(|book| book.stale);
+        if tick_changed {
+            self.commit_tick(&key, tick.unwrap(), Some(exchange_ts_ms));
+        }
+        if unchanged {
+            let book = self.books.get_mut(&key).unwrap();
+            let advanced = book.exchange_ts_ms != exchange_ts_ms;
+            book.exchange_ts_ms = exchange_ts_ms;
+            if advanced || tick_changed {
                 self.changed(&key);
             }
-            return BookUpdate::VerifiedUnchanged;
+            return if tick_changed {
+                BookUpdate::Applied
+            } else {
+                BookUpdate::VerifiedUnchanged
+            };
         }
-        let restored = old.is_none_or(|book| book.stale);
-        let tick_size = self.get(platform, token_id).and_then(|book| book.tick_size);
+        let tick_size = self.tick_size(platform, token_id);
         self.books.insert(
             key.clone(),
             OrderBook {
@@ -298,6 +347,12 @@ impl BookStore {
             .into_iter()
             .chain(self.sync.get(&key).and_then(|state| state.rest.as_ref()))
             .map(|book| book.exchange_ts_ms)
+            .chain(
+                self.sync
+                    .get(&key)
+                    .and_then(|state| state.tick)
+                    .and_then(|tick| tick.exchange_ts_ms),
+            )
             .max()
             .unwrap_or(0);
         if exchange_ts_ms < high {
@@ -355,24 +410,178 @@ impl BookStore {
         }
     }
 
-    pub fn set_tick_size(
+    pub fn tick_size(&self, platform: &str, token_id: &str) -> Option<Decimal> {
+        self.sync
+            .get(&TokenBookKey::new(platform, token_id))
+            .and_then(|state| state.tick)
+            .filter(|tick| tick.trusted)
+            .map(|tick| tick.value)
+    }
+
+    /// 无时间戳 REST 只初始化从未观察过的 tick；失效票据不能填补冲突。
+    pub fn seed_tick_size(&mut self, ticket: &RestTicket, tick: Decimal) -> Option<Decimal> {
+        let current = self.begin_rest(&ticket.key.platform, &ticket.key.token_id);
+        let accepted = self.tick_size(&ticket.key.platform, &ticket.key.token_id);
+        if accepted.is_some() {
+            return accepted;
+        }
+        if current.epoch != ticket.epoch
+            || current.revision != ticket.revision
+            || self
+                .sync
+                .get(&ticket.key)
+                .is_some_and(|state| state.tick.is_some())
+            || ticket.key.token_id.is_empty()
+            || tick <= Decimal::ZERO
+            || tick > Decimal::ONE
+        {
+            tracing::debug!(platform = %ticket.key.platform, token = %ticket.key.token_id,
+                epoch = current.epoch, revision = current.revision,
+                reason = "ticket changed, tick already observed or invalid seed", "tick seed rejected");
+            return None;
+        }
+        self.commit_tick(&ticket.key, tick, None);
+        self.changed(&ticket.key);
+        Some(tick)
+    }
+
+    fn check_tick(&self, key: &TokenBookKey, tick: Decimal, ts: i64) -> Result<bool, BookReject> {
+        if key.token_id.is_empty() || ts <= 0 || tick <= Decimal::ZERO || tick > Decimal::ONE {
+            return Err(BookReject::InvalidPayload);
+        }
+        let high = self
+            .books
+            .get(key)
+            .into_iter()
+            .chain(self.sync.get(key).and_then(|state| state.rest.as_ref()))
+            .map(|book| book.exchange_ts_ms)
+            .max()
+            .unwrap_or(0);
+        let prior = self.sync.get(key).and_then(|state| state.tick);
+        if ts < high
+            || prior
+                .and_then(|tick| tick.exchange_ts_ms)
+                .is_some_and(|high| ts < high)
+        {
+            return Err(BookReject::OlderTimestamp);
+        }
+        if let Some(prior) = prior {
+            if prior.exchange_ts_ms == Some(ts) {
+                return if prior.trusted && prior.value == tick {
+                    Ok(false)
+                } else {
+                    Err(BookReject::TimestampConflict)
+                };
+            }
+        }
+        Ok(true)
+    }
+
+    fn check_snapshot_tick(
+        &mut self,
+        key: &TokenBookKey,
+        tick: Option<Decimal>,
+        ts: i64,
+    ) -> Result<bool, BookReject> {
+        let Some(tick) = tick else {
+            return Ok(false);
+        };
+        let result = self.check_tick(key, tick, ts);
+        if result == Err(BookReject::TimestampConflict) {
+            self.conflict_tick(key);
+        }
+        result
+    }
+
+    fn sync_tick_views(&mut self, key: &TokenBookKey) {
+        let tick = self.tick_size(&key.platform, &key.token_id);
+        if let Some(book) = self.books.get_mut(key) {
+            book.tick_size = tick;
+        }
+        if let Some(book) = self.sync.get_mut(key).and_then(|state| state.rest.as_mut()) {
+            book.tick_size = tick;
+        }
+    }
+
+    fn conflict_tick(&mut self, key: &TokenBookKey) {
+        let Some(tick) = self.sync.get_mut(key).and_then(|state| state.tick.as_mut()) else {
+            return;
+        };
+        if !tick.trusted {
+            return;
+        }
+        tick.trusted = false;
+        let ts = tick.exchange_ts_ms;
+        self.sync_tick_views(key);
+        self.changed(key);
+        let current = self.begin_rest(&key.platform, &key.token_id);
+        tracing::warn!(platform = %key.platform, token = %key.token_id, timestamp = ?ts,
+            epoch = current.epoch, revision = current.revision,
+            reason = "same timestamp has conflicting tick values", "tick trust lost");
+    }
+
+    fn commit_tick(&mut self, key: &TokenBookKey, value: Decimal, exchange_ts_ms: Option<i64>) {
+        let state = self.sync.entry(key.clone()).or_default();
+        let recovered = state.tick.is_some_and(|tick| !tick.trusted);
+        state.tick = Some(TickObservation {
+            value,
+            exchange_ts_ms,
+            trusted: true,
+        });
+        // tick-only 观察保留一个 stale WS 壳，但不提供完整盘口，也不刷新 TTL。
+        self.books
+            .entry(key.clone())
+            .or_insert_with(|| OrderBook::empty(&key.platform, &key.token_id));
+        self.sync_tick_views(key);
+        if recovered {
+            let current = self.begin_rest(&key.platform, &key.token_id);
+            tracing::info!(platform = %key.platform, token = %key.token_id, timestamp = ?exchange_ts_ms,
+                epoch = current.epoch, revision = current.revision + 1, "tick trust restored");
+        }
+    }
+
+    pub fn set_tick_size_at(
         &mut self,
         platform: &str,
         token_id: &str,
-        tick_size: Decimal,
+        tick: Decimal,
+        ts: i64,
     ) -> BookUpdate {
-        if tick_size <= Decimal::ZERO || tick_size > Decimal::ONE {
+        let key = TokenBookKey::new(platform, token_id);
+        match self.check_snapshot_tick(&key, Some(tick), ts) {
+            Ok(true) => {
+                self.commit_tick(&key, tick, Some(ts));
+                self.changed(&key);
+                BookUpdate::Applied
+            }
+            Ok(false) => BookUpdate::VerifiedUnchanged,
+            Err(reason) => {
+                let current = self.begin_rest(platform, token_id);
+                tracing::debug!(
+                    platform,
+                    token = token_id,
+                    timestamp = ts,
+                    ?reason,
+                    epoch = current.epoch,
+                    revision = current.revision,
+                    "tick observation rejected"
+                );
+                BookUpdate::Rejected(reason)
+            }
+        }
+    }
+
+    /// 仅测试夹具使用；生产无时间戳初始化必须持有 REST 票据。
+    #[cfg(test)]
+    pub fn set_tick_size(&mut self, platform: &str, token_id: &str, tick: Decimal) -> BookUpdate {
+        if tick <= Decimal::ZERO || tick > Decimal::ONE {
             return BookUpdate::Rejected(BookReject::InvalidPayload);
         }
-        let key = TokenBookKey::new(platform, token_id);
-        let book = self
-            .books
-            .entry(key.clone())
-            .or_insert_with(|| OrderBook::empty(platform, token_id));
-        if book.tick_size == Some(tick_size) {
+        if self.tick_size(platform, token_id) == Some(tick) {
             return BookUpdate::VerifiedUnchanged;
         }
-        book.tick_size = Some(tick_size);
+        let key = TokenBookKey::new(platform, token_id);
+        self.commit_tick(&key, tick, None);
         self.changed(&key);
         BookUpdate::Applied
     }
@@ -449,10 +658,11 @@ impl BookStore {
             }
             sort_levels(&mut bids, &mut asks);
             self.snapshot_conflict(&ticket.key, &bids, &asks, exchange_ts_ms)?;
-            let tick_size = tick.or_else(|| {
-                self.get(&ticket.key.platform, &ticket.key.token_id)
-                    .and_then(|b| b.tick_size)
-            });
+            let tick_changed = self.check_snapshot_tick(&ticket.key, tick, exchange_ts_ms)?;
+            if tick_changed {
+                self.commit_tick(&ticket.key, tick.unwrap(), Some(exchange_ts_ms));
+            }
+            let tick_size = self.tick_size(&ticket.key.platform, &ticket.key.token_id);
             let book = OrderBook {
                 platform: ticket.key.platform.clone(),
                 token_id: ticket.key.token_id.clone(),
@@ -463,11 +673,6 @@ impl BookStore {
                 stale: false,
                 tick_size,
             };
-            if let Some(tick) = tick {
-                if let Some(ws) = self.books.get_mut(&ticket.key) {
-                    ws.tick_size = Some(tick);
-                }
-            }
             self.changed(&ticket.key);
             let state = self.sync.get_mut(&ticket.key).unwrap();
             state.rest = Some(book.clone());
@@ -775,6 +980,299 @@ mod tests {
             price: d("0.5"),
             size: d(size),
         }]
+    }
+
+    #[test]
+    fn tick_high_water_survives_disconnect_and_rejects_older_snapshots() {
+        for disconnected in [false, true] {
+            let now = Instant::now();
+            let mut store = BookStore::default();
+            store.replace_snapshot(POLYMARKET, "t", vec![], asks("3"), 100, now);
+            assert!(store
+                .set_tick_size_at(POLYMARKET, "t", d("0.001"), 200)
+                .is_applied());
+            if disconnected {
+                store.mark_platform_stale(POLYMARKET);
+            }
+            for tick in [None, Some(d("0.01"))] {
+                let ticket = store.begin_rest(POLYMARKET, "t");
+                assert_eq!(
+                    store
+                        .accept_rest(&ticket, vec![], asks("4"), 150, now, tick)
+                        .unwrap_err(),
+                    BookReject::OlderTimestamp
+                );
+                assert_eq!(
+                    store.replace_snapshot_with_tick(
+                        POLYMARKET,
+                        "t",
+                        vec![],
+                        asks("4"),
+                        150,
+                        now,
+                        tick
+                    ),
+                    BookUpdate::Rejected(BookReject::OlderTimestamp)
+                );
+            }
+            assert_eq!(
+                store.set_tick_size_at(POLYMARKET, "t", d("0.01"), 150),
+                BookUpdate::Rejected(BookReject::OlderTimestamp)
+            );
+            assert_eq!(store.tick_size(POLYMARKET, "t"), Some(d("0.001")));
+            assert_eq!(store.get(POLYMARKET, "t").unwrap().exchange_ts_ms, 100);
+        }
+    }
+
+    #[test]
+    fn older_depth_after_tick_invalidates_ws_without_reverting_tick() {
+        let now = Instant::now();
+        let mut store = BookStore::default();
+        store.replace_snapshot(POLYMARKET, "t", vec![], asks("3"), 100, now);
+        store.set_tick_size_at(POLYMARKET, "t", d("0.001"), 200);
+        assert_eq!(
+            store.apply_levels(POLYMARKET, "t", &[(false, d("0.5"), d("4"))], 150, now),
+            BookUpdate::Rejected(BookReject::OlderTimestamp)
+        );
+        let book = store.get(POLYMARKET, "t").unwrap();
+        assert!(book.stale);
+        assert_eq!(book.asks, asks("3"));
+        assert_eq!(book.exchange_ts_ms, 100);
+        assert_eq!(book.tick_size, Some(d("0.001")));
+    }
+
+    #[test]
+    fn tick_observations_advance_revision_without_refreshing_or_completing_book() {
+        let now = Instant::now();
+        let mut store = BookStore::default();
+        store.replace_snapshot(POLYMARKET, "t", vec![], asks("3"), 100, now);
+        store.set_tick_size_at(POLYMARKET, "t", d("0.01"), 150);
+        let old = store.begin_rest(POLYMARKET, "t");
+        assert_eq!(
+            store.set_tick_size_at(POLYMARKET, "t", d("0.01"), 150),
+            BookUpdate::VerifiedUnchanged
+        );
+        assert_eq!(store.begin_rest(POLYMARKET, "t").revision, old.revision);
+        assert!(store
+            .set_tick_size_at(POLYMARKET, "t", d("0.01"), 200)
+            .is_applied());
+        assert_eq!(
+            store
+                .accept_rest(&old, vec![], asks("3"), 300, now, Some(d("0.001")))
+                .unwrap_err(),
+            BookReject::RevisionChanged
+        );
+        let later = now + Duration::from_secs(6);
+        let book = store.get_at(POLYMARKET, "t", later).unwrap();
+        assert_eq!(book.received_at, now);
+        assert_eq!(book.exchange_ts_ms, 100);
+        assert!(!book.is_fresh(Duration::from_secs(5), later));
+        store.mark_platform_stale(POLYMARKET);
+        store.set_tick_size_at(POLYMARKET, "t", d("0.001"), 300);
+        assert!(store.get(POLYMARKET, "t").unwrap().stale);
+    }
+
+    #[test]
+    fn tick_compares_retained_rest_high_water_even_when_ws_is_selected() {
+        let now = Instant::now();
+        let mut store = BookStore::default();
+        store.replace_snapshot(POLYMARKET, "t", vec![], asks("3"), 100, now);
+        let ticket = store.begin_rest(POLYMARKET, "t");
+        store
+            .accept_rest(&ticket, vec![], asks("4"), 300, now, None)
+            .unwrap();
+        assert_eq!(store.get(POLYMARKET, "t").unwrap().exchange_ts_ms, 100);
+        assert_eq!(
+            store.set_tick_size_at(POLYMARKET, "t", d("0.01"), 200),
+            BookUpdate::Rejected(BookReject::OlderTimestamp)
+        );
+        store.mark_platform_stale(POLYMARKET);
+        assert_eq!(
+            store.set_tick_size_at(POLYMARKET, "t", d("0.01"), 200),
+            BookUpdate::Rejected(BookReject::OlderTimestamp)
+        );
+    }
+
+    #[test]
+    fn tick_conflict_cannot_be_seeded_or_fixed_by_tickless_snapshot() {
+        let now = Instant::now();
+        let mut store = BookStore::default();
+        store.replace_snapshot(POLYMARKET, "t", vec![], asks("3"), 100, now);
+        store.set_tick_size_at(POLYMARKET, "t", d("0.01"), 200);
+        let prior = store.begin_rest(POLYMARKET, "t");
+        assert_eq!(
+            store.set_tick_size_at(POLYMARKET, "t", d("0.001"), 200),
+            BookUpdate::Rejected(BookReject::TimestampConflict)
+        );
+        assert!(store.begin_rest(POLYMARKET, "t").revision > prior.revision);
+        assert_eq!(store.tick_size(POLYMARKET, "t"), None);
+        assert_eq!(store.get(POLYMARKET, "t").unwrap().tick_size, None);
+        assert!(!store.get(POLYMARKET, "t").unwrap().stale);
+        let ticket = store.begin_rest(POLYMARKET, "t");
+        assert_eq!(store.seed_tick_size(&ticket, d("0.01")), None);
+        assert_eq!(
+            store.set_tick_size_at(POLYMARKET, "t", d("0.01"), 200),
+            BookUpdate::Rejected(BookReject::TimestampConflict)
+        );
+        let rest = store
+            .accept_rest(&ticket, vec![], asks("4"), 300, now, None)
+            .unwrap();
+        assert_eq!(rest.tick_size, None);
+        assert!(store
+            .replace_snapshot(POLYMARKET, "t", vec![], asks("5"), 301, now)
+            .is_applied());
+        assert_eq!(store.tick_size(POLYMARKET, "t"), None);
+        assert!(store
+            .set_tick_size_at(POLYMARKET, "t", d("0.001"), 302)
+            .is_applied());
+        assert_eq!(store.tick_size(POLYMARKET, "t"), Some(d("0.001")));
+        assert_eq!(
+            store.get(POLYMARKET, "t").unwrap().tick_size,
+            Some(d("0.001"))
+        );
+    }
+
+    #[test]
+    fn snapshot_tick_is_prechecked_before_any_commit() {
+        for rest in [false, true] {
+            let now = Instant::now();
+            let mut store = BookStore::default();
+            store.replace_snapshot_with_tick(
+                POLYMARKET,
+                "t",
+                vec![],
+                asks("3"),
+                100,
+                now,
+                Some(d("0.01")),
+            );
+            store.set_tick_size_at(POLYMARKET, "t", d("0.001"), 200);
+            let ticket = store.begin_rest(POLYMARKET, "t");
+            // 合法深度但同时间 tick 冲突：只撤销 tick 可信，不提交新盘口。
+            if rest {
+                assert_eq!(
+                    store
+                        .accept_rest(&ticket, vec![], asks("4"), 200, now, Some(d("0.01")))
+                        .unwrap_err(),
+                    BookReject::TimestampConflict
+                );
+            } else {
+                assert_eq!(
+                    store.replace_snapshot_with_tick(
+                        POLYMARKET,
+                        "t",
+                        vec![],
+                        asks("4"),
+                        200,
+                        now,
+                        Some(d("0.01"))
+                    ),
+                    BookUpdate::Rejected(BookReject::TimestampConflict)
+                );
+            }
+            let book = store.get(POLYMARKET, "t").unwrap();
+            assert_eq!(book.asks, asks("3"));
+            assert_eq!(book.exchange_ts_ms, 100);
+            assert_eq!(book.received_at, now);
+            assert!(!book.stale);
+            assert_eq!(book.tick_size, None);
+            let ticket = store.begin_rest(POLYMARKET, "t");
+            if rest {
+                store
+                    .accept_rest(&ticket, vec![], asks("4"), 201, now, Some(d("0.001")))
+                    .unwrap();
+            } else {
+                assert!(store
+                    .replace_snapshot_with_tick(
+                        POLYMARKET,
+                        "t",
+                        vec![],
+                        asks("4"),
+                        201,
+                        now,
+                        Some(d("0.001"))
+                    )
+                    .is_applied());
+            }
+            assert_eq!(store.tick_size(POLYMARKET, "t"), Some(d("0.001")));
+        }
+    }
+
+    #[test]
+    fn rejected_rest_and_bad_ws_payload_do_not_commit_tick() {
+        let now = Instant::now();
+        let mut store = BookStore::default();
+        store.replace_snapshot_with_tick(
+            POLYMARKET,
+            "t",
+            vec![],
+            asks("3"),
+            100,
+            now,
+            Some(d("0.01")),
+        );
+        let old = store.begin_rest(POLYMARKET, "t");
+        store.set_tick_size_at(POLYMARKET, "t", d("0.001"), 200);
+        let before = store.get(POLYMARKET, "t").unwrap().snapshot_json();
+        assert_eq!(
+            store
+                .accept_rest(&old, vec![], asks("3"), 200, now, Some(d("0.01")))
+                .unwrap_err(),
+            BookReject::RevisionChanged
+        );
+        let ticket = store.begin_rest(POLYMARKET, "t");
+        assert_eq!(
+            store
+                .accept_rest(&ticket, vec![], asks("-1"), 200, now, Some(d("0.01")))
+                .unwrap_err(),
+            BookReject::InvalidPayload
+        );
+        assert_eq!(store.get(POLYMARKET, "t").unwrap().snapshot_json(), before);
+        assert_eq!(store.begin_rest(POLYMARKET, "t").revision, ticket.revision);
+        assert_eq!(
+            store.replace_snapshot_with_tick(
+                POLYMARKET,
+                "t",
+                vec![],
+                asks("-1"),
+                300,
+                now,
+                Some(d("0.1"))
+            ),
+            BookUpdate::Rejected(BookReject::InvalidPayload)
+        );
+        assert_eq!(store.tick_size(POLYMARKET, "t"), Some(d("0.001")));
+        // 无效 300 观察没有推进 tick 高水位。
+        assert!(store
+            .set_tick_size_at(POLYMARKET, "t", d("0.01"), 201)
+            .is_applied());
+    }
+
+    #[test]
+    fn all_views_share_trusted_tick_and_seed_uses_ticket() {
+        let now = Instant::now();
+        let mut store = BookStore::default();
+        let seed = store.begin_rest(POLYMARKET, "t");
+        assert_eq!(store.seed_tick_size(&seed, d("0.01")), Some(d("0.01")));
+        store.replace_snapshot(POLYMARKET, "t", vec![], asks("3"), 100, now);
+        let later = now + Duration::from_secs(4);
+        let ticket = store.begin_rest(POLYMARKET, "t");
+        store
+            .accept_rest(&ticket, vec![], asks("4"), 200, later, Some(d("0.001")))
+            .unwrap();
+        for at in [now, now + Duration::from_secs(6)] {
+            assert_eq!(
+                store.get_at(POLYMARKET, "t", at).unwrap().tick_size,
+                Some(d("0.001"))
+            );
+        }
+        assert_eq!(store.seed_tick_size(&seed, d("0.1")), Some(d("0.001")));
+        let missing = store.begin_rest(POLYMARKET, "missing");
+        store.mark_platform_stale(POLYMARKET);
+        assert_eq!(store.seed_tick_size(&missing, d("0.01")), None);
+        let ticket = store.begin_rest(POLYMARKET, "missing");
+        store.replace_snapshot(POLYMARKET, "missing", vec![], asks("3"), 100, now);
+        assert_eq!(store.seed_tick_size(&ticket, d("0.01")), None);
     }
 
     #[test]

@@ -2443,6 +2443,9 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
+ "num-bigint",
+ "num-rational",
+ "num-traits",
  "rand 0.8.8",
  "reqwest",
  "rmp",
@@ -2576,6 +2579,17 @@ version = "0.1.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c92800bd69a1eac91786bcfe9da64a897eb72911b8dc3095decbd07429e8048b"
 dependencies = [
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
+name = "num-rational"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
+dependencies = [
+ "num-bigint",
  "num-integer",
  "num-traits",
 ]
