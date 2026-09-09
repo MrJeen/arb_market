@@ -109,7 +109,9 @@ impl Config {
             arb_min_apr: env_decimal("ARB_MIN_APR", "0")?,
             arb_cost_limit: env_decimal("ARB_COST_LIMIT", "100")?,
             min_rebalance_qty: env_decimal("MIN_REBALANCE_QTY", "1.5")?,
-            polymarket_fee_bps_prior: env_decimal("POLYMARKET_FEE_BPS_PRIOR", "700")?,
+            polymarket_fee_bps_prior: parse_polymarket_fee_bps(
+                env_opt("POLYMARKET_FEE_BPS_PRIOR").as_deref(),
+            )?,
             outcome_taker_fee_rate: env_decimal("OUTCOME_TAKER_FEE_RATE", "0.00035")?,
             pending_leg_timeout: Duration::from_secs(env_u64("PENDING_LEG_TIMEOUT_SECS", 300)),
             unknown_leg_timeout: Duration::from_secs(env_u64("UNKNOWN_LEG_TIMEOUT_SECS", 300)),
@@ -332,6 +334,16 @@ fn parse_nonnegative_decimal(key: &str, raw: Option<&str>, default: &str) -> Res
     Ok(value)
 }
 
+fn parse_polymarket_fee_bps(raw: Option<&str>) -> Result<Decimal> {
+    let value = parse_nonnegative_decimal("POLYMARKET_FEE_BPS_PRIOR", raw, "700")?;
+    if value > Decimal::from(10_000) {
+        return Err(Error::Config(
+            "POLYMARKET_FEE_BPS_PRIOR must not exceed 10000".into(),
+        ));
+    }
+    Ok(value)
+}
+
 fn env_decimal(key: &str, default: &str) -> Result<Decimal> {
     let text = env_opt(key).unwrap_or_else(|| default.to_string());
     Decimal::from_str(&text).map_err(|_| Error::Config(format!("invalid decimal {key}")))
@@ -353,6 +365,20 @@ mod tests {
                 .to_string()
                 .contains("must be non-negative")
         );
+    }
+
+    #[test]
+    fn validates_polymarket_fee_bps_boundaries() {
+        assert_eq!(parse_polymarket_fee_bps(None).unwrap(), Decimal::from(700));
+        for raw in ["0", "700", "10000"] {
+            assert_eq!(
+                parse_polymarket_fee_bps(Some(raw)).unwrap(),
+                Decimal::from_str(raw).unwrap()
+            );
+        }
+        for raw in ["-1", "10000.01", "bad", ""] {
+            assert!(parse_polymarket_fee_bps(Some(raw)).is_err());
+        }
     }
 
     #[test]

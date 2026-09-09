@@ -70,7 +70,9 @@ Outcome 历史覆盖采用初始探测、数据分页、最终覆盖验证三个
 
 `UNKNOWN_LEG_TIMEOUT_SECS` 同时覆盖 `unknown` 和确认中的 `actived`，按首次提交时间计时，已有部分成交或持续重试不会推迟告警。超时仅告警、暂停新套利并继续回填，不清零成交。等待 PM 链上确认也会延后父单完成和生命周期 claim 释放。
 
-**费用口径：** 明确提供金额且币种为 USDC（PM 也接受 pUSD）的费用按原值入账，包含显式 0；Outcome `fee` 已含 builderFee，不重复叠加。PM maker 的官方零费规则记录为 `calculated_maker_zero`。PM taker 未返回实扣金额时，查询 `/clob-markets/{condition_id}` 的 `fd.r`，按[官方费用公式](https://docs.polymarket.com/trading/fees) `shares × rate × price × (1-price)` 逐笔计算，不读取或使用指数参数，五位小数四舍五入，不乘策略 1.3 安全倍率，来源记录为 `calculated`。该政策明确假设所查 schedule 适用于该成交、pUSD 按 1 美元计价；计算金额不是交易所实扣证明。费率、查询时点及币种／舍入政策保存在成交证据中，`fills.fee` 没有实扣值时保持 NULL；重扫先批量合并本页同单已存成交，复用已确定快照，仅为真正缺少证据的成交查询费用接口，不用新费率覆盖旧快照；终态后不自动重新估费。缺少／畸形 schedule、非支持币种等仍保留 `fee_evidence_missing` 或查询错误并告警，不用缺字段推断零费。
+**费用口径：** 明确提供金额且币种为 USDC（PM 也接受 pUSD）的费用按原值入账，包含显式 0；Outcome `fee` 已含 builderFee，不重复叠加。PM maker 的官方零费规则记录为 `calculated_maker_zero`。PM taker 未返回实扣金额时，优先使用 COMMON 对应事件/index/condition/token 的 `feeSchedule.rate`，`feesEnabled=false` 明确为零；目录或费率缺失才回退 `POLYMARKET_FEE_BPS_PRIOR / 10000`（默认700bps，即系数0.07，并非成交本金统一收7%）。COMMON查询失败、畸形/越界费率、市场身份冲突不静默回退。费率按[官方费用公式](https://docs.polymarket.com/trading/fees) `shares × rate × price × (1-price)` 逐笔计算，不使用指数参数，五位小数四舍五入，不乘1.3安全倍率，费用来源仍记为 `calculated`。新费用快照不再请求 `/clob-markets`；已有 `clob-markets` 快照继续兼容并冻结。该政策假设本次读取的COMMON/default系数适用于待确认成交、pUSD按1美元计价，计算金额不是实扣证明。
+
+PM成交接口的 `fee_rate_bps` 仅留在原始JSON，不作为规范化输入，也不会因其缺失或畸形拒绝整页；实际费用金额、身份、数量和价格仍严格校验。新 `fills.fee_rate_bps` 表示从已选费用快照派生的bps（rate×10000），不声称是平台报告值；无实际费的maker记0。有效实际费用不依赖COMMON补可选费率，无法从已有来源恢复bps时允许NULL。快照保存 `source=common/env`、比例rate、bps、市场身份、选取时点及env回退原因；计算金额保存在 `raw.accounting`，`fills.fee` 没有实扣时仍为NULL。重扫先批量合并已存证据，只有真正缺费用快照才查来源，一页共享一次选择；事务内再次合并冻结快照和bps，不用新费率改旧账。已有实扣但币种不支持仍等待；历史终态不自动重开、重算，旧NULL/0不批量回填。
 
 ## 市场与结算口径
 

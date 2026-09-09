@@ -1765,9 +1765,9 @@ fn parse_trade_fill(item: &Value, maker: Option<&Value>) -> Result<TradeFill> {
             FillFinality::Pending
         }
     };
-    // maker 的费率/实收费用必须来自子订单；不得套用 taker 金额或猜测为零。
+    // maker 的实收费用必须来自子订单；不得套用 taker 金额或猜测为零。
     let fee = optional_trade_decimal(record, &["fee_amount", "fee"])?;
-    let fee_rate_bps = optional_trade_decimal(record, &["fee_rate_bps"])?;
+    // 接口 fee_rate_bps 语义不可靠，仅保留在 raw；规范化费率由已验证快照恢复。
     let mut fee_token = None;
     for field in ["fee_token", "feeToken", "fee_currency", "feeCurrency"] {
         if record.get(field).is_some_and(|value| !value.is_null()) {
@@ -1795,7 +1795,7 @@ fn parse_trade_fill(item: &Value, maker: Option<&Value>) -> Result<TradeFill> {
         shares,
         price,
         fee,
-        fee_rate_bps,
+        fee_rate_bps: None,
         fee_token,
         finality,
         raw,
@@ -3212,7 +3212,8 @@ pub(crate) mod tests {
         assert_eq!(fills[2].raw["outcome"], "No");
         assert!(fills[2].raw.get("side").is_none());
         assert_eq!(fills[2].fee, None);
-        assert_eq!(fills[2].fee_rate_bps, Some(d("700")));
+        assert!(fills.iter().all(|fill| fill.fee_rate_bps.is_none()));
+        assert_eq!(fills[2].raw["fee_rate_bps"], "700");
         assert_eq!(fills[2].fee_token, None);
         assert_eq!(fills[2].raw["taker_trade"], trade);
         assert_eq!(fills[2].raw["maker_order"], trade["maker_orders"][1]);
@@ -3220,6 +3221,53 @@ pub(crate) mod tests {
             assert_eq!(fill.trade_id, "t1");
             assert_eq!(fill.order_ids.len(), 1);
             assert_eq!(fill.finality, FillFinality::Confirmed);
+        }
+    }
+
+    #[test]
+    fn parse_trades_ignores_untrusted_fee_rates_but_preserves_raw() {
+        for value in [
+            json!("broken"),
+            json!("-1"),
+            json!("700"),
+            json!(true),
+            json!({"rate": 700}),
+            json!([700]),
+            Value::Null,
+        ] {
+            let mut trade = trade_fixture("untrusted-rate");
+            trade["fee_rate_bps"] = value.clone();
+            trade["maker_orders"] = json!([{
+                "order_id": "maker-1", "asset_id": "yes",
+                "matched_amount": "5", "price": "0.4", "fee_rate_bps": value
+            }]);
+            let fills = parse_trades(&json!([trade])).unwrap();
+            assert_eq!(fills.len(), 2);
+            for fill in fills {
+                assert_eq!(fill.fee_rate_bps, None);
+                assert_eq!(fill.fee, None);
+                assert_eq!(fill.raw["fee_rate_bps"], value);
+                if fill.raw["role"] == "maker" {
+                    assert_eq!(fill.raw["maker_order"]["fee_rate_bps"], value);
+                }
+            }
+        }
+        for (field, value) in [
+            ("order_id", json!("")),
+            ("asset_id", json!(null)),
+            ("matched_amount", json!("broken")),
+            ("price", json!("1.1")),
+            ("fee_amount", json!("broken")),
+            ("fee", json!("-1")),
+            ("fee_token", json!(false)),
+        ] {
+            let mut trade = trade_fixture("invalid-maker");
+            trade["maker_orders"] = json!([{
+                "order_id": "maker-1", "asset_id": "yes", "matched_amount": "5",
+                "price": "0.4", "fee_rate_bps": "broken"
+            }]);
+            trade["maker_orders"][0][field] = value;
+            assert!(parse_trades(&json!([trade])).is_err(), "{field}");
         }
     }
 
@@ -3245,8 +3293,9 @@ pub(crate) mod tests {
             ("size", json!("0")),
             ("price", json!("1.1")),
             ("price", json!("-1")),
-            ("fee_rate_bps", json!("broken")),
             ("fee_amount", json!("broken")),
+            ("fee_amount", json!("-1")),
+            ("fee", json!("broken")),
             ("fee_token", json!(5)),
             ("maker_orders", Value::Null),
         ] {

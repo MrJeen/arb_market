@@ -1002,6 +1002,79 @@ impl Engine {
         self.apply_fill_page(&current, poll, page).await
     }
 
+    async fn pm_reconciliation_fee_snapshot(&self, leg: &crate::store::LegRow) -> Result<Value> {
+        let started = Instant::now();
+        let result: Result<Value> = async {
+            let identities = self.store.market_identities_for_order(leg.order_id).await?;
+            let condition_id = identities.require(POLYMARKET)?;
+            let key = self.store.order_topic_key(leg.order_id).await?;
+            let topic = self.topics.read().await.get(&key).cloned();
+            let rate = if let Some(topic) = topic {
+                let tokens: Vec<_> = topic
+                    .tokens
+                    .iter()
+                    .filter(|token| token.platform == POLYMARKET && token.token_id == leg.token_id)
+                    .collect();
+                if tokens.len() != 1
+                    || !tokens[0]
+                        .condition_id
+                        .as_deref()
+                        .is_some_and(|id| id.eq_ignore_ascii_case(condition_id))
+                {
+                    return Err(Error::msg("cached COMMON polymarket fee identity mismatch"));
+                }
+                let token = tokens[0];
+                if token.fees_enabled == Some(false) {
+                    Some(Decimal::ZERO)
+                } else {
+                    token
+                        .fee_rate
+                        .map(crate::discovery::validate_pm_fee_rate)
+                        .transpose()?
+                }
+            } else {
+                crate::discovery::load_pm_fee_rate(&self.common, key, condition_id, &leg.token_id)
+                    .await?
+            };
+            let (rate, source) = match rate {
+                Some(rate) => (rate, "common"),
+                None => (
+                    self.cfg.polymarket_fee_bps_prior / Decimal::from(10_000),
+                    "env",
+                ),
+            };
+            crate::discovery::validate_pm_fee_rate(rate)?;
+            let bps = rate * Decimal::from(10_000);
+            let mut snapshot = json!({
+                "version": 1, "source": source, "rate": rate.to_string(), "bps": bps.to_string(),
+                "event_id": key.event_id, "unified_index": key.unified_index,
+                "condition_id": condition_id, "token_id": leg.token_id,
+                "fetched_at_ms": chrono::Utc::now().timestamp_millis(),
+                "fee_currency": "USD", "rounding": "five_decimal_half_up"
+            });
+            if source == "env" {
+                snapshot["config_key"] = json!("POLYMARKET_FEE_BPS_PRIOR");
+                snapshot["fallback_reason"] = json!("catalog_or_fee_missing");
+            }
+            tracing::debug!(
+                order_id = leg.order_id, leg_id = leg.id, %condition_id,
+                token_id = %leg.token_id, %rate, %bps, source,
+                fallback_reason = ?snapshot.get("fallback_reason").and_then(|value| value.as_str()),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "polymarket reconciliation fee source selected"
+            );
+            Ok(snapshot)
+        }
+        .await;
+        if let Err(err) = &result {
+            tracing::warn!(service = "common", operation = "reconciliation_fee",
+                order_id = leg.order_id, leg_id = leg.id, token_id = %leg.token_id,
+                elapsed_ms = started.elapsed().as_millis() as u64, error = %err,
+                "polymarket reconciliation fee source unavailable");
+        }
+        result
+    }
+
     async fn apply_fill_page(
         &self,
         leg: &crate::store::LegRow,
@@ -1010,7 +1083,10 @@ impl Engine {
     ) -> Result<()> {
         let trades_only = leg.platform == POLYMARKET && !poll.found;
         let started = Instant::now();
-        let resolution = apply_reconciliation_page(&self.pm, &self.store, leg, poll, page).await?;
+        let resolution = apply_reconciliation_page(&self.store, leg, poll, page, || {
+            self.pm_reconciliation_fee_snapshot(leg)
+        })
+        .await?;
         match resolution {
             LegResolution::Pending(reason) => tracing::debug!(
                 platform=%leg.platform,leg_id=leg.id,order_id=leg.order_id,reason,
@@ -2599,13 +2675,17 @@ pub fn book_recv_skew_ok(a: Instant, b: Instant, max: Duration) -> bool {
     book_recv_skew(a, b) <= max
 }
 
-async fn apply_reconciliation_page(
-    pm: &PolymarketVenue,
+async fn apply_reconciliation_page<F, Fut>(
     store: &Store,
     leg: &crate::store::LegRow,
     poll: OrderPoll,
     page: FillPage,
-) -> Result<LegResolution> {
+    fee_snapshot: F,
+) -> Result<LegResolution>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Value>>,
+{
     let mut matched: Vec<TradeFill> = filter_trades(&page.fills, poll.order_id.as_deref(), None)
         .into_iter()
         .cloned()
@@ -2632,15 +2712,18 @@ async fn apply_reconciliation_page(
         matched = merge_page_observations(&matched, stored)?;
     }
     if leg.platform == POLYMARKET && matched.iter().any(needs_pm_fee_snapshot) {
-        let identities = store.market_identities_for_order(leg.order_id).await?;
-        let market_id = identities.require(POLYMARKET)?;
-        // HTTP 不持锁，仅真正缺少可靠证据者才需要新快照，最终仍锁内重新合并。
-        let schedule = pm.fee_schedule(market_id).await?;
+        // 仅真正缺少可靠证据者才读取来源；同页共享，IO不持锁，事务内仍重新合并。
+        let schedule = fee_snapshot().await?;
         for fill in matched
             .iter_mut()
             .filter(|fill| needs_pm_fee_snapshot(fill))
         {
             fill.raw["fee_calculation"] = schedule.clone();
+        }
+    }
+    if leg.platform == POLYMARKET {
+        for fill in &mut matched {
+            crate::reconcile::restore_pm_fee_rate(fill)?;
         }
     }
     let expected_shares = leg
@@ -3785,7 +3868,9 @@ mod tests {
                 assert_eq!(current.submitted_at, leg.submitted_at);
                 assert_eq!(current.third_order_id.as_deref(), Some(oid.as_str()));
                 assert!(
-                    matches!(apply_reconciliation_page(&pm, &store, &current, poll, page).await?,
+                    matches!(apply_reconciliation_page(&store, &current, poll, page, || async {
+                        panic!("actual fee must not load a fee source")
+                    }).await?,
                     LegResolution::Terminal { status:"matched", shares, .. } if shares == d("6"))
                 );
             }
@@ -3803,7 +3888,119 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
-    async fn pm_fee_recovery_uses_persisted_observations_before_http() {
+    async fn pm_fee_source_common_env_cache_and_errors() {
+        use crate::platforms::polymarket::tests::execution_test_venue;
+        use sqlx::postgres::PgPoolOptions;
+        let uri = std::env::var("APP_POSTGRES_URI").expect("requires a test database");
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&uri)
+            .await
+            .unwrap();
+        let schema = format!("pm_fee_source_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let path = schema.clone();
+        let exercised: anyhow::Result<()> = async {
+            let pool = PgPoolOptions::new().max_connections(2).after_connect(move |conn, _| {
+                let path = path.clone();
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('search_path', $1, false)").bind(path).execute(conn).await?;
+                    Ok(())
+                })
+            }).connect(&uri).await?;
+            let store = Store { pool: pool.clone() };
+            store.migrate().await?;
+            sqlx::query("CREATE TABLE events (id UUID PRIMARY KEY, unified_options JSONB)").execute(&pool).await?;
+            let key = TopicKey::new(uuid::Uuid::new_v4(), 7);
+            let identity = MarketIdentity::new(POLYMARKET, "test-condition")?;
+            let (_, ids) = store.insert_actived_order_with_legs(
+                key, &identity, "fee source", "fee source", None,
+                d("10"), d("1"), d("9"), &json!([]), &[NewLeg {
+                    platform: POLYMARKET, token_id: "yes", label: "yes", side: "BUY", intent: "arb_buy",
+                    funder: Some("test-funder"), wallet: None, service: None,
+                    req_price: d("0.5"), req_shares: d("10"), req_fee: Decimal::ZERO, client_order_id: None,
+                }], 0, Instant::now() + Duration::from_secs(30)
+            ).await?;
+            let leg = store.open_legs().await?.into_iter().find(|leg| leg.id == ids[0]).unwrap();
+            // 地址不监听：费率来源不能意外依赖 PM HTTP。
+            let base = "http://127.0.0.1:1";
+            let mut cfg = admission_test_config(base);
+            cfg.polymarket_fee_bps_prior = d("700");
+            let outcome = OutcomeVenue::connect(&cfg)?;
+            let (pm, _) = execution_test_venue(base.into()).await;
+            let (pm_sub_tx, _) = mpsc::channel(1);
+            let (out_sub_tx, _) = mpsc::channel(1);
+            let engine = Engine {
+                cfg, store, common: pool.clone(),
+                books: Arc::new(Mutex::new(BookStore::default())),
+                dirty: Arc::new(Mutex::new(DirtyCoalescer::default())),
+                topics: Arc::new(RwLock::new(HashMap::new())), pm, outcome,
+                pm_sub_tx, out_sub_tx, notify: None, stats: Arc::new(MinuteStats::new()),
+                position_scan_cursor: Mutex::new(0), settlement_scan_cursor: Mutex::new(0),
+                last_settlement_sweep: Mutex::new(None), reported_stale_unknown: Mutex::new(HashSet::new()),
+            };
+            let missing = engine.pm_reconciliation_fee_snapshot(&leg).await?;
+            assert_eq!(missing["source"], "env");
+            assert_eq!(crate::platforms::parse_decimal(&missing["bps"]), Some(d("700")));
+            let catalog = |rate: Value, enabled: bool| json!([{"index":7,"platformOptions":[{
+                "platform":"polymarket","conditionId":"test-condition","feesEnabled":enabled,
+                "feeSchedule":{"rate":rate},"outcomes":[{"tokenId":"yes"}]
+            }]}]);
+            for (rate, enabled, source, expected) in [
+                (json!("0.05"), true, "common", d("500")),
+                (Value::Null, true, "env", d("700")),
+                (json!("bad"), false, "common", Decimal::ZERO),
+                (json!("0"), true, "common", Decimal::ZERO),
+            ] {
+                sqlx::query("INSERT INTO events VALUES($1,$2) ON CONFLICT(id) DO UPDATE SET unified_options=EXCLUDED.unified_options")
+                    .bind(key.event_id).bind(catalog(rate, enabled)).execute(&pool).await?;
+                let snapshot = engine.pm_reconciliation_fee_snapshot(&leg).await?;
+                assert_eq!(snapshot["source"], source);
+                assert_eq!(crate::platforms::parse_decimal(&snapshot["bps"]), Some(expected));
+                assert_eq!(snapshot["condition_id"], "test-condition");
+                assert_eq!(snapshot["token_id"], "yes");
+            }
+            for raw in [catalog(json!("bad"), true), catalog(json!("1.01"), true),
+                json!([{"index":7,"platformOptions":[{"platform":"polymarket","conditionId":"wrong"}]}])] {
+                sqlx::query("UPDATE events SET unified_options=$1").bind(raw).execute(&pool).await?;
+                assert!(engine.pm_reconciliation_fee_snapshot(&leg).await.is_err());
+            }
+            sqlx::query("DROP TABLE events").execute(&pool).await?;
+            assert!(engine.pm_reconciliation_fee_snapshot(&leg).await.is_err());
+            let topic = Topic {
+                key, title: String::new(), market_title: String::new(), end_date: None,
+                tokens: vec![crate::domain::TokenRef {
+                    platform: POLYMARKET.into(), token_id: "yes".into(), label: "yes".into(),
+                    option_id: "market".into(), condition_id: Some("test-condition".into()),
+                    asset_id: None, side_index: None, neg_risk: Some(false),
+                    fees_enabled: Some(true), fee_rate: Some(d("0.04")),
+                }],
+            };
+            engine.topics.write().await.insert(key, topic.clone());
+            let cached = engine.pm_reconciliation_fee_snapshot(&leg).await?;
+            assert_eq!(cached["source"], "common");
+            assert_eq!(crate::platforms::parse_decimal(&cached["bps"]), Some(d("400")));
+            let mut wrong = topic;
+            wrong.tokens[0].condition_id = Some("wrong".into());
+            engine.topics.write().await.insert(key, wrong);
+            assert!(engine.pm_reconciliation_fee_snapshot(&leg).await.is_err());
+            pool.close().await;
+            Ok(())
+        }.await;
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        admin.close().await;
+        exercised.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+    async fn pm_fee_recovery_uses_persisted_observations_before_source_lookup() {
         use crate::platforms::polymarket::tests::poll_stub;
         use sqlx::postgres::PgPoolOptions;
         let uri = std::env::var("APP_POSTGRES_URI").expect("requires a test database");
@@ -3851,29 +4048,40 @@ mod tests {
                 let b=trade("b","4","TRADE_STATUS_MATCHED_NOT_BROADCASTED");
                 let order=json!({"id":oid,"status":"ORDER_STATUS_MATCHED","asset_id":"yes","original_size":"10",
                     "size_matched":"10","associate_trades":["a","b"]});
-                let (pm,server)=poll_stub(vec![(200,order),(200,json!({"data":[a.clone(),b],"next_cursor":"LTE="})),
-                    (200,json!({"c":"test-condition","fd":{"r":"0.07"}}))]).await;
+                let (pm,server)=poll_stub(vec![(200,order),(200,json!({"data":[a.clone(),b],"next_cursor":"LTE="}))]).await;
+                let source_calls = std::sync::atomic::AtomicUsize::new(0);
+                let snapshot_for = |rate: &str| json!({"version":1,"source":"common",
+                    "rate":rate,"bps":(d(rate)*d("10000")).to_string(),
+                    "condition_id":"test-condition","token_id":"yes"});
                 let leg=store.open_legs().await?.into_iter().find(|leg|leg.id==id).unwrap();
                 let (current,poll,page)=reconcile_pm_page(&pm,&store,&leg).await?.unwrap();
-                assert!(matches!(apply_reconciliation_page(&pm,&store,&current,poll,page).await?,LegResolution::Pending(_)));
+                assert!(matches!(apply_reconciliation_page(&store,&current,poll,page,|| async {
+                    source_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(snapshot_for("0.07"))
+                }).await?,LegResolution::Pending(_)));
                 let requests=tokio::time::timeout(Duration::from_secs(5),server).await??;
-                assert_eq!(requests.len(),3);
-                assert!(requests[2].starts_with("GET /clob-markets/test-condition "));
+                assert_eq!(requests.len(),2);
+                assert_eq!(source_calls.load(std::sync::atomic::Ordering::Relaxed),1);
                 let saved:Value=sqlx::query_scalar("SELECT raw FROM fills WHERE leg_id=$1 AND trade_id='a'").bind(id).fetch_one(&store.pool).await?;
                 let snapshot=saved["reconciliation_v1"]["raw"]["fee_calculation"].clone();
                 assert_eq!(snapshot["rate"],"0.07");
                 let next_b=trade("b","4",if mode=="reuse" || mode=="stale" {"TRADE_STATUS_FAILED"}else{"TRADE_STATUS_CONFIRMED"});
-                let mut responses=vec![(200,Value::Null),(200,json!({"data":[a.clone(),a.clone(),next_b],"next_cursor":"LTE="}))];
-                if mode=="mixed" {responses.push((200,json!({"c":"test-condition","fd":{"r":"0.05"}})));}
-                if mode=="fee_failure" {responses.push((503,json!({"error":"unavailable"})));}
+                let responses=vec![(200,Value::Null),(200,json!({"data":[a.clone(),a.clone(),next_b],"next_cursor":"LTE="}))];
                 let (pm,server)=poll_stub(responses).await;
                 let leg=store.open_legs().await?.into_iter().find(|leg|leg.id==id).unwrap();
                 let (current,poll,page)=reconcile_pm_page(&pm,&store,&leg).await?.unwrap();
                 let before:Value=sqlx::query_scalar("SELECT to_jsonb(l) FROM legs l WHERE id=$1").bind(id).fetch_one(&store.pool).await?;
                 if mode=="stale" {store.record_reconciliation_wait(&current,"concurrent_update").await?;}
-                let resolution=apply_reconciliation_page(&pm,&store,&current,poll,page).await;
+                let resolution=apply_reconciliation_page(&store,&current,poll,page,|| async {
+                    assert!(mode=="mixed" || mode=="fee_failure", "saved fee must skip lookup");
+                    source_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if mode=="fee_failure" { return Err(Error::msg("COMMON lookup failed")); }
+                    Ok(snapshot_for("0.05"))
+                }).await;
                 let requests=tokio::time::timeout(Duration::from_secs(5),server).await??;
-                assert_eq!(requests.len(),if mode=="mixed" || mode=="fee_failure" {3}else{2});
+                assert_eq!(requests.len(),2);
+                assert_eq!(source_calls.load(std::sync::atomic::Ordering::Relaxed),
+                    if mode=="mixed" || mode=="fee_failure" {2}else{1});
                 let after:Value=sqlx::query_scalar("SELECT to_jsonb(l) FROM legs l WHERE id=$1").bind(id).fetch_one(&store.pool).await?;
                 if mode=="fee_failure" {
                     assert!(resolution.is_err());
@@ -3892,6 +4100,9 @@ mod tests {
                 }
                 let latest:Value=sqlx::query_scalar("SELECT raw FROM fills WHERE leg_id=$1 AND trade_id='a'").bind(id).fetch_one(&store.pool).await?;
                 assert_eq!(latest["reconciliation_v1"]["raw"]["fee_calculation"],snapshot);
+                let bps:Decimal=sqlx::query_scalar("SELECT fee_rate_bps FROM fills WHERE leg_id=$1 AND trade_id='a'").bind(id).fetch_one(&store.pool).await?;
+                assert_eq!(bps,d("700"));
+                assert_eq!(crate::platforms::parse_decimal(&latest["reconciliation_v1"]["fee_rate_bps"]),Some(d("700")));
                 let b_value:Value=sqlx::query_scalar("SELECT raw FROM fills WHERE leg_id=$1 AND trade_id='b'").bind(id).fetch_one(&store.pool).await?;
                 if mode=="mixed" {assert_eq!(b_value["reconciliation_v1"]["raw"]["fee_calculation"]["rate"],"0.05");}
                 if mode=="fee_failure" || mode=="stale" {assert_eq!(b_value["reconciliation_v1"]["finality"],"pending");}

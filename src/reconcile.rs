@@ -270,6 +270,7 @@ pub fn merge_observation(previous: &TradeFill, incoming: &TradeFill) -> Result<T
             if let Some(snapshot) = previous.raw.get("fee_calculation") {
                 merged.raw["fee_calculation"] = snapshot.clone();
             }
+            restore_pm_fee_rate(&mut merged)?;
             Ok(merged)
         }
         _ => Ok(incoming.clone()),
@@ -486,6 +487,54 @@ pub fn resolve_leg(
     })
 }
 
+fn pm_snapshot_rate(fill: &TradeFill, snapshot: &Value) -> Result<Decimal> {
+    let rate = snapshot
+        .get("rate")
+        .and_then(crate::platforms::parse_decimal)
+        .ok_or_else(|| Error::msg("fee calculation snapshot missing rate"))?;
+    if rate < Decimal::ZERO || rate > Decimal::ONE {
+        return Err(Error::msg("invalid fee calculation snapshot rate"));
+    }
+    match snapshot.get("source").and_then(Value::as_str) {
+        // 旧快照没有 version/bps/token_id，继续按原始已批准系数计算。
+        Some("clob-markets") => {}
+        Some("common" | "env") => {
+            if snapshot.get("version").and_then(Value::as_u64) != Some(1)
+                || snapshot
+                    .get("bps")
+                    .and_then(crate::platforms::parse_decimal)
+                    != Some(rate * Decimal::from(10_000))
+                || !snapshot
+                    .get("token_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|token| {
+                        !token.trim().is_empty() && Some(token) == fill.coin.as_deref()
+                    })
+                || !snapshot
+                    .get("condition_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|condition| !condition.trim().is_empty())
+            {
+                return Err(Error::msg(
+                    "invalid fee calculation snapshot identity or bps",
+                ));
+            }
+        }
+        _ => return Err(Error::msg("invalid fee calculation snapshot source")),
+    }
+    Ok(rate)
+}
+
+/// 只恢复规范化费率，不把估算费用写成接口实收 fee；无快照的历史值保持原状。
+pub(crate) fn restore_pm_fee_rate(fill: &mut TradeFill) -> Result<()> {
+    if let Some(snapshot) = fill.raw.get("fee_calculation") {
+        fill.fee_rate_bps = Some(pm_snapshot_rate(fill, snapshot)? * Decimal::from(10_000));
+    } else if fill.fee.is_none() && fill.raw.get("role").and_then(Value::as_str) == Some("maker") {
+        fill.fee_rate_bps = Some(Decimal::ZERO);
+    }
+    Ok(())
+}
+
 pub fn accounting_fee(platform: &str, fill: &TradeFill) -> Result<Option<(Decimal, &'static str)>> {
     if let Some(fee) = fill.fee {
         if fill.fee_token.as_deref().is_some_and(|token| {
@@ -502,18 +551,7 @@ pub fn accounting_fee(platform: &str, fill: &TradeFill) -> Result<Option<(Decima
     }
     if platform == POLYMARKET {
         if let Some(snapshot) = fill.raw.get("fee_calculation") {
-            let Some(rate) = snapshot
-                .get("rate")
-                .and_then(crate::platforms::parse_decimal)
-            else {
-                return Err(Error::msg("fee calculation snapshot missing rate"));
-            };
-            if rate < Decimal::ZERO
-                || rate > Decimal::ONE
-                || snapshot.get("source").and_then(|v| v.as_str()) != Some("clob-markets")
-            {
-                return Err(Error::msg("invalid fee calculation snapshot"));
-            }
+            let rate = pm_snapshot_rate(fill, snapshot)?;
             // 官方 trading/fees：C × feeRate × p × (1-p)，不采用 SDK 预算辅助函数的指数。
             let amount = fill
                 .shares
@@ -1087,6 +1125,177 @@ mod tests {
         trade.fee = None;
         trade.raw["fee_calculation"]["rate"] = json!("-1");
         assert!(accounting_fee(POLYMARKET, &trade).is_err());
+    }
+
+    fn pm_fee_snapshot(source: &str, rate: &str) -> Value {
+        let mut snapshot = json!({
+            "version": 1, "source": source, "rate": rate,
+            "bps": (d(rate) * Decimal::from(10_000)).to_string(),
+            "condition_id": "condition", "token_id": "token",
+            "event_id": "event", "unified_index": 0, "fetched_at_ms": 1
+        });
+        if source == "env" {
+            snapshot["config_key"] = json!("PM_FEE_BPS");
+            snapshot["fallback_reason"] = json!("common_unavailable");
+        }
+        snapshot
+    }
+
+    #[test]
+    fn common_and_env_snapshots_calculate_and_restore_without_actual_fee() {
+        for source in ["common", "env"] {
+            for (rate, expected) in [
+                ("0", "0"),
+                ("0.07", "1.75"),
+                ("1", "25"),
+                ("0.0000006", "0.00002"),
+            ] {
+                let mut trade = fill("one", "100", FillFinality::Confirmed);
+                trade.fee = None;
+                trade.fee_token = None;
+                trade.raw =
+                    json!({"role": "taker", "fee_calculation": pm_fee_snapshot(source, rate)});
+                assert_eq!(
+                    accounting_fee(POLYMARKET, &trade).unwrap(),
+                    Some((d(expected), "calculated")),
+                    "{source} {rate}"
+                );
+                restore_pm_fee_rate(&mut trade).unwrap();
+                assert_eq!(trade.fee_rate_bps, Some(d(rate) * Decimal::from(10_000)));
+                assert_eq!(trade.fee, None);
+                assert_eq!(trade.fee_token, None);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_snapshots_fail_validation_without_mutating_legacy_rate() {
+        for source in ["common", "env"] {
+            for (field, value) in [
+                ("source", json!("rest")),
+                ("source", Value::Null),
+                ("rate", json!("-0.01")),
+                ("rate", json!("1.01")),
+                ("rate", json!("broken")),
+                ("rate", Value::Null),
+                ("version", json!(2)),
+                ("version", json!("1")),
+                ("version", Value::Null),
+                ("bps", json!("701")),
+                ("bps", Value::Null),
+                ("token_id", json!("other")),
+                ("token_id", Value::Null),
+                ("condition_id", json!("  ")),
+                ("condition_id", Value::Null),
+            ] {
+                let mut trade = fill("one", "100", FillFinality::Confirmed);
+                trade.fee = None;
+                trade.fee_rate_bps = Some(d("123"));
+                trade.raw =
+                    json!({"role": "taker", "fee_calculation": pm_fee_snapshot(source, "0.07")});
+                trade.raw["fee_calculation"][field] = value;
+                assert!(
+                    accounting_fee(POLYMARKET, &trade).is_err(),
+                    "{source} {field}"
+                );
+                assert!(restore_pm_fee_rate(&mut trade).is_err(), "{source} {field}");
+                assert_eq!(trade.fee_rate_bps, Some(d("123")));
+            }
+            let mut trade = fill("one", "100", FillFinality::Confirmed);
+            trade.fee = None;
+            trade.coin = None;
+            trade.raw["fee_calculation"] = pm_fee_snapshot(source, "0.07");
+            assert!(accounting_fee(POLYMARKET, &trade).is_err());
+            assert!(restore_pm_fee_rate(&mut trade).is_err());
+        }
+    }
+
+    #[test]
+    fn actual_fee_and_maker_zero_precede_invalid_calculation_snapshot() {
+        let mut trade = fill("one", "100", FillFinality::Confirmed);
+        trade.raw = json!({"role": "maker", "fee_calculation": {"source": "invalid"}});
+        trade.fee_token = Some("pUSD".into());
+        assert_eq!(
+            accounting_fee(POLYMARKET, &trade).unwrap(),
+            Some((d("0.01"), "actual"))
+        );
+        trade.raw["role"] = json!("taker");
+        assert_eq!(
+            accounting_fee(POLYMARKET, &trade).unwrap(),
+            Some((d("0.01"), "actual"))
+        );
+        trade.fee_token = Some("OTHER".into());
+        assert_eq!(accounting_fee(POLYMARKET, &trade).unwrap(), None);
+        trade.fee = None;
+        trade.raw["role"] = json!("maker");
+        assert_eq!(
+            accounting_fee(POLYMARKET, &trade).unwrap(),
+            Some((Decimal::ZERO, "calculated_maker_zero"))
+        );
+    }
+
+    #[test]
+    fn restored_fee_rates_keep_legacy_values_and_maker_zero_rule() {
+        let mut trade = fill("one", "100", FillFinality::Confirmed);
+        trade.fee = None;
+        trade.raw = json!({"role": "taker"});
+        for legacy in [None, Some(d("700"))] {
+            trade.fee_rate_bps = legacy;
+            restore_pm_fee_rate(&mut trade).unwrap();
+            assert_eq!(trade.fee_rate_bps, legacy);
+            assert_eq!(accounting_fee(POLYMARKET, &trade).unwrap(), None);
+        }
+        trade.raw["role"] = json!("maker");
+        restore_pm_fee_rate(&mut trade).unwrap();
+        assert_eq!(trade.fee_rate_bps, Some(Decimal::ZERO));
+        trade.fee = Some(d("0.01"));
+        trade.fee_rate_bps = Some(d("123"));
+        restore_pm_fee_rate(&mut trade).unwrap();
+        assert_eq!(trade.fee_rate_bps, Some(d("123")));
+        trade.raw["fee_calculation"] = json!({"source": "clob-markets", "rate": "0.07"});
+        restore_pm_fee_rate(&mut trade).unwrap();
+        assert_eq!(trade.fee_rate_bps, Some(d("700")));
+        assert_eq!(trade.fee, Some(d("0.01")));
+    }
+
+    #[test]
+    fn confirmed_merge_freezes_snapshot_and_restores_its_bps() {
+        for source in ["common", "env", "clob-markets"] {
+            let mut previous = fill("one", "100", FillFinality::Confirmed);
+            previous.fee = None;
+            previous.fee_token = None;
+            previous.raw =
+                json!({"role": "taker", "fee_calculation": pm_fee_snapshot(source, "0.07")});
+            if source == "clob-markets" {
+                previous.raw["fee_calculation"] = json!({"source": source, "rate": "0.07"});
+            }
+            let mut incoming = previous.clone();
+            incoming.raw["fee_calculation"] = pm_fee_snapshot("env", "0.05");
+            incoming.fee_rate_bps = Some(d("500"));
+            let merged = merge_observation(&previous, &incoming).unwrap();
+            assert_eq!(
+                merged.raw["fee_calculation"],
+                previous.raw["fee_calculation"]
+            );
+            assert_eq!(merged.fee_rate_bps, Some(d("700")));
+            assert_eq!(merged.fee, None);
+            assert_eq!(
+                accounting_fee(POLYMARKET, &merged).unwrap(),
+                Some((d("1.75"), "calculated"))
+            );
+            incoming
+                .raw
+                .as_object_mut()
+                .unwrap()
+                .remove("fee_calculation");
+            incoming.fee_rate_bps = None;
+            let merged = merge_observation(&previous, &incoming).unwrap();
+            assert_eq!(merged.fee_rate_bps, Some(d("700")));
+            assert_eq!(
+                merged.raw["fee_calculation"],
+                previous.raw["fee_calculation"]
+            );
+        }
     }
 
     #[test]
