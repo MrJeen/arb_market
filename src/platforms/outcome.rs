@@ -322,20 +322,39 @@ impl OutcomeVenue {
     }
 
     async fn fetch_usdc_balance(&self) -> Result<Decimal> {
-        let user = self
-            .account
-            .clone()
-            .ok_or_else(|| Error::msg("missing OUTCOME_ACCOUNT_ADDRESS"))?;
-        let value: Value = self
-            .http
-            .post(&self.info_url)
-            .json(&json!({"type": "spotClearinghouseState", "user": user}))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        Ok(parse_usdc_balance(&value))
+        let started = Instant::now();
+        let mut http_status = None;
+        let result: Result<Decimal> = async {
+            let user = self
+                .account
+                .as_deref()
+                .ok_or_else(|| Error::msg("missing OUTCOME_ACCOUNT_ADDRESS"))?;
+            let response = self
+                .http
+                .post(&self.info_url)
+                .json(&json!({"type": "spotClearinghouseState", "user": user}))
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)?;
+            http_status = Some(response.status().as_u16());
+            let value: Value = response
+                .error_for_status()
+                .map_err(reqwest::Error::without_url)?
+                .json()
+                .await
+                .map_err(reqwest::Error::without_url)?;
+            parse_usdc_balance(&value)
+        }
+        .await;
+        if let Err(err) = &result {
+            tracing::error!(
+                service = "outcome", api = "spotClearinghouseState",
+                operation = "fetch_usdc_balance", coin = "USDC", http_status,
+                elapsed_ms = started.elapsed().as_millis() as u64, error = %err,
+                "outcome balance query failed"
+            );
+        }
+        result
     }
 
     async fn invalidate_usdc_balance(&self) {
@@ -590,20 +609,39 @@ impl OutcomeVenue {
     }
 
     pub async fn token_balance(&self, coin: &str) -> Result<Decimal> {
-        let user = self
-            .account
-            .clone()
-            .ok_or_else(|| Error::msg("missing OUTCOME_ACCOUNT_ADDRESS"))?;
-        let value: Value = self
-            .http
-            .post(&self.info_url)
-            .json(&json!({"type": "spotClearinghouseState", "user": user}))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        Ok(parse_coin_balance(&value, coin))
+        let started = Instant::now();
+        let mut http_status = None;
+        let result: Result<Decimal> = async {
+            let user = self
+                .account
+                .as_deref()
+                .ok_or_else(|| Error::msg("missing OUTCOME_ACCOUNT_ADDRESS"))?;
+            let response = self
+                .http
+                .post(&self.info_url)
+                .json(&json!({"type": "spotClearinghouseState", "user": user}))
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)?;
+            http_status = Some(response.status().as_u16());
+            let value: Value = response
+                .error_for_status()
+                .map_err(reqwest::Error::without_url)?
+                .json()
+                .await
+                .map_err(reqwest::Error::without_url)?;
+            parse_coin_balance(&value, coin)
+        }
+        .await;
+        if let Err(err) = &result {
+            tracing::error!(
+                service = "outcome", api = "spotClearinghouseState",
+                operation = "token_balance", coin, http_status,
+                elapsed_ms = started.elapsed().as_millis() as u64, error = %err,
+                "outcome balance query failed"
+            );
+        }
+        result
     }
 }
 
@@ -1176,31 +1214,52 @@ fn unix_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn parse_usdc_balance(value: &Value) -> Decimal {
-    let usdc = parse_coin_balance(value, "USDC");
-    if usdc > Decimal::ZERO {
-        return usdc;
+fn parse_usdc_balance(value: &Value) -> Result<Decimal> {
+    if let Some((total, hold)) = parse_coin_balance_fields(value, "USDC")? {
+        // 按原始总额选币；USDC 全部冻结时不能切换到 USDH。
+        if total > Decimal::ZERO {
+            return Ok(if total > hold {
+                total - hold
+            } else {
+                Decimal::ZERO
+            });
+        }
     }
     parse_coin_balance(value, "USDH")
 }
 
-fn parse_coin_balance(value: &Value, want: &str) -> Decimal {
+fn parse_coin_balance(value: &Value, want: &str) -> Result<Decimal> {
+    Ok(parse_coin_balance_fields(value, want)?
+        .map(|(total, hold)| {
+            if total > hold {
+                total - hold
+            } else {
+                Decimal::ZERO
+            }
+        })
+        .unwrap_or(Decimal::ZERO))
+}
+
+fn parse_coin_balance_fields(value: &Value, want: &str) -> Result<Option<(Decimal, Decimal)>> {
     let balances = value
-        .pointer("/balances")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+        .get("balances")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::msg("outcome balance missing or invalid balances array"))?;
     for item in balances {
-        let coin = item.get("coin").and_then(|v| v.as_str()).unwrap_or("");
+        let coin = item.get("coin").and_then(Value::as_str).unwrap_or("");
         if coin_aliases_match(coin, want) {
-            return item
-                .get("total")
-                .or_else(|| item.get("hold"))
-                .and_then(parse_decimal)
-                .unwrap_or(Decimal::ZERO);
+            let field = |name: &str| {
+                item.get(name)
+                    .and_then(parse_decimal)
+                    .filter(|amount| *amount >= Decimal::ZERO)
+                    .ok_or_else(|| {
+                        Error::msg(format!("outcome balance {want} missing or invalid {name}"))
+                    })
+            };
+            return Ok(Some((field("total")?, field("hold")?)));
         }
     }
-    Decimal::ZERO
+    Ok(None)
 }
 
 fn coin_aliases_match(got: &str, want: &str) -> bool {
@@ -2160,12 +2219,214 @@ mod tests {
     #[test]
     fn parse_coin_balance_reads_named_token() {
         let raw = json!({"balances": [
-            {"coin": "USDC", "total": "10"},
-            {"coin": "+5160", "total": "7"}
+            {"coin": "USDC", "total": "10", "hold": "0"},
+            {"coin": "+5160", "total": "7", "hold": "0"}
         ]});
-        assert_eq!(parse_coin_balance(&raw, "#5160").to_string(), "7");
-        assert_eq!(parse_coin_balance(&raw, "+5160").to_string(), "7");
-        assert_eq!(parse_usdc_balance(&raw).to_string(), "10");
+        assert_eq!(parse_coin_balance(&raw, "#5160").unwrap(), Decimal::from(7));
+        assert_eq!(parse_coin_balance(&raw, "+5160").unwrap(), Decimal::from(7));
+        assert_eq!(parse_coin_balance(&raw, "usdc").unwrap(), Decimal::from(10));
+        assert_eq!(parse_usdc_balance(&raw).unwrap(), Decimal::from(10));
+    }
+
+    #[test]
+    fn parse_coin_balance_subtracts_hold_and_clamps_to_zero() {
+        for (total, hold, expected) in [
+            (json!("7.5"), json!("2.25"), "5.25"),
+            (json!(7.5), json!(2.25), "5.25"),
+            (json!("7"), json!("7"), "0"),
+            (json!("7"), json!("8"), "0"),
+            (json!("0"), json!("0"), "0"),
+        ] {
+            let raw = json!({"balances": [{"coin": "+5160", "total": total, "hold": hold}]});
+            assert_eq!(
+                parse_coin_balance(&raw, "#5160").unwrap(),
+                expected.parse::<Decimal>().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn parse_coin_balance_rejects_missing_or_invalid_fields() {
+        for coin in ["USDC", "+5160", "100012110"] {
+            let want = match coin {
+                "+5160" => "#5160",
+                "100012110" => "#12110",
+                _ => "USDC",
+            };
+            for field in ["total", "hold"] {
+                let valid = json!({"coin": coin, "total": "10", "hold": "0"});
+                let mut missing = valid.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                assert!(parse_coin_balance(&json!({"balances": [missing]}), want).is_err());
+                for invalid in [
+                    Value::Null,
+                    json!(""),
+                    json!("bad"),
+                    json!("NaN"),
+                    json!("Infinity"),
+                    json!("79228162514264337593543950336"),
+                    json!("-1"),
+                    json!(-1),
+                    json!(true),
+                    json!([]),
+                    json!({}),
+                ] {
+                    let mut item = valid.clone();
+                    item[field] = invalid;
+                    assert!(
+                        parse_coin_balance(&json!({"balances": [item]}), want).is_err(),
+                        "accepted invalid {field} for {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn balance_parsers_distinguish_absent_coin_from_malformed_state() {
+        for raw in [
+            json!({"balances": []}),
+            json!({"balances": [{"coin": "OTHER", "total": "1", "hold": "0"}]}),
+        ] {
+            assert_eq!(parse_coin_balance(&raw, "#5160").unwrap(), Decimal::ZERO);
+            assert_eq!(parse_usdc_balance(&raw).unwrap(), Decimal::ZERO);
+        }
+        for raw in [
+            Value::Null,
+            json!([]),
+            json!("bad"),
+            json!({}),
+            json!({"balances": null}),
+            json!({"balances": {}}),
+            json!({"balances": "bad"}),
+        ] {
+            assert!(parse_coin_balance(&raw, "#5160").is_err());
+            assert!(parse_usdc_balance(&raw).is_err());
+        }
+    }
+
+    #[test]
+    fn parse_usdc_balance_selects_by_total_before_subtracting_hold() {
+        for (hold, expected) in [("2", 8), ("10", 0), ("11", 0)] {
+            let raw = json!({"balances": [
+                {"coin": "usdc", "total": "10", "hold": hold},
+                {"coin": "USDH", "total": "20", "hold": "3"}
+            ]});
+            assert_eq!(parse_usdc_balance(&raw).unwrap(), Decimal::from(expected));
+        }
+        // 未选中的 USDH 不参与余额校验。
+        let raw = json!({"balances": [
+            {"coin": "USDC", "total": "10", "hold": "10"},
+            {"coin": "USDH", "total": "bad"}
+        ]});
+        assert_eq!(parse_usdc_balance(&raw).unwrap(), Decimal::ZERO);
+    }
+
+    #[test]
+    fn parse_usdc_balance_falls_back_only_when_absent_or_valid_zero() {
+        for usdc in [
+            None,
+            Some(json!({"coin": "USDC", "total": "0", "hold": "0"})),
+        ] {
+            for (hold, expected) in [("3", 17), ("20", 0), ("21", 0)] {
+                let mut balances = vec![json!({"coin": "usdh", "total": "20", "hold": hold})];
+                balances.extend(usdc.clone());
+                assert_eq!(
+                    parse_usdc_balance(&json!({"balances": balances})).unwrap(),
+                    Decimal::from(expected)
+                );
+            }
+            let mut balances = vec![json!({"coin": "USDH", "total": "20"})];
+            balances.extend(usdc);
+            assert!(parse_usdc_balance(&json!({"balances": balances})).is_err());
+        }
+        for usdc in [
+            json!({"coin": "USDC", "hold": "0"}),
+            json!({"coin": "USDC", "total": "bad", "hold": "0"}),
+            json!({"coin": "USDC", "total": "-1", "hold": "0"}),
+            json!({"coin": "USDC", "total": "0"}),
+            json!({"coin": "USDC", "total": "0", "hold": "bad"}),
+            json!({"coin": "USDC", "total": "10", "hold": "-1"}),
+        ] {
+            let raw = json!({"balances": [usdc, {"coin": "USDH", "total": "20", "hold": "0"}]});
+            assert!(parse_usdc_balance(&raw).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn user_state_and_token_balance_return_available_balances() {
+        let raw = json!({"balances": [
+            {"coin": "USDC", "total": "10", "hold": "10"},
+            {"coin": "USDH", "total": "20", "hold": "3"},
+            {"coin": "+5160", "total": "7.5", "hold": "2.25"}
+        ]});
+        let fallback = json!({"balances": [{"coin": "USDH", "total": "20", "hold": "3"}]});
+        let (venue, server) = info_stub(vec![(200, raw.clone()), (200, raw), (200, fallback)]);
+        assert_eq!(venue.user_state().await.unwrap(), Decimal::ZERO);
+        assert_eq!(venue.user_state().await.unwrap(), Decimal::ZERO);
+        assert_eq!(
+            venue.token_balance("#5160").await.unwrap(),
+            "5.25".parse().unwrap()
+        );
+        venue.invalidate_usdc_balance().await;
+        assert_eq!(venue.user_state().await.unwrap(), Decimal::from(17));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in requests {
+            assert_eq!(
+                request,
+                json!({"type": "spotClearinghouseState", "user": "0xtest"})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn user_state_errors_are_propagated_and_not_cached() {
+        for (status, bad) in [
+            (503, json!({"error": "unavailable"})),
+            (200, json!({"balances": null})),
+            (
+                200,
+                json!({"balances": [
+                    {"coin": "USDC", "total": "0"},
+                    {"coin": "USDH", "total": "20", "hold": "0"}
+                ]}),
+            ),
+            (
+                200,
+                json!({"balances": [{"coin": "USDH", "total": "20", "hold": "bad"}]}),
+            ),
+        ] {
+            let good = json!({"balances": [{"coin": "USDC", "total": "10", "hold": "3"}]});
+            let (venue, server) = info_stub(vec![(status, bad), (200, good)]);
+            assert!(venue.user_state().await.is_err());
+            assert!(venue.usdc_balance_cache.lock().await.value.is_none());
+            assert_eq!(venue.user_state().await.unwrap(), Decimal::from(7));
+            assert_eq!(venue.user_state().await.unwrap(), Decimal::from(7));
+            assert_eq!(server.join().unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn token_balance_errors_are_propagated_and_retry_succeeds() {
+        for (status, bad) in [
+            (503, json!({"error": "unavailable"})),
+            (200, json!({})),
+            (200, json!({"balances": [{"coin": "+5160", "total": "7"}]})),
+            (
+                200,
+                json!({"balances": [{"coin": "+5160", "total": "7", "hold": "-1"}]}),
+            ),
+        ] {
+            let good = json!({"balances": [{"coin": "+5160", "total": "7", "hold": "2"}]});
+            let (venue, server) = info_stub(vec![(status, bad), (200, good)]);
+            assert!(venue.token_balance("#5160").await.is_err());
+            assert_eq!(
+                venue.token_balance("#5160").await.unwrap(),
+                Decimal::from(5)
+            );
+            assert_eq!(server.join().unwrap().len(), 2);
+        }
     }
 
     #[test]
@@ -2177,8 +2438,11 @@ mod tests {
 
     #[test]
     fn parse_coin_balance_matches_asset_id() {
-        let raw = json!({"balances": [{"coin": "100012110", "total": "119"}]});
-        assert_eq!(parse_coin_balance(&raw, "#12110").to_string(), "119");
+        let raw = json!({"balances": [{"coin": "100012110", "total": "119", "hold": "0"}]});
+        assert_eq!(
+            parse_coin_balance(&raw, "#12110").unwrap(),
+            Decimal::from(119)
+        );
     }
 
     fn exchange_ok(status_item: Value) -> Value {

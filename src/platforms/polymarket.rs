@@ -13,8 +13,10 @@ use crate::stats::MinuteStats;
 use alloy_primitives::{Address, B256};
 use alloy_signer_local::PrivateKeySigner;
 use futures_util::{SinkExt, StreamExt};
+use num_bigint::BigInt;
+use num_traits::Zero;
 use rust_decimal::prelude::ToPrimitive;
-use rust_decimal::{Decimal, RoundingStrategy};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -37,7 +39,7 @@ const AUTH_TTL_JITTER_MAX_MINS: u64 = 30;
 /// 最早一条凭证距过期不足该时长时主动刷新。
 const AUTH_REFRESH_LEAD_SECS: u64 = 10 * 60;
 /// CLOB FAK 市价单精度：maker 最多 2 位小数，taker 最多 5 位小数。
-/// 买单 USDC 向上取到分，避免隐含限价低于盘口；卖单金额仍向下截断。
+/// 买单只接受原股数与 cap 可无损表达的金额；卖单金额仍向下截断。
 const MARKET_MAKER_DECIMALS: u32 = 2;
 const MARKET_TAKER_DECIMALS: u32 = 5;
 // 官方 CLOB 客户端以 base64("0") 起始，以 base64("-1") 表示已读到末尾。
@@ -1217,6 +1219,9 @@ fn build_unsigned_order(
     if price < tick {
         return Err(Error::msg("price below tick"));
     }
+    if req.side == OrderSide::Buy && price != req.cap_price {
+        return Err(Error::msg("polymarket buy cap incompatible with tick"));
+    }
     let (maker_amount, taker_amount) = market_order_base_units(req.side, req.shares, price)?;
     let maker: Address = account
         .funder
@@ -2121,16 +2126,43 @@ async fn handle_ws_text(
     }
 }
 
+/// 前置准入与签名共用最终金额；不可表示时跳过，不靠舍入改变数量或限价。
+pub(crate) fn market_buy_base_units(size: Decimal, cap: Decimal) -> Result<(u128, u128)> {
+    require_positive(size, cap)?;
+    if cap >= Decimal::ONE {
+        return Err(Error::msg("invalid polymarket buy cap"));
+    }
+    let ten = BigInt::from(10u8);
+    let size_scale = ten.pow(size.scale());
+    let price_scale = ten.pow(cap.scale());
+    let size_n = BigInt::from(size.mantissa());
+    let price_n = BigInt::from(cap.mantissa());
+    let taker_scaled = &size_n * ten.pow(MARKET_TAKER_DECIMALS);
+    if (&taker_scaled % &size_scale) != BigInt::zero() {
+        return Err(Error::msg(
+            "polymarket buy shares exceed supported precision",
+        ));
+    }
+    let taker = (taker_scaled / &size_scale) * ten.pow(6 - MARKET_TAKER_DECIMALS);
+    let denominator = &size_scale * &price_scale;
+    let cents_n = &size_n * &price_n * ten.pow(MARKET_MAKER_DECIMALS);
+    let cents = (&cents_n + &denominator - 1u8) / &denominator;
+    let maker = cents * ten.pow(6 - MARKET_MAKER_DECIMALS);
+    // 不做除法投影；即使只超出一个基础单位也必须拒绝。
+    if &maker * &price_scale > &taker * &price_n {
+        return Err(Error::msg("polymarket buy amounts would exceed cap"));
+    }
+    let maker = maker.to_u128().filter(|n| *n > 0);
+    let taker = taker.to_u128().filter(|n| *n > 0);
+    match (maker, taker) {
+        (Some(maker), Some(taker)) => Ok((maker, taker)),
+        _ => Err(Error::msg("polymarket buy amounts outside supported range")),
+    }
+}
+
 fn market_order_base_units(side: OrderSide, size: Decimal, price: Decimal) -> Result<(u128, u128)> {
     let (maker, taker) = match side {
-        OrderSide::Buy => {
-            let shares = size.trunc_with_scale(MARKET_TAKER_DECIMALS);
-            let usdc = (shares * price).round_dp_with_strategy(
-                MARKET_MAKER_DECIMALS,
-                RoundingStrategy::ToPositiveInfinity,
-            );
-            (usdc, shares)
-        }
+        OrderSide::Buy => return market_buy_base_units(size, price),
         OrderSide::Sell => {
             let shares = size.trunc_with_scale(MARKET_MAKER_DECIMALS);
             let usdc = (shares * price).trunc_with_scale(MARKET_TAKER_DECIMALS);
@@ -3301,6 +3333,33 @@ pub(crate) mod tests {
         (venue, server)
     }
 
+    pub(crate) async fn execution_test_venue(base: String) -> (PolymarketVenue, String) {
+        let mut venue = cache_test_venue();
+        venue.base = base;
+        venue.http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        venue.auth_ttl = Duration::ZERO;
+        let signer = PrivateKeySigner::random();
+        let funder = format!("{:#x}", signer.address());
+        venue.authed.lock().await.insert(
+            funder.clone(),
+            PolymarketAccount {
+                funder: funder.clone(),
+                service: None,
+                signature_type: 0,
+                signer,
+                api_key: "stub-key".into(),
+                api_secret: "dGVzdA==".into(),
+                api_passphrase: "stub-passphrase".into(),
+                created_at: unix_secs(),
+            },
+        );
+        (venue, funder)
+    }
+
     #[tokio::test]
     async fn tick_bootstrap_in_flight_obeys_ws_rest_conflict_and_epoch() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -4240,18 +4299,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn market_buy_ceils_maker_usdc_to_2_decimals() {
-        let (maker, taker) = market_order_base_units(OrderSide::Buy, d("7"), d("0.333")).unwrap();
-        assert_eq!(maker, 2_340_000);
-        assert_eq!(taker, 7_000_000);
+    fn market_buy_rejects_cent_rounding_above_cap() {
+        let err = market_order_base_units(OrderSide::Buy, d("7"), d("0.333")).unwrap_err();
+        assert!(err.to_string().contains("exceed cap"));
+        assert_eq!(
+            market_buy_base_units(d("10"), d("0.333")).unwrap(),
+            (3_330_000, 10_000_000)
+        );
     }
 
     #[test]
-    fn market_buy_floors_taker_shares_to_5_decimals() {
-        let (maker, taker) =
-            market_order_base_units(OrderSide::Buy, d("1.234567"), d("0.50")).unwrap();
-        assert_eq!(taker, 1_234_560);
-        assert_eq!(maker, 620_000);
+    fn market_buy_rejects_lossy_shares_and_accepts_trailing_zeros() {
+        let err = market_order_base_units(OrderSide::Buy, d("1.234567"), d("0.50")).unwrap_err();
+        assert!(err.to_string().contains("shares exceed"));
+        assert_eq!(
+            market_buy_base_units(d("1.25000"), d("0.4")).unwrap(),
+            (500_000, 1_250_000)
+        );
     }
 
     #[test]
@@ -4272,7 +4336,72 @@ pub(crate) mod tests {
     #[test]
     fn market_buy_rejects_when_shares_trunc_to_zero() {
         let err = market_order_base_units(OrderSide::Buy, d("0.000001"), d("0.50")).unwrap_err();
-        assert!(err.to_string().contains("round to zero"));
+        assert!(err.to_string().contains("shares exceed"));
+    }
+
+    #[test]
+    fn market_buy_amounts_preserve_exact_original_constraints() {
+        for cap in [
+            "0.01",
+            "0.333",
+            "0.0001",
+            "0.9999",
+            "0.1234567890123456789012345678",
+        ] {
+            let cap = d(cap);
+            for qty in 1..=200 {
+                if let Ok((maker, taker)) = market_buy_base_units(Decimal::from(qty), cap) {
+                    assert_eq!(taker, qty as u128 * 1_000_000);
+                    assert_eq!(maker % 10_000, 0);
+                    assert!(
+                        BigInt::from(maker) * BigInt::from(10u8).pow(cap.scale())
+                            <= BigInt::from(taker) * BigInt::from(cap.mantissa())
+                    );
+                }
+            }
+        }
+        for (qty, cap) in [
+            (Decimal::ZERO, d("0.5")),
+            (d("-1"), d("0.5")),
+            (d("1"), Decimal::ZERO),
+            (d("1"), Decimal::ONE),
+            (d("1"), d("-0.1")),
+        ] {
+            assert!(market_buy_base_units(qty, cap).is_err());
+        }
+        // 不通过 Decimal 乘法构造金额，最大尾数仍可安全转换为 u128 基础单位。
+        assert!(market_buy_base_units(Decimal::MAX, d("0.5")).is_ok());
+    }
+
+    #[test]
+    fn unsigned_buy_rejects_realignment_and_preserves_payload_amounts() {
+        let account = PolymarketAccount {
+            funder: "0x0000000000000000000000000000000000000001".into(),
+            service: None,
+            signature_type: 0,
+            signer: PrivateKeySigner::random(),
+            api_key: String::new(),
+            api_secret: String::new(),
+            api_passphrase: String::new(),
+            created_at: 0,
+        };
+        let mut req = MarketOrderRequest {
+            token_id: "1".into(),
+            shares: d("10"),
+            cap_price: d("0.333"),
+            side: OrderSide::Buy,
+            neg_risk: Some(false),
+            tick_size: Some(d("0.001")),
+            asset_id: None,
+            funder_address: None,
+        };
+        assert!(build_unsigned_order(&account, &req, d("0.01")).is_err());
+        let order = build_unsigned_order(&account, &req, d("0.001")).unwrap();
+        let payload = order_submit_payload(&order, "test-owner");
+        assert_eq!(payload["order"]["makerAmount"], "3330000");
+        assert_eq!(payload["order"]["takerAmount"], "10000000");
+        req.shares = d("7");
+        assert!(build_unsigned_order(&account, &req, d("0.001")).is_err());
     }
 
     fn dummy_funder(addr: &str) -> PolymarketFunderConfig {

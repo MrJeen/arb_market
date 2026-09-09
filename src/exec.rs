@@ -9,7 +9,8 @@ use crate::discovery::{load_active_topics, load_topic};
 use crate::domain::{MarketIdentity, Topic, TopicKey};
 use crate::error::{Error, Result};
 use crate::hedge::{
-    hedge_order_tokens, leftover_untradeable, needs_rebalance, plan_hedge, HedgeSide,
+    hedge_buy_required, hedge_order_tokens, leftover_untradeable, needs_rebalance, plan_hedge,
+    HedgeSide,
 };
 use crate::notify::{
     self, NatsNotifier, PlaceNotice, PlaceResult, SettlementNotice, TakeProfitCompletedNotice,
@@ -348,6 +349,18 @@ impl Engine {
             return Ok(());
         }
 
+        self.execute_confirmed_plan(topic, &plan, &funder, &fees, confirmation_deadline)
+            .await
+    }
+
+    async fn execute_confirmed_plan(
+        &self,
+        topic: &Topic,
+        plan: &ArbPlan,
+        funder: &str,
+        fees: &FeeContext,
+        confirmation_deadline: Instant,
+    ) -> Result<()> {
         self.ensure_trading_enabled(TradingIntent::Arbitrage)?;
         let pm_tick = self.ensure_pm_tick(&plan.pm.token_id).await;
         if !pm_tick.is_some_and(|tick| {
@@ -364,6 +377,24 @@ impl Engine {
         ]);
         let pm_token = topic.token(POLYMARKET, &plan.pm.label);
         let out_token = topic.token(OUTCOME, &plan.outcome.label);
+        let pm_req = MarketOrderRequest {
+            token_id: plan.pm.token_id.clone(),
+            shares: plan.pm.shares,
+            cap_price: plan.pm.cap_price,
+            side: OrderSide::Buy,
+            neg_risk: pm_token.and_then(|t| t.neg_risk),
+            tick_size: pm_tick,
+            asset_id: None,
+            funder_address: Some(funder.to_owned()),
+        };
+        validate_pm_request_tick(&pm_req)?;
+        if let Err(err) =
+            crate::platforms::polymarket::market_buy_base_units(pm_req.shares, pm_req.cap_price)
+        {
+            tracing::info!(topic = %topic.key.as_str(), reason = %err,
+                "arb skipped before admission: polymarket buy amounts unrepresentable");
+            return Ok(());
+        }
         // 建档必须原子：`actived` 且没有腿的父单会被回填判为无成交并取消。
         let initial_legs = [
             NewLeg {
@@ -372,9 +403,9 @@ impl Engine {
                 label: &plan.pm.label,
                 side: "BUY",
                 intent: "arb_buy",
-                funder: Some(funder.as_str()),
-                wallet: Some(funder.as_str()),
-                service: self.polymarket_service(&funder),
+                funder: Some(funder),
+                wallet: Some(funder),
+                service: self.polymarket_service(funder),
                 req_price: plan.pm.cap_price,
                 req_shares: plan.pm.shares,
                 req_fee: plan.pm.fee,
@@ -435,17 +466,6 @@ impl Engine {
         let [pm_leg, out_leg] = <[i64; 2]>::try_from(leg_ids)
             .map_err(|_| Error::msg("arb order must be created with both initial legs"))?;
         self.stats.orders();
-        let pm_req = MarketOrderRequest {
-            token_id: plan.pm.token_id.clone(),
-            shares: plan.pm.shares,
-            cap_price: plan.pm.cap_price,
-            side: OrderSide::Buy,
-            neg_risk: pm_token.and_then(|t| t.neg_risk),
-            tick_size: pm_tick,
-            asset_id: None,
-            funder_address: Some(funder.clone()),
-        };
-        validate_pm_request_tick(&pm_req)?;
         let out_req = MarketOrderRequest {
             token_id: plan.outcome.token_id.clone(),
             shares: plan.outcome.shares,
@@ -457,8 +477,8 @@ impl Engine {
             funder_address: None,
         };
         let (pm_res, out_res) = tokio::join!(
-            self.submit_pm(pm_leg, &funder, &pm_req, &fees, TradingIntent::Arbitrage),
-            self.submit_outcome(out_leg, &out_req, &fees, TradingIntent::Arbitrage)
+            self.submit_pm(pm_leg, funder, &pm_req, fees, TradingIntent::Arbitrage),
+            self.submit_outcome(out_leg, &out_req, fees, TradingIntent::Arbitrage)
         );
         if let Err(err) = &pm_res {
             tracing::error!(error = %err, "polymarket submit failed");
@@ -472,7 +492,7 @@ impl Engine {
         } else {
             self.stats.out_ok();
         }
-        self.notify_place(order_id, topic, &funder, &plan, pm_res, out_res);
+        self.notify_place(order_id, topic, funder, plan, pm_res, out_res);
         Ok(())
     }
 
@@ -1978,8 +1998,16 @@ impl Engine {
                 self.require_pm_token(&funder, &action.token_id, action.shares)
                     .await?;
             } else {
-                self.require_pm_usdc(&funder, action.shares * action.cap_price)
-                    .await?;
+                self.require_pm_usdc(
+                    &funder,
+                    hedge_buy_required(
+                        &action.platform,
+                        action.shares,
+                        action.cap_price,
+                        action.fee,
+                    )?,
+                )
+                .await?;
             }
             let req = MarketOrderRequest {
                 token_id: action.token_id.clone(),
@@ -2023,7 +2051,12 @@ impl Engine {
                     .await?;
             } else {
                 self.require_outcome_usdc(
-                    action.shares * action.cap_price,
+                    hedge_buy_required(
+                        &action.platform,
+                        action.shares,
+                        action.cap_price,
+                        action.fee,
+                    )?,
                     &format!("rebalance orderId={order_id}"),
                 )
                 .await?;
@@ -2813,6 +2846,316 @@ mod tests {
 
     fn d(s: &str) -> Decimal {
         Decimal::from_str(s).unwrap()
+    }
+
+    // 不加载环境配置或实盘账户；签名只使用公开测试私钥，所有 HTTP 地址均由 loopback stub 提供。
+    fn admission_test_config(base: &str) -> Config {
+        Config {
+            common_postgres_uri: String::new(),
+            app_postgres_uri: String::new(),
+            enabled_platforms: [POLYMARKET.to_string(), OUTCOME.to_string()].into(),
+            enable_arb: true,
+            enable_rebalance: false,
+            enable_take_profit: false,
+            take_profit_min_gain: Decimal::ZERO,
+            discovery_interval: Duration::from_secs(30),
+            reconcile_interval: Duration::from_secs(2),
+            hedge_interval: Duration::from_secs(5),
+            book_stale: Duration::from_secs(5),
+            book_resync: Duration::from_secs(10),
+            book_resync_batch: 1,
+            position_scan_batch: 1,
+            settlement_pending_scan_interval: Duration::from_secs(60),
+            settlement_pending_scan_batch: 1,
+            arb_min_profit: Decimal::ZERO,
+            arb_min_apr: Decimal::ZERO,
+            arb_cost_limit: d("100"),
+            min_rebalance_qty: Decimal::ONE,
+            polymarket_fee_bps_prior: Decimal::ZERO,
+            outcome_taker_fee_rate: Decimal::ZERO,
+            pending_leg_timeout: Duration::from_secs(300),
+            unknown_leg_timeout: Duration::from_secs(300),
+            max_active_orders: 10,
+            max_realized_loss: Decimal::ZERO,
+            polymarket_clob_url: base.into(),
+            polymarket_ws_url: base.into(),
+            polymarket_funders: vec![],
+            polymarket_auth_ttl: Duration::ZERO,
+            hyperliquid_info_url: format!("{base}/info"),
+            hyperliquid_exchange_url: format!("{base}/exchange"),
+            hyperliquid_ws_url: base.into(),
+            hyperliquid_mainnet: false,
+            outcome_agent_private_key: Some(format!("{:064x}", 1)),
+            outcome_account_address: Some("0x7e5f4552091a69125d5dfcb7b8c2659029395bdf".into()),
+            outcome_builder_address: None,
+            outcome_builder_fee: 0,
+            nats_url: None,
+            nats_token: None,
+            nats_subject: String::new(),
+            nats_channel: String::new(),
+            cat: "admission-test".into(),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+    async fn confirmed_pm_amount_admission_blocks_all_side_effects() {
+        use crate::platforms::polymarket::tests::execution_test_venue;
+        use sqlx::postgres::PgPoolOptions;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let uri = std::env::var("APP_POSTGRES_URI").expect("requires a test database");
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&uri)
+            .await
+            .unwrap();
+        let schema = format!("exec_admission_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = requests.clone();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = tokio::select! {
+                    _ = &mut stop_rx => break,
+                    accepted = listener.accept() => accepted.unwrap(),
+                };
+                let mut bytes = Vec::new();
+                let (body_start, content_length) = loop {
+                    let mut buffer = [0u8; 4096];
+                    let n = tokio::time::timeout(Duration::from_secs(3), socket.read(&mut buffer))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(n > 0, "stub request ended before headers");
+                    bytes.extend_from_slice(&buffer[..n]);
+                    assert!(bytes.len() < 65_536, "unexpectedly large stub request");
+                    if let Some(index) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = std::str::from_utf8(&bytes[..index]).unwrap();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (key, value) = line.split_once(':')?;
+                                key.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        assert!(length < 65_536, "unexpectedly large stub body");
+                        break (index + 4, length);
+                    }
+                };
+                while bytes.len() < body_start + content_length {
+                    let mut buffer = [0u8; 4096];
+                    let n = tokio::time::timeout(Duration::from_secs(3), socket.read(&mut buffer))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(n > 0, "stub request ended before body");
+                    bytes.extend_from_slice(&buffer[..n]);
+                }
+                // 只记录请求行；签名、认证头和请求体既不保留也不打印。
+                let request = std::str::from_utf8(&bytes[..body_start])
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_string();
+                let body = match request.as_str() {
+                    "POST /order HTTP/1.1" => json!({
+                        "success": true, "status": "matched", "orderID": "pm-admission",
+                        "makingAmount": "3.33", "takingAmount": "10"
+                    }),
+                    "POST /exchange HTTP/1.1" => json!({
+                        "status": "ok", "response": {"type": "order", "data": {"statuses": [
+                            {"filled": {"totalSz": "10", "avgPx": "0.4", "oid": 777}}
+                        ]}}
+                    }),
+                    _ => panic!("unexpected stub request: {request}"),
+                }
+                .to_string();
+                observed.lock().await.push(request);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let search_path = schema.clone();
+        let exercised: anyhow::Result<()> = async {
+            let pool = PgPoolOptions::new()
+                .max_connections(2)
+                .after_connect(move |conn, _| {
+                    let path = search_path.clone();
+                    Box::pin(async move {
+                        sqlx::query("SELECT set_config('search_path', $1, false)")
+                            .bind(path)
+                            .execute(conn)
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .connect(&uri)
+                .await?;
+            let store = Store { pool: pool.clone() };
+            store.migrate().await?;
+            let cfg = admission_test_config(&base);
+            let outcome = OutcomeVenue::connect(&cfg)?;
+            let (pm, funder) = execution_test_venue(base).await;
+            let (pm_sub_tx, _pm_sub_rx) = mpsc::channel(1);
+            let (out_sub_tx, _out_sub_rx) = mpsc::channel(1);
+            let engine = Engine {
+                cfg,
+                store,
+                common: pool,
+                books: Arc::new(Mutex::new(BookStore::default())),
+                dirty: Arc::new(Mutex::new(DirtyCoalescer::default())),
+                topics: Arc::new(RwLock::new(HashMap::new())),
+                pm,
+                outcome,
+                pm_sub_tx,
+                out_sub_tx,
+                notify: None,
+                stats: Arc::new(MinuteStats::new()),
+                position_scan_cursor: Mutex::new(0),
+                settlement_scan_cursor: Mutex::new(0),
+                last_settlement_sweep: Mutex::new(None),
+                reported_stale_unknown: Mutex::new(HashSet::new()),
+            };
+            let token = |platform: &str, id: &str, label: &str| crate::domain::TokenRef {
+                platform: platform.into(),
+                token_id: id.into(),
+                label: label.into(),
+                option_id: "admission-market".into(),
+                condition_id: Some("admission-condition".into()),
+                asset_id: (platform == OUTCOME).then_some(100_000_001),
+                side_index: None,
+                neg_risk: Some(false),
+                fees_enabled: Some(false),
+                fee_rate: Some(Decimal::ZERO),
+            };
+            let pm_token = token(POLYMARKET, "123", "yes");
+            let out_token = token(OUTCOME, "#1", "no");
+            let topic = Topic {
+                key: TopicKey::new(uuid::Uuid::new_v4(), 0),
+                title: "admission test".into(),
+                market_title: "admission test".into(),
+                end_date: None,
+                tokens: vec![pm_token.clone(), out_token.clone()],
+            };
+            let fees = FeeContext {
+                polymarket_fee_rate: Decimal::ZERO,
+                outcome_taker_rate: Decimal::ZERO,
+            };
+            let limits = ArbLimits {
+                cost_limit: d("100"),
+                min_profit: Decimal::ZERO,
+                min_apr: Decimal::ZERO,
+                days: 1,
+            };
+            // 负例与正例均由真实盘口生成并通过 HTTP 确认所用的 confirm_plan；不伪造 ArbPlan。
+            for (shares, expected_rows) in [("7", (0_i64, 0_i64, 0_i64)), ("10", (1, 2, 2))] {
+                let confirmed = {
+                    let now = Instant::now();
+                    let mut books = engine.books.lock().await;
+                    books.set_tick_size(POLYMARKET, "123", d("0.001"));
+                    for (platform, id, price) in
+                        [(POLYMARKET, "123", "0.333"), (OUTCOME, "#1", "0.4")]
+                    {
+                        books.replace_snapshot(
+                            platform,
+                            id,
+                            vec![],
+                            vec![crate::book::Level {
+                                price: d(price),
+                                size: d(shares),
+                            }],
+                            if shares == "7" { 100 } else { 101 },
+                            now,
+                        );
+                    }
+                    let pm_book = books.get(POLYMARKET, "123").unwrap();
+                    let out_book = books.get(OUTCOME, "#1").unwrap();
+                    let plan = crate::calc::plan_arbitrage(
+                        &topic, pm_book, out_book, &pm_token, &out_token, &fees, &limits,
+                    )
+                    .ok_or_else(|| anyhow::anyhow!("calculator rejected {shares}-share fixture"))?;
+                    anyhow::ensure!(plan.pm.shares == d(shares));
+                    anyhow::ensure!(plan.pm.cap_price == d("0.333"));
+                    confirm_plan(&topic, &plan, pm_book, out_book, &fees, &limits).ok_or_else(
+                        || anyhow::anyhow!("confirmation rejected {shares}-share fixture"),
+                    )?
+                };
+                anyhow::ensure!(
+                    crate::platforms::polymarket::market_buy_base_units(
+                        confirmed.pm.shares,
+                        confirmed.pm.cap_price,
+                    )
+                    .is_ok()
+                        == (shares == "10")
+                );
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    engine.execute_confirmed_plan(
+                        &topic,
+                        &confirmed,
+                        &funder,
+                        &fees,
+                        Instant::now() + Duration::from_secs(30),
+                    ),
+                )
+                .await??;
+                let counts: (i64, i64, i64) = sqlx::query_as(
+                    "SELECT (SELECT COUNT(*) FROM arb_orders), (SELECT COUNT(*) FROM legs), \
+                     (SELECT COUNT(*) FROM signed_envelopes)",
+                )
+                .fetch_one(&engine.store.pool)
+                .await?;
+                anyhow::ensure!(
+                    counts == expected_rows,
+                    "{shares}-share row counts: {counts:?}"
+                );
+                let mut calls = requests.lock().await.clone();
+                calls.sort();
+                if shares == "7" {
+                    anyhow::ensure!(
+                        calls.is_empty(),
+                        "invalid plan submitted HTTP requests: {calls:?}"
+                    );
+                } else {
+                    anyhow::ensure!(calls == ["POST /exchange HTTP/1.1", "POST /order HTTP/1.1"]);
+                    let submitted: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM legs WHERE submitted_at IS NOT NULL \
+                         AND third_order_id IS NOT NULL AND status = 'actived'",
+                    )
+                    .fetch_one(&engine.store.pool)
+                    .await?;
+                    anyhow::ensure!(
+                        submitted == 2,
+                        "positive control must persist both successful submissions"
+                    );
+                }
+            }
+            engine.store.pool.close().await;
+            Ok(())
+        }
+        .await;
+        let _ = stop_tx.send(());
+        let server_result = server.await;
+        let cleanup = sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&admin)
+            .await;
+        admin.close().await;
+        cleanup.unwrap();
+        server_result.unwrap();
+        exercised.unwrap();
     }
 
     #[test]

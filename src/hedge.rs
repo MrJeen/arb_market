@@ -4,6 +4,8 @@ use crate::calc::{
 };
 use crate::config::{OUTCOME, POLYMARKET};
 use crate::domain::{TokenRef, Topic};
+use crate::error::{Error, Result};
+use crate::platforms::polymarket::market_buy_base_units;
 use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -27,6 +29,40 @@ pub struct HedgeAction {
 }
 
 pub type Positions = HashMap<String, HashMap<String, Decimal>>;
+
+/// 资金准入使用最终限价本金加已有估计费；不是预计成本或最坏费用上界。
+pub(crate) fn hedge_buy_required(
+    platform: &str,
+    shares: Decimal,
+    cap: Decimal,
+    fee: Decimal,
+) -> Result<Decimal> {
+    if shares <= Decimal::ZERO
+        || !shares.fract().is_zero()
+        || cap <= Decimal::ZERO
+        || cap >= Decimal::ONE
+        || fee < Decimal::ZERO
+    {
+        return Err(Error::msg("invalid rebalance buy funding inputs"));
+    }
+    let principal = match platform {
+        POLYMARKET => {
+            let (maker, _) = market_buy_base_units(shares, cap)?;
+            // maker 是整分金额，先去掉基础单位尾零，避免无谓压缩 Decimal 值域。
+            let cents = i128::try_from(maker / 10_000)
+                .map_err(|_| Error::msg("rebalance buy funding outside decimal range"))?;
+            Decimal::try_from_i128_with_scale(cents, 2)
+                .map_err(|_| Error::msg("rebalance buy funding outside decimal range"))?
+        }
+        OUTCOME => shares
+            .checked_mul(cap)
+            .ok_or_else(|| Error::msg("rebalance buy funding outside decimal range"))?,
+        _ => return Err(Error::msg("unsupported rebalance buy platform")),
+    };
+    principal
+        .checked_add(fee)
+        .ok_or_else(|| Error::msg("rebalance buy funding outside decimal range"))
+}
 
 struct Depth {
     avg: Decimal,
@@ -344,12 +380,18 @@ fn eval_buy(
     if below_venue_mins(platform, true, qty, trade_cost) {
         return None;
     }
+    // 买入 cap 取最差价与再后两档的较大值，给 IOC/FAK 留出行走空间。
+    let cap = align_hedge_price(
+        platform,
+        true,
+        depth.worst.max(depth.worst_plus_two),
+        polymarket_tick(books, platform, token_id),
+    )?;
+    let required = hedge_buy_required(platform, qty, cap, fee).ok()?;
     let balance = balances.get(platform).copied().unwrap_or(Decimal::ZERO);
-    if balance < cost {
+    if balance < required {
         return None;
     }
-    // 买入 cap 取最差价与再后两档的较大值，给 IOC/FAK 留出行走空间。
-    let cap = depth.worst.max(depth.worst_plus_two);
     Some(Candidate {
         action: HedgeAction {
             platform: platform.into(),
@@ -357,12 +399,7 @@ fn eval_buy(
             label: label.into(),
             side: HedgeSide::Buy,
             shares: qty,
-            cap_price: align_hedge_price(
-                platform,
-                true,
-                cap,
-                polymarket_tick(books, platform, token_id),
-            )?,
+            cap_price: cap,
             fee,
             // 补齐后锁定兑付 $1/share，边际价值 = 锁定兑付 - 买入成本。
             marginal_value: qty - cost,
@@ -543,6 +580,130 @@ mod tests {
             now,
             Duration::from_secs(5),
         )
+    }
+
+    #[test]
+    fn buy_funding_uses_final_cap_and_fee_before_candidate_selection() {
+        let now = Instant::now();
+        for buy_pm in [false, true] {
+            let (buy_platform, buy_token, sell_platform, sell_token, pm_qty, out_qty) = if buy_pm {
+                (POLYMARKET, "pm-yes", OUTCOME, "#10", "0", "10")
+            } else {
+                (OUTCOME, "#10", POLYMARKET, "pm-yes", "10", "0")
+            };
+            let mut books = BookStore::default();
+            books.replace_snapshot(
+                buy_platform,
+                buy_token,
+                vec![],
+                [("0.30", "10"), ("0.60", "10"), ("0.90", "10")]
+                    .into_iter()
+                    .map(|(p, s)| Level {
+                        price: d(p),
+                        size: d(s),
+                    })
+                    .collect(),
+                1,
+                now,
+            );
+            books.replace_snapshot(
+                sell_platform,
+                sell_token,
+                vec![Level {
+                    price: d("0.40"),
+                    size: d("10"),
+                }],
+                vec![],
+                1,
+                now,
+            );
+            books.set_tick_size(POLYMARKET, "pm-yes", d("0.01"));
+            let positions = imbalanced_positions(pm_qty, out_qty);
+            let fees = FeeContext {
+                polymarket_fee_rate: d("0.07"),
+                outcome_taker_rate: d("0.00035"),
+            };
+            let fee = estimate_taker_fee(buy_platform, d("10"), d("0.30"), &fees);
+            let required = hedge_buy_required(buy_platform, d("10"), d("0.90"), fee).unwrap();
+            assert_eq!(required, d("9") + fee);
+            for balance in [d("5"), d("9"), required - d("0.00000001"), required] {
+                let actions = plan_hedge(
+                    &topic(),
+                    &positions,
+                    &books,
+                    &HashMap::from([(buy_platform.into(), balance)]),
+                    &fees,
+                    d("1.5"),
+                    now,
+                    Duration::from_secs(5),
+                );
+                assert_eq!(actions.len(), 1);
+                if balance < required {
+                    assert_eq!(actions[0].side, HedgeSide::Sell);
+                } else {
+                    assert_eq!(actions[0].side, HedgeSide::Buy);
+                    assert_eq!(actions[0].marginal_value, d("7") - fee);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unrepresentable_pm_buy_does_not_hide_sell_or_mark_dust_complete() {
+        let now = Instant::now();
+        let mut books = BookStore::default();
+        books.replace_snapshot(
+            POLYMARKET,
+            "pm-yes",
+            vec![],
+            vec![Level {
+                price: d("0.333"),
+                size: d("100"),
+            }],
+            1,
+            now,
+        );
+        books.set_tick_size(POLYMARKET, "pm-yes", d("0.001"));
+        books.replace_snapshot(
+            OUTCOME,
+            "#10",
+            vec![Level {
+                price: d("0.40"),
+                size: d("100"),
+            }],
+            vec![],
+            1,
+            now,
+        );
+        let balances = HashMap::from([(POLYMARKET.into(), d("100"))]);
+        let actions = plan(&books, &balances, now, "0", "7");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].side, HedgeSide::Sell);
+        books.replace_snapshot(OUTCOME, "#10", vec![], vec![], 2, now);
+        assert!(plan(&books, &balances, now, "0", "7").is_empty());
+        assert!(!leftover_untradeable(
+            &topic(),
+            &imbalanced_positions("0", "7"),
+            &books,
+            d("1.5"),
+            now,
+            Duration::from_secs(5)
+        ));
+    }
+
+    #[test]
+    fn buy_funding_rejects_invalid_inputs_and_overflow() {
+        for platform in [POLYMARKET, OUTCOME] {
+            for (shares, cap, fee) in [
+                (d("0"), d("0.5"), d("0")),
+                (d("1.5"), d("0.5"), d("0")),
+                (d("10"), d("1"), d("0")),
+                (d("10"), d("0.5"), d("-1")),
+                (Decimal::MAX, d("0.5"), Decimal::MAX),
+            ] {
+                assert!(hedge_buy_required(platform, shares, cap, fee).is_err());
+            }
+        }
     }
 
     #[test]
