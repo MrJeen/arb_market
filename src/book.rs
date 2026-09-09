@@ -112,7 +112,10 @@ impl BookStore {
         let key = TokenBookKey::new(platform, token_id);
         let prev_tick = self.books.get(&key).and_then(|book| book.tick_size);
         if let Some(existing) = self.books.get(&key) {
-            if exchange_ts_ms <= existing.exchange_ts_ms {
+            // 缺少完整性时，同时间戳的全量快照仍可修复增量未覆盖的档位。
+            if exchange_ts_ms < existing.exchange_ts_ms
+                || (exchange_ts_ms == existing.exchange_ts_ms && !existing.stale)
+            {
                 return false;
             }
         }
@@ -136,47 +139,56 @@ impl BookStore {
         true
     }
 
-    pub fn apply_level(
+    /// 一条消息中同 token 的 (is_bid, price, size)，按消息顺序整批应用。
+    pub fn apply_levels(
         &mut self,
         platform: &str,
         token_id: &str,
-        is_bid: bool,
-        price: Decimal,
-        size: Decimal,
+        updates: &[(bool, Decimal, Decimal)],
         exchange_ts_ms: i64,
         now: Instant,
     ) -> bool {
+        if updates.is_empty() {
+            return false;
+        }
         let key = TokenBookKey::new(platform, token_id);
         let existed = self.books.contains_key(&key);
         let book = self
             .books
-            .entry(key.clone())
+            .entry(key)
             .or_insert_with(|| OrderBook::empty(platform, token_id));
         if existed && exchange_ts_ms <= book.exchange_ts_ms {
             return false;
         }
-        let levels = if is_bid {
-            &mut book.bids
-        } else {
-            &mut book.asks
-        };
-        if let Some(idx) = levels.iter().position(|l| l.price == price) {
-            if size.is_zero() {
-                levels.remove(idx);
+        let mut bids_changed = false;
+        let mut asks_changed = false;
+        for &(is_bid, price, size) in updates {
+            let levels = if is_bid {
+                bids_changed = true;
+                &mut book.bids
             } else {
-                levels[idx].size = size;
+                asks_changed = true;
+                &mut book.asks
+            };
+            if let Some(idx) = levels.iter().position(|l| l.price == price) {
+                if size.is_zero() {
+                    levels.remove(idx);
+                } else {
+                    levels[idx].size = size;
+                }
+            } else if !size.is_zero() {
+                levels.push(Level { price, size });
             }
-        } else if !size.is_zero() {
-            levels.push(Level { price, size });
         }
-        if is_bid {
+        if bids_changed {
             book.bids.sort_by(|a, b| b.price.cmp(&a.price));
-        } else {
+        }
+        if asks_changed {
             book.asks.sort_by(|a, b| a.price.cmp(&b.price));
         }
+        // 批内共用时间戳；增量不能证明初始／断线期间未覆盖的档位完整。
         book.exchange_ts_ms = exchange_ts_ms;
         book.received_at = now;
-        book.stale = false;
         true
     }
 
@@ -328,8 +340,68 @@ mod tests {
             now,
         ));
         assert_eq!(store.get(POLYMARKET, "t1").unwrap().asks[0].price, d("0.6"));
-        assert!(!store.apply_level(POLYMARKET, "t1", false, d("0.6"), d("1"), 101, now));
-        assert!(store.apply_level(POLYMARKET, "t1", false, d("0.61"), d("1"), 102, now));
+        assert!(!store.apply_levels(POLYMARKET, "t1", &[(false, d("0.6"), d("1"))], 101, now));
+        assert!(store.apply_levels(POLYMARKET, "t1", &[(false, d("0.61"), d("1"))], 102, now));
+    }
+
+    #[test]
+    fn empty_increment_batch_does_not_create_or_refresh_book() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(1);
+        let mut store = BookStore::default();
+        assert!(!store.apply_levels(POLYMARKET, "t", &[], 100, now));
+        assert!(store.get(POLYMARKET, "t").is_none());
+        store.replace_snapshot(POLYMARKET, "t", vec![], vec![], 100, now);
+        assert!(!store.apply_levels(POLYMARKET, "t", &[], 101, later));
+        let book = store.get(POLYMARKET, "t").unwrap();
+        assert_eq!(book.exchange_ts_ms, 100);
+        assert_eq!(book.received_at, now);
+    }
+
+    #[test]
+    fn partial_books_remain_stale_until_snapshot() {
+        let now = Instant::now();
+        let mut store = BookStore::default();
+        for (index, token) in ["empty", "tick-only"].into_iter().enumerate() {
+            store.index_token(POLYMARKET, token, topic_key(index as i32));
+            if token == "tick-only" {
+                store.set_tick_size(POLYMARKET, token, d("0.01"));
+            }
+            assert!(store.apply_levels(POLYMARKET, token, &[(true, d("0.4"), d("10"))], 100, now));
+            let book = store.get(POLYMARKET, token).unwrap();
+            assert!(book.stale);
+            assert!(!book.is_fresh(Duration::from_secs(5), now));
+        }
+        assert_eq!(
+            store.stale_pm_tokens(Duration::from_secs(5), now, 10),
+            vec!["empty", "tick-only"]
+        );
+        let later = now + Duration::from_secs(1);
+        assert!(!store.replace_snapshot(POLYMARKET, "empty", vec![], vec![], 99, later));
+        assert!(store.get(POLYMARKET, "empty").unwrap().stale);
+        assert!(store.replace_snapshot(POLYMARKET, "empty", vec![], vec![], 100, later));
+        assert!(store
+            .get(POLYMARKET, "empty")
+            .unwrap()
+            .is_fresh(Duration::from_secs(5), later));
+    }
+
+    #[test]
+    fn complete_book_increment_renews_ttl_without_snapshot() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(10);
+        let mut store = BookStore::default();
+        store.replace_snapshot(POLYMARKET, "t", vec![], vec![], 100, now);
+        assert!(!store
+            .get(POLYMARKET, "t")
+            .unwrap()
+            .is_fresh(Duration::from_secs(5), later));
+        assert!(!store.replace_snapshot(POLYMARKET, "t", vec![], vec![], 100, later));
+        assert!(store.apply_levels(POLYMARKET, "t", &[(true, d("0.4"), d("10"))], 101, later));
+        assert!(store
+            .get(POLYMARKET, "t")
+            .unwrap()
+            .is_fresh(Duration::from_secs(5), later));
     }
 
     #[test]

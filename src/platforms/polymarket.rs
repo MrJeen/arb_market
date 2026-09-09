@@ -1807,6 +1807,7 @@ pub fn apply_ws_message(
             })
             .unwrap_or(unix_millis() as i64);
         if let Some(arr) = payload.get("price_changes").and_then(|v| v.as_array()) {
+            let mut by_token = std::collections::BTreeMap::<&str, Vec<_>>::new();
             for change in arr {
                 let token = change
                     .get("asset_id")
@@ -1819,15 +1820,13 @@ pub fn apply_ws_message(
                     continue;
                 }
                 let is_bid = side.eq_ignore_ascii_case("BUY") || side.eq_ignore_ascii_case("BID");
-                if books.apply_level(
-                    POLYMARKET,
-                    token,
-                    is_bid,
-                    price.unwrap(),
-                    size.unwrap(),
-                    ts,
-                    now,
-                ) {
+                by_token
+                    .entry(token)
+                    .or_default()
+                    .push((is_bid, price.unwrap(), size.unwrap()));
+            }
+            for (token, updates) in by_token {
+                if books.apply_levels(POLYMARKET, token, &updates, ts, now) {
                     changed.push((token.to_string(), true));
                 }
             }
@@ -2359,6 +2358,133 @@ pub(crate) mod tests {
         match classify_submit_error(&err, "0x1".into(), json!({})) {
             SubmitResult::Unknown { message, .. } => assert!(message.contains("connection reset")),
             other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn price_change_applies_whole_token_batch_once() {
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        for token in ["a", "b"] {
+            apply_ws_message(
+                &mut books,
+                &json!({
+                    "event_type":"book", "asset_id":token, "timestamp":"100",
+                    "tick_size":"0.01",
+                    "bids":[{"price":"0.40","size":"10"}],
+                    "asks":[{"price":"0.50","size":"10"}]
+                }),
+                now,
+            );
+        }
+        let payload = json!({
+            "event_type":"price_change", "timestamp":"101", "price_changes":[
+                {"asset_id":"a","side":"BUY","price":"0.40","size":"0"},
+                {"asset_id":"b","side":"SELL","price":"0.50","size":"3"},
+                {"asset_id":"a","side":"SELL","price":"0.50","size":"0"},
+                {"asset_id":"a","side":"BUY","price":"0.41","size":"1"},
+                {"asset_id":"a","side":"BUY","price":"0.42","size":"2"},
+                {"asset_id":"a","side":"BUY","price":"0.41","size":"4"},
+                {"asset_id":"a","side":"SELL","price":"0.53","size":"6"},
+                {"asset_id":"a","side":"SELL","price":"0.52","size":"5"}
+            ]
+        });
+        let mut changed = apply_ws_message(&mut books, &payload, now);
+        changed.sort();
+        assert_eq!(changed, vec![("a".into(), true), ("b".into(), true)]);
+        let book = books.get(POLYMARKET, "a").unwrap();
+        assert_eq!(
+            book.bids
+                .iter()
+                .map(|l| (l.price, l.size))
+                .collect::<Vec<_>>(),
+            vec![
+                ("0.42".parse().unwrap(), Decimal::from(2)),
+                ("0.41".parse().unwrap(), Decimal::from(4))
+            ]
+        );
+        assert_eq!(
+            book.asks
+                .iter()
+                .map(|l| (l.price, l.size))
+                .collect::<Vec<_>>(),
+            vec![
+                ("0.52".parse().unwrap(), Decimal::from(5)),
+                ("0.53".parse().unwrap(), Decimal::from(6))
+            ]
+        );
+        assert_eq!(book.tick_size, Some("0.01".parse().unwrap()));
+        assert_eq!(
+            books.get(POLYMARKET, "b").unwrap().asks[0].size,
+            Decimal::from(3)
+        );
+        let later = now + Duration::from_secs(1);
+        for ts in ["101", "99"] {
+            let mut replay = payload.clone();
+            replay["timestamp"] = json!(ts);
+            assert!(apply_ws_message(&mut books, &replay, later).is_empty());
+            assert_eq!(books.get(POLYMARKET, "a").unwrap().received_at, now);
+        }
+        // 一个 token 的旧批次不能阻止同消息中另一个 token 的新批次。
+        books.replace_snapshot(POLYMARKET, "b", vec![], vec![], 102, later);
+        let mut mixed = payload;
+        mixed["timestamp"] = json!("102");
+        assert_eq!(
+            apply_ws_message(&mut books, &mixed, later),
+            vec![("a".into(), true)]
+        );
+    }
+
+    #[test]
+    fn disconnected_book_waits_for_full_snapshot_through_ws_and_rest() {
+        for use_rest in [false, true] {
+            let now = Instant::now();
+            let mut books = BookStore::default();
+            let mut snapshot = json!({
+                "event_type":"book", "asset_id":"t", "timestamp":"100", "tick_size":"0.01",
+                "bids":[{"price":"0.40","size":"10"}],
+                "asks":[{"price":"0.50","size":"10"}]
+            });
+            apply_ws_message(&mut books, &snapshot, now);
+            books.mark_platform_stale(POLYMARKET);
+            let later = now + Duration::from_secs(1);
+            apply_ws_message(
+                &mut books,
+                &json!({
+                    "event_type":"price_change", "timestamp":"102", "price_changes":[
+                        {"asset_id":"t","side":"BUY","price":"0.40","size":"8"}
+                    ]
+                }),
+                later,
+            );
+            assert!(!books
+                .get(POLYMARKET, "t")
+                .unwrap()
+                .is_fresh(Duration::from_secs(5), later));
+            snapshot["timestamp"] = json!("101");
+            assert!(apply_ws_message(&mut books, &snapshot, later).is_empty());
+            assert!(books.get(POLYMARKET, "t").unwrap().stale);
+            snapshot["timestamp"] = json!("102");
+            snapshot["asks"] = json!([]);
+            snapshot["bids"][0]["size"] = json!("8");
+            snapshot.as_object_mut().unwrap().remove("tick_size");
+            if use_rest {
+                assert_eq!(
+                    apply_rest_books(&mut books, &[snapshot.clone()], later),
+                    (vec!["t".into()], 0)
+                );
+            } else {
+                assert_eq!(
+                    apply_ws_message(&mut books, &snapshot, later),
+                    vec![("t".into(), true)]
+                );
+            }
+            let book = books.get(POLYMARKET, "t").unwrap();
+            assert!(book.is_fresh(Duration::from_secs(5), later));
+            assert!(book.asks.is_empty());
+            assert_eq!(book.bids[0].size, Decimal::from(8));
+            assert_eq!(book.tick_size, Some("0.01".parse().unwrap()));
+            assert!(apply_ws_message(&mut books, &snapshot, later).is_empty());
         }
     }
 

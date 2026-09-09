@@ -1720,6 +1720,28 @@ mod tests {
     }
 
     #[test]
+    fn l2_snapshot_restores_disconnected_book_at_same_timestamp() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(1);
+        let mut books = BookStore::default();
+        let mut raw = json!({"channel":"l2Book", "data":{
+            "coin":"#5160", "time":10,
+            "levels":[[{"px":"0.40","sz":"12","n":1}],[]]
+        }});
+        assert_eq!(apply_ws_book(&mut books, &raw, now), Some("#5160".into()));
+        assert_eq!(apply_ws_book(&mut books, &raw, later), None);
+        books.mark_platform_stale(OUTCOME);
+        raw["data"]["time"] = json!(9);
+        assert_eq!(apply_ws_book(&mut books, &raw, later), None);
+        assert!(books.get(OUTCOME, "#5160").unwrap().stale);
+        raw["data"]["time"] = json!(10);
+        assert_eq!(apply_ws_book(&mut books, &raw, later), Some("#5160".into()));
+        let book = books.get(OUTCOME, "#5160").unwrap();
+        assert!(book.is_fresh(Duration::from_secs(5), later));
+        assert_eq!(book.received_at, later);
+    }
+
+    #[test]
     fn parses_l2_snapshot() {
         let raw = json!({
             "channel": "l2Book",
