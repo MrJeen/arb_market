@@ -55,13 +55,17 @@ pub(super) fn project(value: &Q, upward: bool) -> Option<Decimal> {
         .find_map(|scale| at_scale(value, scale, upward))
 }
 
+pub(super) fn project_down(value: &Q) -> Option<Decimal> {
+    project(&(-value), true).map(|value| -value)
+}
+
 pub(super) fn unit_display(pm: Decimal, out: Decimal, fees: &FeeContext) -> Option<Decimal> {
     let p = rational(pm);
     let o = rational(out);
     project(
         &(&p + &o
             + rational(fees.polymarket_fee_rate) * &p * (Q::one() - &p)
-            + rational(fees.outcome_taker_rate) * o),
+            + rational(fees.outcome_builder_rate) * o),
         false,
     )
 }
@@ -69,12 +73,14 @@ pub(super) fn unit_display(pm: Decimal, out: Decimal, fees: &FeeContext) -> Opti
 pub(super) fn valid_parameters(fees: &FeeContext, limits: &ArbLimits) -> bool {
     limits.cost_limit > Decimal::ZERO
         && (Decimal::ZERO..=Decimal::ONE).contains(&fees.polymarket_fee_rate)
-        && (Decimal::ZERO..=Decimal::ONE).contains(&fees.outcome_taker_rate)
+        && (Decimal::ZERO..Decimal::ONE).contains(&fees.outcome_taker_rate)
+        && (Decimal::ZERO..=Decimal::ONE).contains(&fees.outcome_builder_rate)
 }
 
 struct Rules {
     pm_rate: Q,
     out_rate: Q,
+    builder_rate: Q,
     budget: Q,
     profit: Q,
     apr_days: Q,
@@ -88,6 +94,7 @@ impl Rules {
         Ok(Self {
             pm_rate: rational(fees.polymarket_fee_rate),
             out_rate: rational(fees.outcome_taker_rate),
+            builder_rate: rational(fees.outcome_builder_rate),
             budget: rational(limits.cost_limit),
             profit: rational(limits.min_profit),
             apr_days: rational(limits.min_apr) * Q::from_integer(limits.days.max(1).into()),
@@ -228,15 +235,19 @@ impl Acc {
         EVALUATIONS.with(|n| n.set(n.get() + 1));
         let s = integer(&self.shares);
         let pm_fee = &rules.pm_rate * (&self.pm_cost - &self.pm_cost * &self.pm_cost / &s);
-        let out_fee = &rules.out_rate * &self.out_cost;
+        let out_fee = &rules.builder_rate * &self.out_cost;
         let total = &self.pm_cost + &self.out_cost + &pm_fee + &out_fee;
-        let profit = &s - &total;
+        let settlement_reserve = &s * &rules.out_rate;
+        let expected_revenue = &s - &settlement_reserve;
+        let profit = &expected_revenue - &total;
         Values {
             s,
             pm_cost: self.pm_cost.clone(),
             out_cost: self.out_cost.clone(),
             pm_fee,
             out_fee,
+            settlement_reserve,
+            expected_revenue,
             total,
             profit,
         }
@@ -250,6 +261,8 @@ struct Values {
     out_cost: Q,
     pm_fee: Q,
     out_fee: Q,
+    settlement_reserve: Q,
+    expected_revenue: Q,
     total: Q,
     profit: Q,
 }
@@ -328,7 +341,8 @@ fn interval(
             lower = mid + 1;
         }
     }
-    // C(S)=A*S+K-r*B²/S 递增凹；profit 及非自动通过的 APR 门槛为凸函数。
+    // builder 买费只增加线性成本，结算准备只减少线性收入：
+    // C(S)=A*S+K-pm_rate*B²/S 仍递增凹；profit 及非自动通过的 APR 门槛仍凸。
     // U 失败且 L 通过时只二分该单项的通过前缀；收缩后从头复验另一门槛。
     // 已收缩的项在 [L,U] 全通过，故至多两次实际收缩，无逐股扫描。
     loop {
@@ -417,9 +431,9 @@ pub(super) fn search(
         ) {
             let p = rational(p.price);
             let o = rational(o.price);
-            let unit = &p + &o + &rules.pm_rate * &p * (Q::one() - &p) + &rules.out_rate * o;
-            if unit >= Q::one() {
-                reason = "unit_cost_ge_1";
+            let unit = &p + &o + &rules.pm_rate * &p * (Q::one() - &p) + &rules.builder_rate * o;
+            if unit >= Q::one() - &rules.out_rate {
+                reason = "unit_cost_ge_revenue";
             }
         }
     }
@@ -485,6 +499,7 @@ pub(super) struct ExactMetrics {
     values: Values,
     pm: Binding,
     out: Binding,
+    out_builder_rate: Q,
 }
 
 impl ExactMetrics {
@@ -500,7 +515,7 @@ impl ExactMetrics {
         if pm {
             &self.values.pm_cost + &self.values.pm_fee
         } else {
-            &self.values.out_cost + &self.values.out_fee
+            &self.values.s * rational(self.out.cap) * (Q::one() + &self.out_builder_rate)
         }
     }
     pub(super) fn required(&self, plan: &ArbPlan, pm: bool) -> Option<Decimal> {
@@ -520,6 +535,8 @@ struct DisplayValues {
     out_cost: Decimal,
     pm_fee: Decimal,
     out_fee: Decimal,
+    settlement_reserve: Decimal,
+    expected_revenue: Decimal,
     total: Decimal,
     profit: Decimal,
     roi: Decimal,
@@ -527,13 +544,13 @@ struct DisplayValues {
 }
 
 fn display(v: &Values, days: i64) -> Option<DisplayValues> {
-    let net = project(&v.s, false)?;
+    project(&v.s, false)?;
     for scale in (0..=28).rev() {
         let attempt = || {
-            let pm_cost = at_scale(&v.pm_cost, scale, false)?;
-            let out_cost = at_scale(&v.out_cost, scale, false)?;
-            let pm_fee = at_scale(&v.pm_fee, scale, false)?;
-            let out_fee = at_scale(&v.out_fee, scale, false)?;
+            let pm_cost = at_scale(&v.pm_cost, scale, true)?;
+            let out_cost = at_scale(&v.out_cost, scale, true)?;
+            let pm_fee = at_scale(&v.pm_fee, scale, true)?;
+            let out_fee = at_scale(&v.out_fee, scale, true)?;
             // 直接检查共同 scale 下的整数和，防止 Decimal checked_add 静默降精度。
             let total_n = BigInt::from(pm_cost.mantissa())
                 + BigInt::from(out_cost.mantissa())
@@ -542,22 +559,28 @@ fn display(v: &Values, days: i64) -> Option<DisplayValues> {
             let unit = integer(&BigInt::from(10u8).pow(scale));
             let total_q = integer(&total_n) / &unit;
             let total = at_scale(&total_q, scale, false)?;
-            let profit_q = rational(net) - &total_q;
+            let settlement_reserve = at_scale(&v.settlement_reserve, scale, true)?;
+            // 同一 scale 上费用向上投影，收入/利润向下；保持收入-现金=利润。
+            let revenue_q =
+                &v.expected_revenue - (rational(settlement_reserve) - &v.settlement_reserve);
+            let expected_revenue = at_scale(&revenue_q, scale, false)?;
+            let profit_q = &revenue_q - &total_q;
             let profit = at_scale(&profit_q, scale, false)?;
             if !total_q.is_positive() {
                 return None;
             }
             let roi_q = profit_q / total_q;
-            let roi = project(&roi_q, false)?;
-            let apr = project(
+            let roi = project_down(&roi_q)?;
+            let apr = project_down(
                 &(roi_q * Q::from_integer(365.into()) / Q::from_integer(days.max(1).into())),
-                false,
             )?;
             Some(DisplayValues {
                 pm_cost,
                 out_cost,
                 pm_fee,
                 out_fee,
+                settlement_reserve,
+                expected_revenue,
                 total,
                 profit,
                 roi,
@@ -584,7 +607,10 @@ fn make_plan(
     let shares = at_scale(&values.s, 0, false)?;
     let d = display(&values, limits.days)?;
     project(&(&values.pm_cost + &values.pm_fee), true)?;
-    project(&(&values.out_cost + &values.out_fee), true)?;
+    project(
+        &(&values.s * rational(out_cap) * (Q::one() + &rules.builder_rate)),
+        true,
+    )?;
     let pm = LegPlan {
         platform: POLYMARKET.into(),
         token_id: pm_token.token_id.clone(),
@@ -609,11 +635,14 @@ fn make_plan(
         values,
         pm: Binding::new(&pm),
         out: Binding::new(&outcome),
+        out_builder_rate: rules.builder_rate.clone(),
     };
     Some(ArbPlan {
         pm,
         outcome,
         net_shares: shares,
+        expected_revenue: d.expected_revenue,
+        settlement_reserve: d.settlement_reserve,
         total_cost: d.total,
         profit: d.profit,
         roi: d.roi,
@@ -749,8 +778,8 @@ mod tests {
             let s = Q::from_integer(n.into());
             let avg = &pc / &s;
             let fee = &s * rational(fees.polymarket_fee_rate) * &avg * (Q::one() - avg);
-            let c = &pc + &oc + fee + &oc * rational(fees.outcome_taker_rate);
-            let profit = &s - &c;
+            let c = &pc + &oc + fee + &oc * rational(fees.outcome_builder_rate);
+            let profit = &s * (Q::one() - rational(fees.outcome_taker_rate)) - &c;
             if n >= 5
                 && pc >= Q::one()
                 && &s * &o[oe].0 >= Q::one()
@@ -788,6 +817,7 @@ mod tests {
                 polymarket_fee_rate: Decimal::new(rng.gen_range(0..=10), 2)
                     + Decimal::new(rng.gen_range(0..=9), 28),
                 outcome_taker_rate: Decimal::new(rng.gen_range(0..=100), 5),
+                outcome_builder_rate: Decimal::new(rng.gen_range(0..=100), 5),
             };
             let mut bounds = limits("0", "100");
             bounds.cost_limit = Decimal::new(rng.gen_range(10..=300), 1);
@@ -804,12 +834,107 @@ mod tests {
     }
 
     #[test]
+    fn settlement_reserve_is_not_cash_and_confirm_refreshes_both_rates() {
+        let pm = book_levels(&[("0.4", "30")]);
+        let out = book_levels(&[("0.4", "30")]);
+        let fees = FeeContext {
+            outcome_taker_rate: d("0.001344"),
+            ..fees_zero()
+        };
+        let bounds = limits("5.95968", "24");
+        let plan = run(&pm, &out, &fees, &bounds).unwrap();
+        assert_eq!(plan.net_shares, d("30"));
+        assert_eq!(plan.settlement_reserve, d("0.04032"));
+        assert_eq!(plan.expected_revenue, d("29.95968"));
+        assert_eq!(plan.outcome.fee, Decimal::ZERO);
+        assert_eq!(plan.total_cost, d("24"));
+        assert_eq!(plan.profit, d("5.95968"));
+        assert_eq!(plan.outcome_required(), Some(d("12")));
+        assert!(plan.outcome_balance_sufficient(d("12")));
+        let mut strict = bounds.clone();
+        strict.min_profit += Decimal::new(1, 28);
+        assert!(run(&pm, &out, &fees, &strict).is_none());
+        strict = bounds.clone();
+        strict.min_apr = d("0.24832");
+        strict.days = 365;
+        assert!(run(&pm, &out, &fees, &strict).is_some());
+        strict.min_apr += Decimal::new(1, 28);
+        assert!(run(&pm, &out, &fees, &strict).is_none());
+
+        let topic = sample_topic();
+        let mut capped = plan.clone();
+        capped.outcome.cap_price = d("0.9");
+        let changed = FeeContext {
+            outcome_taker_rate: d("0.002"),
+            outcome_builder_rate: d("0.0003"),
+            ..fees_zero()
+        };
+        assert!(confirm(
+            &capped,
+            &pm,
+            &out,
+            &topic.tokens[0],
+            &topic.tokens[2],
+            &changed,
+            &bounds
+        )
+        .is_err());
+        let refreshed = confirm(
+            &capped,
+            &pm,
+            &out,
+            &topic.tokens[0],
+            &topic.tokens[2],
+            &changed,
+            &limits("0", "24.0036"),
+        )
+        .unwrap();
+        assert_eq!(refreshed.net_shares, d("30"));
+        assert_eq!(refreshed.outcome.fee, d("0.0036"));
+        assert_eq!(refreshed.settlement_reserve, d("0.06"));
+        assert_eq!(refreshed.expected_revenue, d("29.94"));
+        assert_eq!(refreshed.total_cost, d("24.0036"));
+        assert_eq!(
+            refreshed.expected_revenue - refreshed.total_cost,
+            refreshed.profit
+        );
+        assert_eq!(refreshed.outcome_required(), Some(d("27.0081")));
+        assert!(!refreshed.outcome_balance_sufficient(d("27.0036")));
+        assert!(!refreshed.outcome_balance_sufficient(d("27.00809999")));
+        assert!(refreshed.outcome_balance_sufficient(d("27.0081")));
+    }
+
+    #[test]
+    fn reserve_and_profit_projection_are_conservative_below_decimal_precision() {
+        let pm = book_levels(&[("0.3333333333333333333333333333", "30")]);
+        let out = book_levels(&[("0.4", "30")]);
+        let fees = FeeContext {
+            polymarket_fee_rate: d("0.07"),
+            outcome_taker_rate: d("0.0013440000000000000000000001"),
+            outcome_builder_rate: d("0.0003"),
+        };
+        let plan = run(&pm, &out, &fees, &limits("0", "100")).unwrap();
+        let v = &plan.exact.values;
+        assert!(rational(plan.settlement_reserve) >= v.settlement_reserve);
+        assert!(rational(plan.expected_revenue) <= v.expected_revenue);
+        assert!(rational(plan.total_cost) >= v.total);
+        assert!(rational(plan.profit) <= v.profit);
+        assert!(rational(plan.roi) <= &v.profit / &v.total);
+        assert_eq!(plan.expected_revenue - plan.total_cost, plan.profit);
+        assert_eq!(
+            plan.net_shares - plan.settlement_reserve,
+            plan.expected_revenue
+        );
+    }
+
+    #[test]
     fn original_fee_regression_fourteen_and_exact_legacy_counterexample() {
         let pm = book_levels(&[("0.30", "4.5"), ("0.61", "100")]);
         let out = book_levels(&[("0.40", "200")]);
         let fees = FeeContext {
             polymarket_fee_rate: d("0.07"),
             outcome_taker_rate: Decimal::ZERO,
+            outcome_builder_rate: Decimal::ZERO,
         };
         assert_eq!(
             run(&pm, &out, &fees, &limits("1", "100"))
@@ -824,6 +949,7 @@ mod tests {
         let fees = FeeContext {
             polymarket_fee_rate: Decimal::ONE,
             outcome_taker_rate: Decimal::ZERO,
+            outcome_builder_rate: Decimal::ZERO,
         };
         let rules = Rules::new(&fees, &bounds).unwrap();
         let quote = PmQuote {
@@ -891,6 +1017,8 @@ mod tests {
         assert_eq!(project(&near, true), Some(Decimal::MAX));
         let v = Values {
             s: max.clone(),
+            settlement_reserve: Q::zero(),
+            expected_revenue: max.clone(),
             pm_cost: &max / Q::from_integer(2.into()),
             out_cost: Q::zero(),
             pm_fee: Q::zero(),
@@ -915,6 +1043,7 @@ mod tests {
         let fees = FeeContext {
             polymarket_fee_rate: d("0.07"),
             outcome_taker_rate: d("0.00035"),
+            outcome_builder_rate: Decimal::ZERO,
         };
         let b = limits("0", "100");
         let plan = run(&pm, &out, &fees, &b).unwrap();
@@ -1053,8 +1182,8 @@ mod tests {
             &limits("0", "100"),
         )
         .unwrap();
-        assert_eq!(refreshed.pm.cost, d("4"));
-        assert_eq!(refreshed.profit, d("2"));
+        assert!(refreshed.pm.cost > d("4"));
+        assert!(refreshed.profit < d("2"));
         assert!(
             !refreshed.pm_balance_sufficient(d("4")),
             "展示需求4不能放行精确大于4的成本"
@@ -1076,7 +1205,7 @@ mod tests {
         let mut p2 = p1.clone();
         // 子 Decimal 位的精确成本差模拟合法逐档小数乘积，排序不得读取展示 ROI。
         p2.exact.values.total += Q::new(1.into(), BigInt::from(10u8).pow(50));
-        p2.exact.values.profit = &p2.exact.values.s - &p2.exact.values.total;
+        p2.exact.values.profit = &p2.exact.values.expected_revenue - &p2.exact.values.total;
         assert_eq!(p1.roi, p2.roi);
         assert!(p1.exact.compare(&p2.exact).is_gt());
         let mut equal_roi = p1.exact.clone();
@@ -1095,8 +1224,47 @@ mod tests {
         let fees = FeeContext {
             polymarket_fee_rate: Decimal::ONE,
             outcome_taker_rate: Decimal::ZERO,
+            outcome_builder_rate: Decimal::ZERO,
         };
         let bounds = limits("0.1223", "200");
+        // 非零 builder 和结算准备仍可同时出现通过/失败/通过的凸收益两支。
+        let nonzero = Rules::new(
+            &FeeContext {
+                outcome_taker_rate: d("0.000001"),
+                outcome_builder_rate: d("0.00001"),
+                ..fees.clone()
+            },
+            &bounds,
+        )
+        .unwrap();
+        for (s, passes) in [(5, true), (10, false), (100, true)] {
+            assert_eq!(
+                Acc::default()
+                    .plus(&s.into(), &quote, d("0.3599"))
+                    .metrics(&nonzero)
+                    .profit_passes(&nonzero),
+                passes
+            );
+        }
+        let values: Vec<_> = (5..=100)
+            .map(|s| {
+                Acc::default()
+                    .plus(&s.into(), &quote, d("0.3599"))
+                    .metrics(&nonzero)
+            })
+            .collect();
+        for triple in values.windows(3) {
+            assert!(triple[0].total < triple[1].total);
+            assert!(triple[1].total < triple[2].total);
+            assert!(
+                &triple[1].profit * Q::from_integer(2.into())
+                    <= &triple[0].profit + &triple[2].profit
+            );
+        }
+        assert_eq!(
+            interval(&Acc::default(), &quote, d("0.3599"), &nonzero).0,
+            Some(100.into())
+        );
         let rules = Rules::new(&fees, &bounds).unwrap();
         let acc = Acc::default();
         for (s, passes) in [(5, true), (10, false), (100, true)] {
@@ -1147,7 +1315,8 @@ mod tests {
                     for apr in ["-400", "-1", "-0.1", "0", "0.001", "0.02", "1"] {
                         let fees = FeeContext {
                             polymarket_fee_rate: d(pm_rate),
-                            outcome_taker_rate: d("0.00035"),
+                            outcome_taker_rate: d("0.001344"),
+                            outcome_builder_rate: d("0.0003"),
                         };
                         let b = ArbLimits {
                             min_apr: d(apr),
@@ -1163,8 +1332,8 @@ mod tests {
                             let c = &pc
                                 + &oc
                                 + &s * rational(d(pm_rate)) * &avg * (Q::one() - avg)
-                                + oc * rational(d("0.00035"));
-                            let gain = &s - &c;
+                                + oc * rational(d("0.0003"));
+                            let gain = &s * (Q::one() - rational(d("0.001344"))) - &c;
                             *n >= 5
                                 && pc >= Q::one()
                                 && &s * rational(d(out_px)) >= Q::one()
@@ -1219,6 +1388,8 @@ mod tests {
         let s = rational(Decimal::MAX) + Q::one();
         let v = Values {
             s: s.clone(),
+            settlement_reserve: Q::zero(),
+            expected_revenue: s.clone(),
             pm_cost: &s / Q::from_integer(2.into()),
             out_cost: Q::zero(),
             pm_fee: Q::zero(),

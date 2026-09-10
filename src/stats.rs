@@ -84,6 +84,9 @@ minute_stats! {
     pm_balance_refresh,
     pm_balance_refresh_fail,
     out_bal,
+    outcome_fee_refresh_ok,
+    outcome_fee_refresh_failed,
+    outcome_fee_unavailable,
     http_fail,
     skew,
     no_longer,
@@ -241,6 +244,9 @@ mod tests {
         stats.settlement_skipped_before_end();
         stats.settlement_end_date_missing();
         stats.lifecycle_busy();
+        stats.outcome_fee_refresh_ok();
+        stats.outcome_fee_refresh_failed();
+        stats.outcome_fee_unavailable();
 
         let first = stats.snapshot_and_reset();
         assert_eq!(first.wakeup, 2);
@@ -252,6 +258,9 @@ mod tests {
         assert_eq!(first.settlement_skipped_before_end, 2);
         assert_eq!(first.settlement_end_date_missing, 1);
         assert_eq!(first.lifecycle_busy, 1);
+        assert_eq!(first.outcome_fee_refresh_ok, 1);
+        assert_eq!(first.outcome_fee_refresh_failed, 1);
+        assert_eq!(first.outcome_fee_unavailable, 1);
         assert_eq!(first.calc, 0);
 
         let second = stats.snapshot_and_reset();

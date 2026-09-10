@@ -52,9 +52,24 @@ PM 买入签名保持既有 maker 金额两位、taker 股数五位精度，但�
 
 新套利会跨 PM 小数档累计完整整数份额，成本按实际吃档量计算，cap 按最后吃到的价格确定；Outcome 仍逐档取整。每个物理报价区间使用精确预算及收益门槛，取首个可行区间内的最大合法整数数量，不做跨区间全局最优搜索，也不逐股遍历大单。PM `.30×4.5 + .61×100`、Outcome `.40×200`、零费率、预算100、最低利润1时选择39股（利润1.005）；PM费率0.07、Outcome费率0时选择14股。
 
-**新套利精度口径：** 从已解析 Decimal 的尾数与 scale 精确转换为有理数，在深度乘加之前消除中间舍入；数量搜索、HTTP重新计价、两轮余额检查及ROI方向择优共享精确口径。PM估算仍为 `r*(P-P²/S)`（原均价费用公式的等价式），Outcome估算仍为 `t*O`，预算/利润/APR用精确不等式比较，不加epsilon。输入价格须为合法预测价格、预算为正、两费率支持[0,1]；无效参数跳过，不回退旧舍入算法。费用公式不变，但旧Decimal近门槛的舍入假阳性/假阴性不保证兼容。
+**新套利精度口径：** 从已解析 Decimal 的尾数与 scale 精确转换为有理数，在深度乘加之前消除中间舍入；数量搜索、HTTP重新计价、两轮余额检查及ROI方向择优共享精确口径。PM估算仍为 `r*(P-P²/S)`（原均价费用公式的等价式）；Outcome 买入只计实际随订单发送的 builder 比例，未来结算准备单列。预算以即时现金成本判断，利润/APR以净预计兑付减即时成本判断，精确比较且不加epsilon。输入价格须为合法预测价格、预算为正，PM系数支持[0,1]、Outcome协议比例须[0,1)；无效参数跳过，不回退旧固定费率或舍入算法。
 
-数据库及通知的财务字段仍为 Decimal 展示投影：cost/fee按可容纳的最大共同scale采用nearest-even，总成本为展示分项之和，利润由展示总成本派生；均价和收益率也为近似值，不以这些展示值重新作交易门槛判断。资金检查使用精确含费需求，通知中的required向上转换，不能低估；无法表示的计划保守拒绝。`ArbPlan`的精确估值仅保存在内存，并绑定身份、股数与cap；增加私有字段后不再支持外部结构体字面量构造。止盈、再平衡、实扣费用及历史账务口径未改变。
+数据库及通知的财务字段仍为 Decimal 展示投影：预计费用/准备保守投影，净收入及收益不向乐观方向舍入；利润由展示净收入减展示现金成本派生，均价和收益率为近似值，不以展示值重新作交易门槛判断。资金检查使用精确需求，Outcome按最终cap本金加cap对应builder费用预留，required向上转换，不包含未来结算准备；无法表示的计划保守拒绝。`ArbPlan`精确估值仅保存在内存并绑定身份、股数与cap，`net_shares`仍是股数，`expected_revenue`才是预计收入。实扣成交费与历史账务不因估算更新而重算。
+
+### Outcome 动态费用与估算边界
+
+启动获取 `userFees`（实际账户地址，不是agent）和 `outcomeMeta`，每300秒刷新组合内存快照，900秒过期。交易热路径不请求费用接口；刷新失败保留原快照但不延长时间。没有有效费率只暂停依赖它的新套利/止盈/再平衡，对账、结算查询和状态收尾继续。旧 `OUTCOME_TAKER_FEE_RATE` 已忽略，无固定费率兜底；无需新增env或SQL迁移。
+
+当前估算模型只支持已验证的 `venue=out`、`quoteToken=USDC`、顶层 `feeScale=1` 和合法逐市场 `deployerFeeScale=s`：`r = userSpotCrossRate × (1-activeReferralDiscount) × [s+max(s,1)]`。当前样本 `0.0007×0.96×2=0.001344`，即13.44bps；不额外乘固定2，不另套未经核实的staking/稳定币折扣。这是当前市场的样本支持模型，不是所有Outcome市场的通用官方费率。未知或缺失规则按不可估值处理。
+
+本策略采用正仓位、IOC交易：增加正仓的买入协议费0，减少正仓的卖出协议费为名义额×r。若实际订单带非零builder费，`b=OUTCOME_BUILDER_FEE/100000`，买卖均另预估名义额×b；builder best-effort并不意味着预估可以忽略。卖出仍须通过可用token余额检查，不支持把任意负仓买入直接解释为免费开仓。
+
+严格互补q对的新套利暂以 `q×r` 作为未来结算准备，来源标记 `estimated_from_taker_close`，净预计收入 `q×(1-r)`；这只是所选结算假设下的情景估计，不是实际扣费或严格费用上界。准备影响profit/ROI/APR，不进入买腿req_fee、当前余额或现金budget，也不重复从profit扣减。止盈保持“两腿净卖出收入-q”门槛；再平衡卖超额取净现金，补PM或Outcome缺口均按新增配对净预计兑付减即时买成本。
+
+最终确认绑定计划、费率规则和有效期限，尚未发送就过期/变化时放弃本轮；多腿开始发送后使用冻结依据，不因后台刷新重签重发。估算在父单计划JSON及 `legs.last_order_info.fee_estimate` 留档，不进入实际成交费用。`fills.fee_rate_bps` 对Outcome仍可NULL；实际费用只取有效fill fee（包括0，已含builderFee），缺实扣证据继续等待。
+
+分钟统计：`outcome_fee_refresh_ok/failed` 统计完整刷新结果，`outcome_fee_unavailable` 统计费率不可用跳过。正常细节DEBUG、就绪/失效/恢复INFO、刷新失败WARN；不打印完整费用响应。
+
 
 ## 成交确认与恢复
 
@@ -82,7 +97,7 @@ common 数据库提供给本服务的统一事件视为已经完成业务筛选�
 
 时间门禁的排查优先看每分钟 `minute stats`：`settlement_skipped_before_end` 统计未到期跳过次数，`settlement_end_date_missing` 统计时间缺失而继续查询的次数；配合原有 `settlement_scan`、`settlement_pending_scan` 判断处理路径。这些均是检查次数，不是去重订单数或 HTTP 请求数，提交前复查也会计数。需要逐订单排查时，启用 `market_arb::exec` 的 DEBUG 可见 `settlement time gate evaluated`，包含 `order_id`、`end_date`、`checked_at` 和 `decision`（`skip_before_end`、`query_due`、`query_missing_end_date`）。日志过滤器在加载 `.env` 前初始化，应通过进程启动环境或 systemd 覆盖配置设置 `RUST_LOG`，仅修改 `.env` 不会调整日志级别。
 
-任一平台先确认结算时，订单进入 `settlement_pending`：该订单立即停止止盈、再平衡和所有新交易，只保留两平台结算查询。两平台 payout 都可信后才核算最终 `actual_cost`、`actual_rev`、`actual_profit` 并转为 `settled`；不会用单平台结果推算另一侧，也不会自动卖出另一平台持仓。
+任一平台先确认结算时，订单进入 `settlement_pending`：该订单立即停止止盈、再平衡和所有新交易，只保留两平台结算查询。两平台 payout 都可信后才核算 `actual_cost`、`actual_rev`、`actual_profit` 并转为 `settled`；不会用单平台结果推算另一侧，也不会自动卖出另一平台持仓。当前金额仍是“真实成交净现金流＋剩余毛兑付”，尚未核实的Outcome结算费不以估算伪装实扣；新结算证据和通知明确标记未扣该费用，因此 `actual_profit` 不是已证明的最终净到账。未结算的actual汇总同样保留既有每对毛锁定兑付口径，不因估算政策重写历史记录。
 
 `settlement_pending` 走独立的扫描游标和批量，默认每 `SETTLEMENT_PENDING_SCAN_INTERVAL_SECS`（60 秒）清扫一次、每次至多 `SETTLEMENT_PENDING_SCAN_BATCH` 条，不再占用 `POSITION_SCAN_BATCH` 给活跃订单的配额，因此 pending 积压不会拉长止盈响应。清扫在同一个循环内串行执行，同一订单不会被两条路径并发处理。pending 没有超时自动最终化，长期缺失对手方 payout 时会持续驻留并每轮重试。
 

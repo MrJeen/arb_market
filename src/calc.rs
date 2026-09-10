@@ -1,6 +1,7 @@
 use crate::book::{Level, OrderBook};
 use crate::config::{OUTCOME, POLYMARKET};
 use crate::domain::{TokenRef, Topic};
+use crate::platforms::OrderSide;
 use chrono::{DateTime, Utc};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -12,7 +13,10 @@ mod exact;
 pub struct FeeContext {
     /// Polymarket `feeSchedule.rate` (0.07 crypto, not 700 bps).
     pub polymarket_fee_rate: Decimal,
+    /// 协议 taker 平仓费率，同时用于未来结算准备估计。
     pub outcome_taker_rate: Decimal,
+    /// 实际随订单发送的 builder 比例；买卖均按名义额计提。
+    pub outcome_builder_rate: Decimal,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +44,10 @@ pub struct ArbPlan {
     pub pm: LegPlan,
     pub outcome: LegPlan,
     pub net_shares: Decimal,
+    /// 所选结算估算政策下的互补组合最低情景净兑付，不是实扣保证。
+    pub expected_revenue: Decimal,
+    /// 未来结算准备，不计入即时现金成本或买腿费用。
+    pub settlement_reserve: Decimal,
     pub total_cost: Decimal,
     pub profit: Decimal,
     pub roi: Decimal,
@@ -326,9 +334,9 @@ impl LegacyAcc {
         let pm_avg = self.pm_cost / self.pm_shares;
         let out_avg = self.out_cost / self.out_shares;
         let pm_fee = estimate_polymarket_fee(self.pm_shares, pm_avg, fees);
-        let out_fee = estimate_outcome_fee(self.out_cost, fees);
+        let out_fee = estimate_outcome_fee(self.out_cost, OrderSide::Buy, fees);
         let total_cost = self.pm_cost + self.out_cost + pm_fee + out_fee;
-        let profit = net - total_cost;
+        let profit = net * (Decimal::ONE - fees.outcome_taker_rate) - total_cost;
         let roi = if total_cost > Decimal::ZERO {
             profit / total_cost
         } else {
@@ -443,13 +451,14 @@ pub struct CalcPairSample {
     pub out_ask: Option<Decimal>,
     pub out_sz: Option<Decimal>,
     pub unit_cost: Option<Decimal>,
+    pub unit_expected_revenue: Option<Decimal>,
     pub reason: &'static str,
 }
 
 impl CalcPairSample {
     pub fn compact(&self) -> String {
         format!(
-            "{}/{} pm={}x{} out={}x{} unit={} reason={}",
+            "{}/{} pm={}x{} out={}x{} unit={} revenue={} reason={}",
             self.pm_label,
             self.out_label,
             fmt_dec(self.pm_ask),
@@ -457,6 +466,7 @@ impl CalcPairSample {
             fmt_dec(self.out_ask),
             fmt_dec(self.out_sz),
             fmt_dec(self.unit_cost),
+            fmt_dec(self.unit_expected_revenue),
             self.reason
         )
     }
@@ -507,7 +517,7 @@ pub fn inspect_calc(
         match sample.reason {
             "missing_book" => counts.missing_book += 1,
             "stale_book" => counts.stale_book += 1,
-            "unit_cost_ge_1" => counts.unit_cost += 1,
+            "unit_cost_ge_revenue" => counts.unit_cost += 1,
             _ => counts.unprofitable += 1,
         }
         pairs.push(sample);
@@ -533,6 +543,7 @@ fn diagnose_pair(
         out_ask: None,
         out_sz: None,
         unit_cost: None,
+        unit_expected_revenue: None,
         reason: "missing_book",
     };
     let Some(pm_token) = topic.token(POLYMARKET, pm_label) else {
@@ -574,6 +585,7 @@ pub fn diagnose_books(
         out_ask: None,
         out_sz: None,
         unit_cost: None,
+        unit_expected_revenue: None,
         reason: "missing_book",
     };
     let Some(pm_token) = topic.token(POLYMARKET, pm_label) else {
@@ -604,6 +616,7 @@ fn diagnose_loaded(
             sample.out_ask = Some(out_px);
             sample.out_sz = Some(out_sz);
             sample.unit_cost = exact::unit_display(pm_px, out_px, fees);
+            sample.unit_expected_revenue = Some(Decimal::ONE - fees.outcome_taker_rate);
         }
     }
     sample.reason = match pm_book.tick_size {
@@ -632,12 +645,18 @@ pub fn estimate_polymarket_fee(shares: Decimal, price: Decimal, fees: &FeeContex
     shares * fees.polymarket_fee_rate * price * one_minus
 }
 
-pub fn estimate_outcome_fee(notional: Decimal, fees: &FeeContext) -> Decimal {
-    notional * fees.outcome_taker_rate
+/// 仅用于增加正仓的买入、减少可用正仓的卖出；不推广到带符号仓位。
+pub fn estimate_outcome_fee(notional: Decimal, side: OrderSide, fees: &FeeContext) -> Decimal {
+    let rate = match side {
+        OrderSide::Buy => fees.outcome_builder_rate,
+        OrderSide::Sell => fees.outcome_taker_rate + fees.outcome_builder_rate,
+    };
+    notional * rate
 }
 
 pub fn estimate_taker_fee(
     platform: &str,
+    side: OrderSide,
     shares: Decimal,
     price: Decimal,
     fees: &FeeContext,
@@ -645,7 +664,7 @@ pub fn estimate_taker_fee(
     if platform == POLYMARKET {
         estimate_polymarket_fee(shares, price, fees)
     } else {
-        estimate_outcome_fee(shares * price, fees)
+        estimate_outcome_fee(shares * price, side, fees)
     }
 }
 
@@ -762,6 +781,7 @@ mod tests {
         FeeContext {
             polymarket_fee_rate: Decimal::ZERO,
             outcome_taker_rate: Decimal::ZERO,
+            outcome_builder_rate: Decimal::ZERO,
         }
     }
 
@@ -847,7 +867,7 @@ mod tests {
         snapshot(&mut books, POLYMARKET, "pm-no", vec![("0.40", "3")], now);
         snapshot(&mut books, OUTCOME, "#11", vec![("0.40", "3")], now);
         let reasons = inspect_reasons(&books, now, &limits("-1", "10"));
-        assert!(reasons.contains(&"unit_cost_ge_1"));
+        assert!(reasons.contains(&"unit_cost_ge_revenue"));
         assert!(reasons.contains(&"venue_min"));
     }
 
@@ -954,6 +974,7 @@ mod tests {
                 let fees = FeeContext {
                     polymarket_fee_rate: rate,
                     outcome_taker_rate: Decimal::ZERO,
+                    outcome_builder_rate: Decimal::ZERO,
                 };
                 let out_px = Decimal::ONE - p - rate * p * (Decimal::ONE - p);
                 for scale in (13..=28).rev() {
@@ -1010,6 +1031,7 @@ mod tests {
         let fees = FeeContext {
             polymarket_fee_rate: Decimal::ONE,
             outcome_taker_rate: Decimal::ZERO,
+            outcome_builder_rate: Decimal::ZERO,
         };
         let bounds = ArbLimits {
             days: 365,
@@ -1168,6 +1190,7 @@ mod tests {
             let fees = FeeContext {
                 polymarket_fee_rate: d(pm_rate),
                 outcome_taker_rate: d(out_rate),
+                outcome_builder_rate: Decimal::ZERO,
             };
             assert!(search_pair(
                 &sample_topic().tokens[0],
@@ -1215,9 +1238,10 @@ mod tests {
         let fees = FeeContext {
             polymarket_fee_rate: d("0.07"),
             outcome_taker_rate: d("0.00035"),
+            outcome_builder_rate: Decimal::ZERO,
         };
-        // 10 股 PM 均价0.395，费用0.1672825；Outcome费用0.0014。
-        let mut exact = limits("1.8", "8.1186825");
+        // 10 股 PM 均价0.395，费用0.1672825；Outcome 即时费0，结算准备0.0035。
+        let mut exact = limits("1.8", "8.1172825");
         exact.days = 365;
         exact.min_apr = d("0.23");
         let plan = assert_fractional_plan(
@@ -1243,7 +1267,7 @@ mod tests {
             d("0.40"),
         );
         // 已有整数累计后再桥接，预算必须包含整体均价手续费，而非仅新增报价手续费。
-        let accumulated = limits("0", "7.7116825");
+        let accumulated = limits("0", "7.7102825");
         assert_fractional_plan(
             levels(&[("0.30", "4.5"), ("0.40", "100")]),
             levels(&[("0.40", "200")]),
@@ -1480,6 +1504,7 @@ mod tests {
         let fees = FeeContext {
             polymarket_fee_rate: d("0.07"),
             outcome_taker_rate: Decimal::ZERO,
+            outcome_builder_rate: Decimal::ZERO,
         };
         // Official crypto table: 100 shares @ $0.50 → $1.75
         assert_eq!(
@@ -1497,14 +1522,69 @@ mod tests {
     }
 
     #[test]
+    fn outcome_direction_and_builder_preserve_full_fee_precision() {
+        let mut fees = FeeContext {
+            outcome_taker_rate: d("0.001344"),
+            ..fees_zero()
+        };
+        assert_eq!(
+            estimate_taker_fee(OUTCOME, OrderSide::Buy, d("30"), d("0.9608"), &fees),
+            Decimal::ZERO
+        );
+        assert_eq!(
+            estimate_taker_fee(OUTCOME, OrderSide::Sell, d("30"), d("0.9608"), &fees),
+            d("0.038739456")
+        );
+        fees.outcome_builder_rate = d("0.0003");
+        let buy = estimate_taker_fee(OUTCOME, OrderSide::Buy, d("30"), d("0.9608"), &fees);
+        let sell = estimate_taker_fee(OUTCOME, OrderSide::Sell, d("30"), d("0.9608"), &fees);
+        assert_eq!(buy, d("0.0086472"));
+        assert_eq!(sell, d("0.047386656"));
+        assert_eq!(sell - buy, d("0.038739456"));
+    }
+
+    #[test]
+    fn diagnosis_compares_cash_to_net_unit_revenue() {
+        let mut books = BookStore::default();
+        let now = Instant::now();
+        snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.50", "30")], now);
+        snapshot(&mut books, OUTCOME, "#10", vec![("0.499", "30")], now);
+        let sample = diagnose_books(
+            &sample_topic(),
+            books.get(POLYMARKET, "pm-yes").unwrap(),
+            books.get(OUTCOME, "#10").unwrap(),
+            &FeeContext {
+                outcome_taker_rate: d("0.001344"),
+                ..fees_zero()
+            },
+            &limits("0", "100"),
+            "yes",
+            "no",
+        );
+        assert_eq!(sample.unit_cost, Some(d("0.999")));
+        assert_eq!(sample.unit_expected_revenue, Some(d("0.998656")));
+        assert_eq!(sample.reason, "unit_cost_ge_revenue");
+    }
+
+    #[test]
     fn outcome_fee_uses_taker_rate() {
         let fees = FeeContext {
             polymarket_fee_rate: Decimal::ZERO,
             outcome_taker_rate: d("0.00035"),
+            outcome_builder_rate: Decimal::ZERO,
         };
-        assert_eq!(estimate_outcome_fee(d("100"), &fees), d("0.035"));
-        assert_eq!(estimate_outcome_fee(Decimal::ZERO, &fees), Decimal::ZERO);
-        assert_eq!(estimate_outcome_fee(d("100"), &fees_zero()), Decimal::ZERO);
+        assert_eq!(
+            estimate_outcome_fee(d("100"), OrderSide::Sell, &fees),
+            d("0.035")
+        );
+        assert_eq!(
+            estimate_outcome_fee(Decimal::ZERO, OrderSide::Sell, &fees),
+            Decimal::ZERO
+        );
+        assert_eq!(
+            estimate_outcome_fee(d("100"), OrderSide::Sell, &fees_zero()),
+            Decimal::ZERO
+        );
     }
 
     #[test]
@@ -1639,6 +1719,7 @@ mod tests {
         let fees = FeeContext {
             polymarket_fee_rate: d("0.07"),
             outcome_taker_rate: d("0.00035"),
+            outcome_builder_rate: Decimal::ZERO,
         };
         for (pm_px, out_px) in [("0.39", "0.38"), ("0.40", "0.40")] {
             let mut pm = books.get(POLYMARKET, "pm-yes").unwrap().clone();
@@ -1660,7 +1741,7 @@ mod tests {
             let pm_cost = d(pm_px) * d("50");
             let out_cost = d(out_px) * d("50");
             let pm_fee = estimate_polymarket_fee(d("50"), d(pm_px), &fees);
-            let out_fee = estimate_outcome_fee(out_cost, &fees);
+            let out_fee = estimate_outcome_fee(out_cost, OrderSide::Buy, &fees);
             let total_cost = pm_cost + out_cost + pm_fee + out_fee;
             assert_eq!(confirmed.pm.cost, pm_cost);
             assert_eq!(confirmed.outcome.cost, out_cost);
@@ -1670,16 +1751,29 @@ mod tests {
             assert_eq!(confirmed.outcome.fee, out_fee);
             assert_eq!(confirmed.net_shares, d("50"));
             assert_eq!(confirmed.total_cost, total_cost);
-            assert_eq!(confirmed.profit, d("50") - total_cost);
-            assert_eq!(confirmed.roi, confirmed.profit / total_cost);
-            // APR 由展示成本的精确比值独立投影，不复用已经舍入的 ROI。
+            assert_eq!(
+                confirmed.expected_revenue,
+                d("50") * (Decimal::ONE - fees.outcome_taker_rate)
+            );
+            assert_eq!(
+                confirmed.settlement_reserve,
+                d("50") * fees.outcome_taker_rate
+            );
+            assert_eq!(confirmed.profit, confirmed.expected_revenue - total_cost);
+            assert_eq!(
+                confirmed.roi,
+                exact::project_down(
+                    &(exact::rational(confirmed.profit) / exact::rational(total_cost))
+                )
+                .unwrap()
+            );
+            // APR 由展示成本的精确比值独立向下投影，不复用已经舍入的 ROI。
             assert_eq!(
                 confirmed.apr,
-                exact::project(
+                exact::project_down(
                     &(exact::rational(confirmed.profit) / exact::rational(total_cost)
                         * exact::rational(d("365"))
-                        / exact::rational(d("30"))),
-                    false
+                        / exact::rational(d("30")))
                 )
                 .unwrap()
             );

@@ -18,6 +18,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
+pub mod fees;
+pub use fees::OutcomeFeeSnapshot;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::RwLock as StdRwLock;
+
 const USDC_BALANCE_CACHE_TTL: Duration = Duration::from_secs(10);
 const FILL_PAGE_SIZE: usize = 2_000;
 const FILL_HISTORY_LIMIT: usize = 10_000;
@@ -174,6 +179,16 @@ pub struct OutcomeVenue {
     nonce: Arc<StdMutex<u64>>,
     usdc_balance_cache: Arc<Mutex<UsdcBalanceCache>>,
     usdc_balance_refresh: Arc<Mutex<()>>,
+    fee_cache: Arc<StdRwLock<fees::FeeCache>>,
+    fee_refreshing: Arc<AtomicBool>,
+}
+
+// 只防重复刷新，不持快照锁跨 HTTP；取消任务也必须释放刷新标记。
+struct FeeRefreshGuard<'a>(&'a AtomicBool);
+impl Drop for FeeRefreshGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Default)]
@@ -221,7 +236,86 @@ impl OutcomeVenue {
             nonce: Arc::new(StdMutex::new(0)),
             usdc_balance_cache: Arc::new(Mutex::new(UsdcBalanceCache::default())),
             usdc_balance_refresh: Arc::new(Mutex::new(())),
+            fee_cache: Arc::new(StdRwLock::new(fees::FeeCache::default())),
+            fee_refreshing: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    pub fn fee_snapshot(&self, outcome_id: u64) -> Result<OutcomeFeeSnapshot> {
+        self.fee_cache
+            .read()
+            .map_err(|_| Error::msg("outcome fee cache lock poisoned"))?
+            .get(outcome_id)
+    }
+
+    pub async fn refresh_fees(&self) -> Result<()> {
+        self.fee_refreshing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::msg("outcome fee refresh already running"))?;
+        let _guard = FeeRefreshGuard(&self.fee_refreshing);
+        let started = Instant::now();
+        let result = async {
+            let account = self
+                .account
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| Error::msg("missing outcome account for userFees"))?;
+            let user_fees = self
+                .query_info("userFees", "", &json!({"type":"userFees", "user":account}))
+                .await?;
+            let account = fees::parse_account(&user_fees)?;
+            let metadata = self
+                .query_info("outcomeMeta", "", &json!({"type":"outcomeMeta"}))
+                .await?;
+            let markets = fees::parse_markets(&metadata, &account)?;
+            // 与 order_action 实际携带的 builder 完全一致，关闭归因就不估 builder 费。
+            let builder_rate = self.builder.as_ref().map_or(Decimal::ZERO, |(_, fee)| {
+                Decimal::from(*fee) / Decimal::from(100_000)
+            });
+            let mut next = self
+                .fee_cache
+                .read()
+                .map_err(|_| Error::msg("outcome fee cache lock poisoned"))?
+                .clone();
+            // Arc 只读旧代，版本计算和整张 map 构造均在锁外；发布只交换指针。
+            next.publish(account, markets, builder_rate)?;
+            let previous = std::mem::replace(
+                &mut *self
+                    .fee_cache
+                    .write()
+                    .map_err(|_| Error::msg("outcome fee cache lock poisoned"))?,
+                next,
+            );
+            drop(previous);
+            Ok(())
+        }
+        .await;
+        if let Err(err) = &result {
+            if let Ok(mut cache) = self.fee_cache.write() {
+                cache.report_availability();
+            }
+            tracing::warn!(service = "outcome", api = "fee_snapshot", elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %err, "outcome fee refresh failed; retaining original source ages");
+        }
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_fee_snapshot(
+        &self,
+        outcome_id: u64,
+        taker_rate: Decimal,
+        builder_rate: Decimal,
+    ) {
+        self.fee_cache
+            .write()
+            .unwrap()
+            .install_test(outcome_id, taker_rate, builder_rate);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_test_fee_snapshot(&self, _outcome_id: u64) {
+        self.fee_cache.write().unwrap().expire_test();
     }
 
     pub fn account_address(&self) -> Option<&str> {
@@ -584,9 +678,20 @@ impl OutcomeVenue {
         let started = Instant::now();
         let mut http_status = None;
         let result: Result<Value> = async {
-            let response = self.http.post(&self.info_url).json(body).send().await?;
+            let response = self
+                .http
+                .post(&self.info_url)
+                .json(body)
+                .send()
+                .await
+                .map_err(reqwest::Error::without_url)?;
             http_status = Some(response.status().as_u16());
-            Ok(response.error_for_status()?.json().await?)
+            Ok(response
+                .error_for_status()
+                .map_err(reqwest::Error::without_url)?
+                .json()
+                .await
+                .map_err(reqwest::Error::without_url)?)
         }
         .await;
         match &result {
@@ -1270,6 +1375,105 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn fee_user_reply() -> Value {
+        json!({"userSpotCrossRate":"0.0007", "activeReferralDiscount":"0.04", "privateIgnoredField":"never log wallet response"})
+    }
+
+    fn fee_meta_reply() -> Value {
+        json!({"feeScale":"1", "outcomes":[{"outcome":516,"venue":"out","quoteToken":"USDC","deployerFeeScale":"1","sideSpecs":[{"name":"Yes"},{"name":"No"}]}]})
+    }
+
+    #[tokio::test]
+    async fn fee_refresh_loopback_atomic_renewal_and_hot_path_without_http() {
+        let (mut venue, server) = info_stub(vec![
+            (200, fee_user_reply()),
+            (200, fee_meta_reply()),
+            (200, fee_user_reply()),
+            (503, json!({"private":"not logged"})),
+            (200, fee_user_reply()),
+            (200, fee_meta_reply()),
+        ]);
+        venue.builder = Some(("test-builder".into(), 10));
+        assert!(venue.fee_snapshot(516).is_err());
+        venue.refresh_fees().await.unwrap();
+        let first = venue.fee_snapshot(516).unwrap();
+        assert_eq!(first.taker_rate, Decimal::new(1344, 6));
+        assert_eq!(first.builder_rate, Decimal::new(1, 4));
+        for _ in 0..100 {
+            assert!(first.same_rules(&venue.fee_snapshot(516).unwrap()));
+        }
+        assert!(venue.refresh_fees().await.is_err());
+        assert_eq!(
+            first.estimate_json(),
+            venue.fee_snapshot(516).unwrap().estimate_json()
+        );
+        venue.refresh_fees().await.unwrap();
+        let renewed = venue.fee_snapshot(516).unwrap();
+        assert!(first.same_rules(&renewed));
+        assert_ne!(
+            first.estimate_json()["user_fees_fetched_at"],
+            renewed.estimate_json()["user_fees_fetched_at"]
+        );
+        assert!(!renewed
+            .estimate_json()
+            .to_string()
+            .contains("privateIgnoredField"));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 6);
+        for pair in requests.chunks_exact(2) {
+            assert_eq!(pair[0], json!({"type":"userFees","user":"0xtest"}));
+            assert_eq!(pair[1], json!({"type":"outcomeMeta"}));
+        }
+    }
+
+    #[tokio::test]
+    async fn fee_refresh_missing_account_and_unset_builder() {
+        let mut missing = test_venue();
+        missing.account = None;
+        assert!(missing.refresh_fees().await.is_err());
+        assert!(missing.fee_snapshot(516).is_err());
+        let (venue, server) = info_stub(vec![(200, fee_user_reply()), (200, fee_meta_reply())]);
+        venue.refresh_fees().await.unwrap();
+        assert_eq!(venue.fee_snapshot(516).unwrap().builder_rate, Decimal::ZERO);
+        venue.expire_test_fee_snapshot(516);
+        assert!(venue.fee_snapshot(516).is_err());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn fee_refresh_invalid_market_replaces_old_and_structural_failure_does_not_renew() {
+        let mut invalid = fee_meta_reply();
+        invalid["outcomes"][0]["venue"] = json!("unknown");
+        let (venue, server) = info_stub(vec![
+            (200, fee_user_reply()),
+            (200, fee_meta_reply()),
+            (200, fee_user_reply()),
+            (200, json!({"outcomes":null})),
+            (200, fee_user_reply()),
+            (200, invalid),
+        ]);
+        venue.refresh_fees().await.unwrap();
+        let first = venue.fee_snapshot(516).unwrap();
+        assert!(venue.refresh_fees().await.is_err());
+        assert_eq!(
+            first.estimate_json(),
+            venue.fee_snapshot(516).unwrap().estimate_json()
+        );
+        venue.refresh_fees().await.unwrap();
+        assert!(venue.fee_snapshot(516).is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn fee_refresh_guard_releases_on_cancel() {
+        let venue = test_venue();
+        venue.fee_refreshing.store(true, Ordering::Release);
+        {
+            let _guard = FeeRefreshGuard(&venue.fee_refreshing);
+        }
+        assert!(!venue.fee_refreshing.load(Ordering::Acquire));
+    }
+
     fn test_venue() -> OutcomeVenue {
         OutcomeVenue {
             http: reqwest::Client::new(),
@@ -1282,6 +1486,8 @@ mod tests {
             nonce: Arc::new(StdMutex::new(0)),
             usdc_balance_cache: Arc::new(Mutex::new(UsdcBalanceCache::default())),
             usdc_balance_refresh: Arc::new(Mutex::new(())),
+            fee_cache: Arc::new(StdRwLock::new(fees::FeeCache::default())),
+            fee_refreshing: Arc::new(AtomicBool::new(false)),
         }
     }
 

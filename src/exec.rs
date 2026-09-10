@@ -1,8 +1,7 @@
 use crate::book::{BookStore, DirtyCoalescer, OrderBook};
 use crate::calc::{
-    below_venue_mins, best_plan, confirm_plan, confirm_plan_reason, diagnose_books,
-    first_usable_ask, inspect_calc, min_trade_amount, min_trade_cost, ArbLimits, ArbPlan,
-    CalcMissSnapshot, FeeContext,
+    best_plan, confirm_plan, confirm_plan_reason, diagnose_books, first_usable_ask, inspect_calc,
+    ArbLimits, ArbPlan, CalcMissSnapshot, FeeContext,
 };
 use crate::config::{Config, OUTCOME, POLYMARKET};
 use crate::discovery::{load_active_topics, load_topic};
@@ -16,11 +15,11 @@ use crate::notify::{
     self, NatsNotifier, PlaceNotice, PlaceResult, SettlementNotice, TakeProfitCompletedNotice,
     TakeProfitTriggerNotice,
 };
-use crate::platforms::outcome::OutcomeVenue;
+use crate::platforms::outcome::{OutcomeFeeSnapshot, OutcomeVenue};
 use crate::platforms::polymarket::PolymarketVenue;
 use crate::platforms::{
-    ioc_fill, pm_fak_fill, FillPage, MarketOrderRequest, OrderPoll, OrderSide, SubmitResult,
-    TradeFill,
+    ioc_fill, pm_fak_fill, FillPage, MarketOrderRequest, OrderPoll, OrderSide, PreparedOrder,
+    SubmitResult, TradeFill,
 };
 use crate::reconcile::{FillEvidence, LegResolution, PmTradeScan};
 use crate::settlement::{OutcomeSettlement, SettlementStatus};
@@ -53,6 +52,50 @@ pub struct Engine {
     pub last_settlement_sweep: Mutex<Option<Instant>>,
     /// 已告警过的超时 unknown 腿；超时腿留在库里持续重试，告警只推一次。
     pub reported_stale_unknown: Mutex<HashSet<i64>>,
+}
+
+/// 一个动作的估值依据；最后准入后所有腿沿用它，不追逐后台刷新。
+#[derive(Clone)]
+struct ActionFees {
+    context: FeeContext,
+    outcome: OutcomeFeeSnapshot,
+    outcome_id: u64,
+}
+
+struct ConfirmedArb {
+    plan: ArbPlan,
+    fees: ActionFees,
+    deadline: Instant,
+}
+
+struct ConfirmedTakeProfit {
+    plan: TakeProfitPlan,
+    fees: ActionFees,
+    deadline: Instant,
+    notionals: [Decimal; 2],
+}
+
+#[allow(clippy::too_many_arguments)]
+fn action_fee_estimate(
+    fees: &ActionFees,
+    platform: &str,
+    token_id: &str,
+    side: OrderSide,
+    shares: Decimal,
+    notional: Decimal,
+    fee: Decimal,
+    reserve: Decimal,
+    funding: Decimal,
+) -> Value {
+    let mut estimate = fees.outcome.estimate_json();
+    estimate["action"] = json!({
+        "platform": platform, "token": token_id, "side": side.as_str(),
+        "shares": shares.to_string(), "notional": notional.to_string(),
+        "fee": fee.to_string(), "settlement_reserve": reserve.to_string(),
+        "funding": funding.to_string(),
+        "reserve_scope": "action_paired_outcome_exposure_not_additive_across_legs",
+    });
+    estimate
 }
 
 impl Engine {
@@ -132,18 +175,56 @@ impl Engine {
         Ok(false)
     }
 
-    fn fee_context(&self, topic: &Topic) -> FeeContext {
-        self.fee_context_from(Some(topic))
+    fn fee_context(&self, topic: &Topic) -> Result<ActionFees> {
+        let outcome_id: u64 = topic
+            .market_identity()?
+            .require(OUTCOME)?
+            .parse()
+            .map_err(|_| Error::msg("invalid outcome fee market identity"))?;
+        if topic
+            .tokens
+            .iter()
+            .filter(|token| token.platform == OUTCOME)
+            .any(|token| {
+                crate::domain::parse_side_coin(&token.token_id).map(|(id, _)| id)
+                    != Some(outcome_id)
+            })
+        {
+            return Err(Error::msg("outcome fee token/market identity mismatch"));
+        }
+        let outcome = self.outcome.fee_snapshot(outcome_id)?;
+        Ok(ActionFees {
+            context: FeeContext {
+                polymarket_fee_rate: topic
+                    .polymarket_fee_rate()
+                    .unwrap_or_else(|| self.cfg.polymarket_fee_bps_prior / Decimal::from(10_000)),
+                outcome_taker_rate: outcome.taker_rate,
+                outcome_builder_rate: outcome.builder_rate,
+            },
+            outcome,
+            outcome_id,
+        })
     }
 
-    fn fee_context_from(&self, topic: Option<&Topic>) -> FeeContext {
-        let rate = topic
-            .and_then(Topic::polymarket_fee_rate)
-            .unwrap_or_else(|| self.cfg.polymarket_fee_bps_prior / Decimal::from(10_000));
-        FeeContext {
-            polymarket_fee_rate: rate,
-            outcome_taker_rate: self.cfg.outcome_taker_fee_rate,
+    fn available_fees(&self, topic: &Topic) -> Option<ActionFees> {
+        match self.fee_context(topic) {
+            Ok(fees) => Some(fees),
+            Err(err) => {
+                self.stats.outcome_fee_unavailable();
+                tracing::debug!(topic = %topic.key.as_str(), error = %err,
+                    "outcome fee unavailable; skip new trading action");
+                None
+            }
         }
+    }
+
+    fn fees_admitted(&self, fees: &ActionFees, deadline: Instant) -> bool {
+        Instant::now() < deadline
+            && fees.outcome.is_fresh()
+            && self
+                .outcome
+                .fee_snapshot(fees.outcome_id)
+                .is_ok_and(|current| current.is_fresh() && fees.outcome.same_rules(&current))
     }
 
     async fn evaluate_topic(&self, topic_key: TopicKey) -> Result<()> {
@@ -173,7 +254,10 @@ impl Engine {
             return Ok(());
         }
         self.ensure_topic_pm_ticks(&topic).await;
-        let fees = self.fee_context(&topic);
+        let Some(selected_fees) = self.available_fees(&topic) else {
+            return Ok(());
+        };
+        let fees = selected_fees.context.clone();
         let limits = ArbLimits {
             cost_limit: self.cfg.arb_cost_limit,
             min_profit: self.cfg.arb_min_profit,
@@ -257,7 +341,6 @@ impl Engine {
 
     async fn execute_plan(&self, topic: &Topic, plan: ArbPlan) -> Result<()> {
         self.ensure_trading_enabled(TradingIntent::Arbitrage)?;
-        let fees = self.fee_context(topic);
         let Some(out_need) = plan.outcome_required() else {
             tracing::warn!(topic = %topic.key.as_str(), "arb exact valuation unavailable");
             return Ok(());
@@ -311,7 +394,11 @@ impl Engine {
             "balances confirmed"
         );
 
-        let Some((plan, confirmation_deadline)) = self.confirm_http_plan(topic, &plan).await?
+        let Some(ConfirmedArb {
+            plan,
+            fees,
+            deadline: confirmation_deadline,
+        }) = self.confirm_http_plan(topic, &plan).await?
         else {
             return Ok(());
         };
@@ -358,10 +445,11 @@ impl Engine {
         topic: &Topic,
         plan: &ArbPlan,
         funder: &str,
-        fees: &FeeContext,
+        selected_fees: &ActionFees,
         confirmation_deadline: Instant,
     ) -> Result<()> {
         self.ensure_trading_enabled(TradingIntent::Arbitrage)?;
+        let fees = &selected_fees.context;
         let pm_tick = self.ensure_pm_tick(&plan.pm.token_id).await;
         if !pm_tick.is_some_and(|tick| {
             tick > Decimal::ZERO
@@ -371,9 +459,37 @@ impl Engine {
             tracing::info!(topic = %topic.key.as_str(), "polymarket tick unavailable or cap changed before admission");
             return Ok(());
         }
+        if !self.fees_admitted(selected_fees, confirmation_deadline) {
+            tracing::debug!(topic = %topic.key.as_str(), "arb fee confirmation expired or changed");
+            return Ok(());
+        }
+        let pm_estimate = action_fee_estimate(
+            selected_fees,
+            POLYMARKET,
+            &plan.pm.token_id,
+            OrderSide::Buy,
+            plan.pm.shares,
+            plan.pm.cost,
+            plan.pm.fee,
+            plan.settlement_reserve,
+            plan.pm_required()
+                .ok_or_else(|| Error::msg("missing PM funding"))?,
+        );
+        let out_estimate = action_fee_estimate(
+            selected_fees,
+            OUTCOME,
+            &plan.outcome.token_id,
+            OrderSide::Buy,
+            plan.outcome.shares,
+            plan.outcome.cost,
+            plan.outcome.fee,
+            plan.settlement_reserve,
+            plan.outcome_required()
+                .ok_or_else(|| Error::msg("missing Outcome funding"))?,
+        );
         let fills = json!([
             {"platform": POLYMARKET, "token": plan.pm.token_id, "label": plan.pm.label, "shares": plan.pm.shares, "price": plan.pm.cap_price},
-            {"platform": OUTCOME, "token": plan.outcome.token_id, "label": plan.outcome.label, "shares": plan.outcome.shares, "price": plan.outcome.cap_price}
+            {"platform": OUTCOME, "token": plan.outcome.token_id, "label": plan.outcome.label, "shares": plan.outcome.shares, "price": plan.outcome.cap_price, "estimate": out_estimate}
         ]);
         let pm_token = topic.token(POLYMARKET, &plan.pm.label);
         let out_token = topic.token(OUTCOME, &plan.outcome.label);
@@ -395,6 +511,10 @@ impl Engine {
                 "arb skipped before admission: polymarket buy amounts unrepresentable");
             return Ok(());
         }
+        let prepared_pm = self.pm.prepare_market_order(funder, &pm_req).await?;
+        if !self.fees_admitted(selected_fees, confirmation_deadline) {
+            return Ok(());
+        }
         // 建档必须原子：`actived` 且没有腿的父单会被回填判为无成交并取消。
         let initial_legs = [
             NewLeg {
@@ -410,6 +530,7 @@ impl Engine {
                 req_shares: plan.pm.shares,
                 req_fee: plan.pm.fee,
                 client_order_id: None,
+                fee_estimate: Some(pm_estimate),
             },
             NewLeg {
                 platform: OUTCOME,
@@ -424,6 +545,7 @@ impl Engine {
                 req_shares: plan.outcome.shares,
                 req_fee: plan.outcome.fee,
                 client_order_id: None,
+                fee_estimate: Some(out_estimate),
             },
         ];
         let (order_id, leg_ids) = match self
@@ -434,7 +556,7 @@ impl Engine {
                 &topic.title,
                 &topic.market_title,
                 topic.end_date,
-                plan.net_shares,
+                plan.expected_revenue,
                 plan.profit,
                 plan.total_cost,
                 &fills,
@@ -465,6 +587,14 @@ impl Engine {
         };
         let [pm_leg, out_leg] = <[i64; 2]>::try_from(leg_ids)
             .map_err(|_| Error::msg("arb order must be created with both initial legs"))?;
+        // 建档等待也可能跨越刷新/过期；尚未签名时整组取消，不能留下单边提交。
+        if !self.fees_admitted(selected_fees, confirmation_deadline) {
+            self.store
+                .abort_unsubmitted_legs(&[pm_leg, out_leg], "fee_confirmation_changed_or_expired")
+                .await?;
+            mark_orders_complete(&self.store).await?;
+            return Ok(());
+        }
         self.stats.orders();
         let out_req = MarketOrderRequest {
             token_id: plan.outcome.token_id.clone(),
@@ -477,7 +607,13 @@ impl Engine {
             funder_address: None,
         };
         let (pm_res, out_res) = tokio::join!(
-            self.submit_pm(pm_leg, funder, &pm_req, fees, TradingIntent::Arbitrage),
+            self.submit_prepared_pm(
+                pm_leg,
+                &prepared_pm,
+                &pm_req,
+                fees,
+                TradingIntent::Arbitrage
+            ),
             self.submit_outcome(out_leg, &out_req, fees, TradingIntent::Arbitrage)
         );
         if let Err(err) = &pm_res {
@@ -547,7 +683,7 @@ impl Engine {
         &self,
         topic: &Topic,
         plan: &ArbPlan,
-    ) -> Result<Option<(ArbPlan, Instant)>> {
+    ) -> Result<Option<ConfirmedArb>> {
         self.ensure_pm_tick(&plan.pm.token_id).await;
         let (pm_ticket, out_ticket) = {
             let books = self.books.lock().await;
@@ -647,7 +783,10 @@ impl Engine {
             return Ok(None);
         }
         let confirmation_deadline = pm_at.min(out_at) + self.cfg.book_stale;
-        let fees = self.fee_context(topic);
+        let Some(selected_fees) = self.available_fees(topic) else {
+            return Ok(None);
+        };
+        let fees = selected_fees.context.clone();
         let limits = ArbLimits {
             cost_limit: self.cfg.arb_cost_limit,
             min_profit: self.cfg.arb_min_profit,
@@ -670,7 +809,11 @@ impl Engine {
                     out_sz = %fmt_px(out_sz),
                     "http arb confirmed"
                 );
-                Ok(Some((confirmed, confirmation_deadline)))
+                Ok(Some(ConfirmedArb {
+                    plan: confirmed,
+                    fees: selected_fees,
+                    deadline: confirmation_deadline,
+                }))
             }
             None => {
                 let miss = diagnose_books(
@@ -727,21 +870,6 @@ impl Engine {
         Err(Error::msg("no polymarket funder with sufficient balance"))
     }
 
-    async fn require_outcome_usdc(&self, required: Decimal, context: &str) -> Result<()> {
-        match self.outcome.user_state().await {
-            Ok(bal) if bal >= required => Ok(()),
-            Ok(bal) => {
-                self.notify_balance_insufficient(OUTCOME, bal, required, context);
-                Err(Error::msg(format!(
-                    "outcome buy skipped, usdc {bal} < {required}"
-                )))
-            }
-            Err(err) => Err(Error::msg(format!(
-                "outcome buy skipped, usdc balance unavailable: {err}"
-            ))),
-        }
-    }
-
     fn notify_balance_insufficient(
         &self,
         platform: &str,
@@ -769,18 +897,6 @@ impl Engine {
         };
         let order_funder = self.store.order_pm_funder(order_id).await?;
         resolve_hedge_pm_funder(side == OrderSide::Sell, token_buy, order_funder)
-    }
-
-    async fn require_pm_usdc(&self, funder: &str, required: Decimal) -> Result<()> {
-        match self.pm.balance(funder).await {
-            Ok(bal) if bal >= required => Ok(()),
-            Ok(bal) => Err(Error::msg(format!(
-                "polymarket buy skipped, usdc {bal} < {required}"
-            ))),
-            Err(err) => Err(Error::msg(format!(
-                "polymarket buy skipped, usdc balance unavailable: {err}"
-            ))),
-        }
     }
 
     async fn require_pm_token(&self, funder: &str, token_id: &str, shares: Decimal) -> Result<()> {
@@ -816,17 +932,16 @@ impl Engine {
         ensure_trading_submission_enabled(intent.enabled(&self.cfg), intent)
     }
 
-    async fn submit_pm(
+    async fn submit_prepared_pm(
         &self,
         leg_id: i64,
-        funder: &str,
+        prepared: &PreparedOrder,
         req: &MarketOrderRequest,
         fees: &FeeContext,
         intent: TradingIntent,
     ) -> Result<SubmitResult> {
         self.ensure_trading_enabled(intent)?;
         validate_pm_request_tick(req)?;
-        let prepared = self.pm.prepare_market_order(funder, req).await?;
         let book_snapshot = self.token_book_snapshot(POLYMARKET, &req.token_id).await;
         self.store
             .insert_envelope(
@@ -837,7 +952,7 @@ impl Engine {
                 book_snapshot.as_ref(),
             )
             .await?;
-        let (result, response) = self.pm.post_prepared(&prepared).await?;
+        let (result, response) = self.pm.post_prepared(prepared).await?;
         persist_submit(
             &self.store,
             leg_id,
@@ -1222,7 +1337,10 @@ impl Engine {
             return Ok(());
         }
 
-        let fees = self.fee_context(&topic);
+        let Some(selected_fees) = self.available_fees(&topic) else {
+            return Ok(());
+        };
+        let fees = selected_fees.context.clone();
 
         if settlement_access == SettlementAccess::All {
             let take_profit_tokens = take_profit_book_tokens(&topic, &positions);
@@ -1248,9 +1366,7 @@ impl Engine {
             };
             if let Some(plan) = cached_plan {
                 self.stats.take_profit_candidate();
-                if let Some(confirmed) = self
-                    .confirm_take_profit(&topic, &positions, &fees, &plan)
-                    .await?
+                if let Some(confirmed) = self.confirm_take_profit(&topic, &positions, &plan).await?
                 {
                     if self.cfg.enable_take_profit {
                         let Some(claim_id) = self
@@ -1277,16 +1393,14 @@ impl Engine {
                                 .await?;
                             return Ok(());
                         }
-                        self.stats.take_profit_confirmed();
-                        if let Some(notify) = &self.notify {
-                            notify.publish_take_profit_trigger(TakeProfitTriggerNotice {
-                                order_id: order.id,
-                                title: topic.title.clone(),
-                                expected_gain: confirmed.gain,
-                            });
-                        }
                         let result = self
-                            .execute_take_profit(order.id, claim_id, &topic, &fees, &confirmed)
+                            .execute_take_profit(
+                                order.id,
+                                claim_id,
+                                &topic,
+                                &positions,
+                                &confirmed.plan,
+                            )
                             .await;
                         if let Err(err) = result {
                             self.release_failed_zero_leg_claim(order.id, "take_profit", claim_id)
@@ -1416,21 +1530,9 @@ impl Engine {
                 .await?;
             return Ok(());
         }
-        let result = async {
-            self.store.mark_rebalance(order.id, "actived").await?;
-            let mut first_error = None;
-            for action in actions {
-                if let Err(err) = self.execute_hedge(order.id, claim_id, &action, &fees).await {
-                    tracing::error!(order_id = order.id, error = %err, "hedge submit failed");
-                    first_error.get_or_insert(err);
-                }
-            }
-            match first_error {
-                Some(err) => Err(err),
-                None => Ok(()),
-            }
-        }
-        .await;
+        let result = self
+            .execute_hedges(order.id, claim_id, &topic, &positions, &actions)
+            .await;
         if let Err(err) = result {
             self.release_failed_zero_leg_claim(order.id, "rebalance", claim_id)
                 .await?;
@@ -1675,6 +1777,8 @@ impl Engine {
             let evidence = json!({
                 "polymarket": settlement_result_evidence(&pm),
                 "outcome": settlement_result_evidence(&outcome),
+                "settlement_fee_status": "unknown",
+                "profit_basis": "gross_payout_less_trade_costs",
             });
             // One confirmed venue is enough to stop trading, but both payouts are required before
             // terminal state and actuals are made durable. Until then the order is retried.
@@ -1722,7 +1826,8 @@ impl Engine {
                         notify.publish_settlement(SettlementNotice {
                             order_id,
                             title: title.to_string(),
-                            status: "settled (polymarket+outcome)".to_string(),
+                            status: "settled (polymarket+outcome); 未扣未核实的 Outcome 结算费"
+                                .to_string(),
                             actual_profit: Some(actual_profit),
                         });
                     }
@@ -1802,9 +1907,8 @@ impl Engine {
         &self,
         topic: &Topic,
         positions: &crate::hedge::Positions,
-        fees: &FeeContext,
         cached: &TakeProfitPlan,
-    ) -> Result<Option<TakeProfitPlan>> {
+    ) -> Result<Option<ConfirmedTakeProfit>> {
         let pm_action = cached
             .actions
             .iter()
@@ -1922,15 +2026,51 @@ impl Engine {
                 return Ok(None);
             }
         }
-        Ok(plan_take_profit(
+        let Some(fees) = self.available_fees(topic) else {
+            return Ok(None);
+        };
+        // 仅确认原方向原数量；不在 claim 内缩量或换方向。
+        let mut fixed_positions = crate::hedge::Positions::new();
+        for action in &cached.actions {
+            if position_qty(positions, &action.platform, &action.label) < action.shares {
+                return Ok(None);
+            }
+            fixed_positions
+                .entry(action.platform.clone())
+                .or_default()
+                .insert(action.label.clone(), action.shares);
+        }
+        let Some(plan) = plan_take_profit(
             topic,
-            positions,
+            &fixed_positions,
             &confirmed_books,
-            fees,
+            &fees.context,
             self.cfg.take_profit_min_gain,
             Instant::now(),
             self.cfg.book_stale,
-        ))
+        )
+        .filter(|plan| same_take_profit_quantity(cached, plan)) else {
+            return Ok(None);
+        };
+        let mut notionals = [Decimal::ZERO; 2];
+        for (index, action) in plan.actions.iter().enumerate() {
+            let Some(notional) = action_notional(
+                &confirmed_books,
+                &action.platform,
+                &action.token_id,
+                OrderSide::Sell,
+                action.shares,
+            ) else {
+                return Ok(None);
+            };
+            notionals[index] = notional;
+        }
+        Ok(Some(ConfirmedTakeProfit {
+            plan,
+            fees,
+            deadline: pm_at.min(out_at) + self.cfg.book_stale,
+            notionals,
+        }))
     }
 
     async fn execute_take_profit(
@@ -1938,7 +2078,7 @@ impl Engine {
         order_id: i64,
         claim_id: uuid::Uuid,
         topic: &Topic,
-        fees: &FeeContext,
+        positions: &crate::hedge::Positions,
         plan: &TakeProfitPlan,
     ) -> Result<()> {
         self.ensure_trading_enabled(TradingIntent::TakeProfit)?;
@@ -1962,11 +2102,74 @@ impl Engine {
         pm_balance?;
         out_balance?;
 
+        // claim 后余额等待完成，再按 HTTP 盘口与当前费用确认原数量。
+        let Some(confirmed) = self.confirm_take_profit(topic, positions, plan).await? else {
+            return Err(Error::msg(
+                "take profit original quantity no longer confirmed",
+            ));
+        };
+        let plan = &confirmed.plan;
+        let pm_action = plan
+            .actions
+            .iter()
+            .find(|a| a.platform == POLYMARKET)
+            .unwrap();
+        let out_action = plan.actions.iter().find(|a| a.platform == OUTCOME).unwrap();
+        let fees = &confirmed.fees.context;
+        let estimates: Vec<_> = plan
+            .actions
+            .iter()
+            .enumerate()
+            .map(|(index, action)| {
+                action_fee_estimate(
+                    &confirmed.fees,
+                    &action.platform,
+                    &action.token_id,
+                    OrderSide::Sell,
+                    action.shares,
+                    confirmed.notionals[index],
+                    action.fee,
+                    Decimal::ZERO,
+                    Decimal::ZERO,
+                )
+            })
+            .collect();
+        let pm_estimate = estimates[plan
+            .actions
+            .iter()
+            .position(|a| a.platform == POLYMARKET)
+            .unwrap()]
+        .clone();
+        let out_estimate = estimates[plan
+            .actions
+            .iter()
+            .position(|a| a.platform == OUTCOME)
+            .unwrap()]
+        .clone();
         let pm_req = self
             .take_profit_request(topic, pm_action, Some(&funder))
             .await;
         let out_req = self.take_profit_request(topic, out_action, None).await;
         validate_pm_request_tick(&pm_req)?;
+        if !self.fees_admitted(&confirmed.fees, confirmed.deadline) {
+            return Err(Error::msg(
+                "take profit fee confirmation changed or expired",
+            ));
+        }
+        let prepared_pm = self.pm.prepare_market_order(&funder, &pm_req).await?;
+        let identity = self.market_identity_for_order(order_id, topic).await?;
+        if self
+            .settlement_gate_after_end(order_id, &topic.title, &identity, topic.end_date)
+            .await?
+            != SettlementAccess::All
+        {
+            return Err(Error::msg("take profit settlement gate changed"));
+        }
+        if !self.fees_admitted(&confirmed.fees, confirmed.deadline) {
+            return Err(Error::msg(
+                "take profit fee confirmation changed or expired",
+            ));
+        }
         let leg_ids = self
             .store
             .insert_legs_atomic(
@@ -1987,6 +2190,7 @@ impl Engine {
                         req_shares: pm_action.shares,
                         req_fee: pm_action.fee,
                         client_order_id: None,
+                        fee_estimate: Some(pm_estimate),
                     },
                     NewLeg {
                         platform: OUTCOME,
@@ -2001,6 +2205,7 @@ impl Engine {
                         req_shares: out_action.shares,
                         req_fee: out_action.fee,
                         client_order_id: None,
+                        fee_estimate: Some(out_estimate),
                     },
                 ],
             )
@@ -2008,8 +2213,31 @@ impl Engine {
         let [pm_leg, out_leg]: [i64; 2] = leg_ids
             .try_into()
             .map_err(|_| Error::msg("take profit must create exactly two legs"))?;
+        if !self.fees_admitted(&confirmed.fees, confirmed.deadline) {
+            self.store
+                .abort_unsubmitted_legs(&[pm_leg, out_leg], "fee_confirmation_changed_or_expired")
+                .await?;
+            self.store
+                .release_lifecycle(order_id, "take_profit", claim_id)
+                .await?;
+            return Ok(());
+        }
+        self.stats.take_profit_confirmed();
+        if let Some(notify) = &self.notify {
+            notify.publish_take_profit_trigger(TakeProfitTriggerNotice {
+                order_id,
+                title: topic.title.clone(),
+                expected_gain: plan.gain,
+            });
+        }
         let (pm_result, out_result) = tokio::join!(
-            self.submit_pm(pm_leg, &funder, &pm_req, fees, TradingIntent::TakeProfit),
+            self.submit_prepared_pm(
+                pm_leg,
+                &prepared_pm,
+                &pm_req,
+                fees,
+                TradingIntent::TakeProfit
+            ),
             self.submit_outcome(out_leg, &out_req, fees, TradingIntent::TakeProfit),
         );
         if submit_confirmed(&pm_result) {
@@ -2067,149 +2295,256 @@ impl Engine {
         Ok(())
     }
 
-    async fn execute_hedge(
+    async fn execute_hedges(
         &self,
         order_id: i64,
         claim_id: uuid::Uuid,
-        action: &crate::hedge::HedgeAction,
-        fees: &FeeContext,
+        topic: &Topic,
+        positions: &crate::hedge::Positions,
+        cached: &[crate::hedge::HedgeAction],
     ) -> Result<()> {
         self.ensure_trading_enabled(TradingIntent::Rebalance)?;
-        let side = match action.side {
-            HedgeSide::Buy => OrderSide::Buy,
-            HedgeSide::Sell => OrderSide::Sell,
-        };
-        let buy = side == OrderSide::Buy;
-        if below_venue_mins(
-            &action.platform,
-            buy,
-            action.shares,
-            action.shares * action.cap_price,
-        ) {
-            return Err(Error::msg(format!(
-                "{} {} skipped, {} shares @ {} below min {} shares / {} notional",
-                action.platform,
-                side.as_str(),
-                action.shares,
-                action.cap_price,
-                min_trade_amount(&action.platform, buy),
-                min_trade_cost(&action.platform, buy)
-            )));
-        }
-        if action.platform == POLYMARKET {
-            let funder = self
-                .hedge_pm_funder(order_id, &action.token_id, side)
-                .await?;
-            tracing::info!(
-                order_id,
-                funder = %funder,
-                side = side.as_str(),
-                token = %action.token_id,
-                "hedge pinned to original polymarket funder"
-            );
-            if side == OrderSide::Sell {
-                self.require_pm_token(&funder, &action.token_id, action.shares)
+        let mut funders = HashMap::new();
+        let mut balances = HashMap::new();
+        // 所有外部余额/tick等待均在整组最终重算前，避免第一腿发送后再追逐费率。
+        for action in cached {
+            let side = hedge_order_side(&action.side);
+            if action.platform == POLYMARKET {
+                let funder = self
+                    .hedge_pm_funder(order_id, &action.token_id, side)
                     .await?;
-            } else {
-                self.require_pm_usdc(
-                    &funder,
-                    hedge_buy_required(
-                        &action.platform,
-                        action.shares,
-                        action.cap_price,
-                        action.fee,
-                    )?,
-                )
-                .await?;
-            }
-            let req = MarketOrderRequest {
-                token_id: action.token_id.clone(),
-                shares: action.shares,
-                cap_price: action.cap_price,
-                side,
-                neg_risk: None,
-                tick_size: self.ensure_pm_tick(&action.token_id).await,
-                asset_id: None,
-                funder_address: Some(funder.clone()),
-            };
-            validate_pm_request_tick(&req)?;
-            let leg_id = self
-                .store
-                .insert_leg_for_claim(
-                    order_id,
-                    "rebalance",
-                    claim_id,
-                    &NewLeg {
-                        platform: POLYMARKET,
-                        token_id: &action.token_id,
-                        label: &action.label,
-                        side: side.as_str(),
-                        intent: "rebalance",
-                        funder: Some(&funder),
-                        wallet: Some(&funder),
-                        service: self.polymarket_service(&funder),
-                        req_price: action.cap_price,
-                        req_shares: action.shares,
-                        req_fee: action.fee,
-                        client_order_id: None,
-                    },
-                )
-                .await?;
-            self.submit_pm(leg_id, &funder, &req, fees, TradingIntent::Rebalance)
-                .await?;
-            Ok(())
-        } else {
-            if side == OrderSide::Sell {
+                if side == OrderSide::Sell {
+                    self.require_pm_token(&funder, &action.token_id, action.shares)
+                        .await?;
+                } else {
+                    balances.insert(POLYMARKET.to_string(), self.pm.balance(&funder).await?);
+                }
+                self.ensure_pm_tick(&action.token_id).await;
+                funders.insert(action.token_id.clone(), funder);
+            } else if side == OrderSide::Sell {
                 self.require_outcome_token(&action.token_id, action.shares)
                     .await?;
             } else {
-                self.require_outcome_usdc(
-                    hedge_buy_required(
-                        &action.platform,
-                        action.shares,
-                        action.cap_price,
-                        action.fee,
-                    )?,
-                    &format!("rebalance orderId={order_id}"),
-                )
-                .await?;
+                balances.insert(OUTCOME.to_string(), self.outcome.user_state().await?);
             }
-            let req = MarketOrderRequest {
+        }
+        let tokens = hedge_order_tokens(topic, positions, self.cfg.min_rebalance_qty);
+        self.refresh_hedge_books(order_id, &tokens).await;
+        let selected = self
+            .available_fees(topic)
+            .ok_or_else(|| Error::msg("rebalance fee unavailable"))?;
+        let fees = &selected.context;
+        let (actions, notionals, deadline) = {
+            let books = self.books.lock().await;
+            let replanned = plan_hedge(
+                topic,
+                positions,
+                &books,
+                &balances,
+                fees,
+                self.cfg.min_rebalance_qty,
+                Instant::now(),
+                self.cfg.book_stale,
+            );
+            // 不自动缩量、改方向或重复搜索；下一轮可以用新条件重新择优。
+            let mut actions = Vec::new();
+            let mut notionals = Vec::new();
+            let mut deadline = Instant::now() + self.cfg.book_stale;
+            for old in cached {
+                let action = replanned
+                    .iter()
+                    .find(|new| same_hedge_quantity(old, new))
+                    .ok_or_else(|| Error::msg("rebalance original quantity no longer confirmed"))?
+                    .clone();
+                let book = books
+                    .get(&action.platform, &action.token_id)
+                    .ok_or_else(|| Error::msg("rebalance confirmation book unavailable"))?;
+                deadline = deadline.min(book.received_at + self.cfg.book_stale);
+                // HedgeAction 没有保存均价。审计沿用其估值现金流，避免把重新走整数
+                // 深度的金额冒充 planner 用过的名义额；派生值不参与任何准入判断。
+                notionals.push(match action.side {
+                    HedgeSide::Sell => action.marginal_value + action.fee,
+                    HedgeSide::Buy => {
+                        action.shares * (Decimal::ONE - fees.outcome_taker_rate)
+                            - action.marginal_value
+                            - action.fee
+                    }
+                });
+                actions.push(action);
+            }
+            (actions, notionals, deadline)
+        };
+        let mut required = HashMap::<String, Decimal>::new();
+        let mut requests = Vec::new();
+        let mut estimates = Vec::new();
+        for (index, action) in actions.iter().enumerate() {
+            let side = hedge_order_side(&action.side);
+            let funding = if side == OrderSide::Buy {
+                let funding = hedge_buy_required(
+                    &action.platform,
+                    action.shares,
+                    action.cap_price,
+                    action.fee,
+                    fees,
+                )?;
+                *required.entry(action.platform.clone()).or_default() += funding;
+                funding
+            } else {
+                Decimal::ZERO
+            };
+            let tick = if action.platform == POLYMARKET {
+                self.books
+                    .lock()
+                    .await
+                    .get(POLYMARKET, &action.token_id)
+                    .and_then(|book| book.tick_size)
+            } else {
+                None
+            };
+            let request = MarketOrderRequest {
                 token_id: action.token_id.clone(),
                 shares: action.shares,
                 cap_price: action.cap_price,
                 side,
                 neg_risk: None,
-                tick_size: None,
+                tick_size: tick,
                 asset_id: crate::domain::parse_side_coin(&action.token_id)
                     .map(|(id, side)| crate::domain::side_asset_id(id, side)),
-                funder_address: None,
+                funder_address: funders.get(&action.token_id).cloned(),
             };
-            let leg_id = self
-                .store
-                .insert_leg_for_claim(
-                    order_id,
-                    "rebalance",
-                    claim_id,
-                    &NewLeg {
-                        platform: OUTCOME,
-                        token_id: &action.token_id,
-                        label: &action.label,
-                        side: side.as_str(),
-                        intent: "rebalance",
-                        funder: None,
-                        wallet: self.outcome.account_address(),
-                        service: None,
-                        req_price: action.cap_price,
-                        req_shares: action.shares,
-                        req_fee: action.fee,
-                        client_order_id: None,
-                    },
+            if action.platform == POLYMARKET {
+                validate_pm_request_tick(&request)?;
+            }
+            let mut estimate = action_fee_estimate(
+                &selected,
+                &action.platform,
+                &action.token_id,
+                side,
+                action.shares,
+                notionals[index],
+                action.fee,
+                if side == OrderSide::Buy {
+                    action.shares * fees.outcome_taker_rate
+                } else {
+                    Decimal::ZERO
+                },
+                funding,
+            );
+            estimate["action"]["notional_source"] = json!("derived_from_planner_cashflow");
+            estimates.push(estimate);
+            requests.push(request);
+        }
+        for (platform, amount) in required {
+            if balances.get(&platform).copied().unwrap_or(Decimal::ZERO) < amount {
+                if platform == OUTCOME {
+                    self.notify_balance_insufficient(
+                        OUTCOME,
+                        balances.get(&platform).copied().unwrap_or(Decimal::ZERO),
+                        amount,
+                        &format!("rebalance orderId={order_id}"),
+                    );
+                }
+                return Err(Error::msg(
+                    "rebalance confirmed aggregate funding insufficient",
+                ));
+            }
+        }
+        let mut prepared_pm = Vec::new();
+        for (action, request) in actions.iter().zip(&requests) {
+            prepared_pm.push(if action.platform == POLYMARKET {
+                Some(
+                    self.pm
+                        .prepare_market_order(request.funder_address.as_deref().unwrap(), request)
+                        .await?,
                 )
+            } else {
+                None
+            });
+        }
+        let legs: Vec<_> = actions
+            .iter()
+            .zip(&requests)
+            .zip(estimates)
+            .map(|((action, request), estimate)| {
+                let funder = request.funder_address.as_deref();
+                NewLeg {
+                    platform: &action.platform,
+                    token_id: &action.token_id,
+                    label: &action.label,
+                    side: request.side.as_str(),
+                    intent: "rebalance",
+                    funder,
+                    wallet: if action.platform == POLYMARKET {
+                        funder
+                    } else {
+                        self.outcome.account_address()
+                    },
+                    service: funder.and_then(|f| self.polymarket_service(f)),
+                    req_price: action.cap_price,
+                    req_shares: action.shares,
+                    req_fee: action.fee,
+                    client_order_id: None,
+                    fee_estimate: Some(estimate),
+                }
+            })
+            .collect();
+        let identity = self.market_identity_for_order(order_id, topic).await?;
+        let access = self
+            .settlement_gate_after_end(order_id, &topic.title, &identity, topic.end_date)
+            .await?;
+        if access == SettlementAccess::Stop
+            || actions
+                .iter()
+                .any(|action| !action_allowed_for_rebalance(action, access))
+        {
+            return Err(Error::msg("rebalance settlement gate changed"));
+        }
+        self.store.mark_rebalance(order_id, "actived").await?;
+        if !self.fees_admitted(&selected, deadline) {
+            return Err(Error::msg("rebalance fee confirmation changed or expired"));
+        }
+        let ids = self
+            .store
+            .insert_legs_atomic(order_id, "rebalance", claim_id, &legs)
+            .await?;
+        if !self.fees_admitted(&selected, deadline) {
+            self.store
+                .abort_unsubmitted_legs(&ids, "fee_confirmation_changed_or_expired")
                 .await?;
-            self.submit_outcome(leg_id, &req, fees, TradingIntent::Rebalance)
+            self.store
+                .release_lifecycle(order_id, "rebalance", claim_id)
                 .await?;
-            Ok(())
+            return Ok(());
+        }
+        // 此后整组冻结。已开始提交则保持现有部分失败/未知状态对账，不重签或重发。
+        let mut first_error = None;
+        for (((leg_id, request), action), prepared) in ids
+            .into_iter()
+            .zip(&requests)
+            .zip(&actions)
+            .zip(&prepared_pm)
+        {
+            let result = if action.platform == POLYMARKET {
+                self.submit_prepared_pm(
+                    leg_id,
+                    prepared.as_ref().unwrap(),
+                    request,
+                    fees,
+                    TradingIntent::Rebalance,
+                )
+                .await
+            } else {
+                self.submit_outcome(leg_id, request, fees, TradingIntent::Rebalance)
+                    .await
+            };
+            if let Err(err) = result {
+                tracing::error!(order_id, error = %err, "hedge submit failed");
+                first_error.get_or_insert(err);
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
         }
     }
 
@@ -2541,6 +2876,60 @@ fn take_profit_book_tokens(
         }
     }
     tokens
+}
+
+fn same_take_profit_quantity(old: &TakeProfitPlan, new: &TakeProfitPlan) -> bool {
+    old.shares == new.shares
+        && old.actions.iter().all(|action| {
+            new.actions.iter().any(|other| {
+                action.platform == other.platform
+                    && action.token_id == other.token_id
+                    && action.shares == other.shares
+            })
+        })
+}
+
+fn hedge_order_side(side: &HedgeSide) -> OrderSide {
+    match side {
+        HedgeSide::Buy => OrderSide::Buy,
+        HedgeSide::Sell => OrderSide::Sell,
+    }
+}
+
+fn same_hedge_quantity(old: &crate::hedge::HedgeAction, new: &crate::hedge::HedgeAction) -> bool {
+    old.platform == new.platform
+        && old.token_id == new.token_id
+        && old.side == new.side
+        && old.shares == new.shares
+}
+
+/// 用同一份确认盘口记录名义额，不从费用倒推，也不把限价金额冒充均价成交额。
+fn action_notional(
+    books: &BookStore,
+    platform: &str,
+    token: &str,
+    side: OrderSide,
+    shares: Decimal,
+) -> Option<Decimal> {
+    let book = books.get(platform, token)?;
+    let levels = match side {
+        OrderSide::Buy => &book.asks,
+        OrderSide::Sell => &book.bids,
+    };
+    let mut left = shares;
+    let mut notional = Decimal::ZERO;
+    for level in levels
+        .iter()
+        .filter(|level| level.price > Decimal::ZERO && level.size > Decimal::ZERO)
+    {
+        let quantity = left.min(level.size);
+        notional += quantity * level.price;
+        left -= quantity;
+        if left <= Decimal::ZERO {
+            return Some(notional);
+        }
+    }
+    None
 }
 
 fn position_qty(positions: &crate::hedge::Positions, platform: &str, label: &str) -> Decimal {
@@ -3015,7 +3404,6 @@ mod tests {
             arb_cost_limit: d("100"),
             min_rebalance_qty: Decimal::ONE,
             polymarket_fee_bps_prior: Decimal::ZERO,
-            outcome_taker_fee_rate: Decimal::ZERO,
             pending_leg_timeout: Duration::from_secs(300),
             unknown_leg_timeout: Duration::from_secs(300),
             max_active_orders: 10,
@@ -3038,6 +3426,223 @@ mod tests {
             nats_channel: String::new(),
             cat: "admission-test".into(),
         }
+    }
+
+    async fn fee_test_engine() -> Engine {
+        let base = "http://127.0.0.1:1";
+        let cfg = admission_test_config(base);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .unwrap();
+        let outcome = OutcomeVenue::connect(&cfg).unwrap();
+        let (pm, _) = crate::platforms::polymarket::tests::execution_test_venue(base.into()).await;
+        let (pm_sub_tx, _) = mpsc::channel(1);
+        let (out_sub_tx, _) = mpsc::channel(1);
+        Engine {
+            cfg,
+            store: Store { pool: pool.clone() },
+            common: pool,
+            books: Arc::new(Mutex::new(BookStore::default())),
+            dirty: Arc::new(Mutex::new(DirtyCoalescer::default())),
+            topics: Arc::new(RwLock::new(HashMap::new())),
+            pm,
+            outcome,
+            pm_sub_tx,
+            out_sub_tx,
+            notify: None,
+            stats: Arc::new(MinuteStats::new()),
+            position_scan_cursor: Mutex::new(0),
+            settlement_scan_cursor: Mutex::new(0),
+            last_settlement_sweep: Mutex::new(None),
+            reported_stale_unknown: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn fee_test_topic() -> Topic {
+        let mut topic = take_profit_topic();
+        for token in &mut topic.tokens {
+            if token.platform == POLYMARKET {
+                token.condition_id = Some("test-condition".into());
+                token.fees_enabled = Some(false);
+            } else {
+                token.token_id = if token.label == "yes" { "#10" } else { "#11" }.into();
+            }
+        }
+        topic
+    }
+
+    #[tokio::test]
+    async fn outcome_fee_admission_rejects_changed_expired_and_missing_rules_without_io() {
+        let engine = fee_test_engine().await;
+        let topic = fee_test_topic();
+        assert!(engine.available_fees(&topic).is_none());
+        engine
+            .outcome
+            .install_test_fee_snapshot(1, d("0.001344"), d("0.0001"));
+        let fees = engine.fee_context(&topic).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        assert!(engine.fees_admitted(&fees, deadline));
+        assert!(!engine.fees_admitted(&fees, Instant::now()));
+        engine
+            .outcome
+            .install_test_fee_snapshot(1, d("0.001344"), d("0.0001"));
+        assert!(
+            engine.fees_admitted(&fees, deadline),
+            "same rules renewal must remain valid"
+        );
+        engine
+            .outcome
+            .install_test_fee_snapshot(1, d("0.002"), d("0.0001"));
+        assert!(!engine.fees_admitted(&fees, deadline));
+        let current = engine.fee_context(&topic).unwrap();
+        engine.outcome.expire_test_fee_snapshot(1);
+        assert!(!engine.fees_admitted(&current, deadline));
+        assert!(engine.available_fees(&topic).is_none());
+        assert_eq!(engine.stats.snapshot_and_reset().outcome_fee_unavailable, 2);
+    }
+
+    #[tokio::test]
+    async fn confirmed_arb_changed_or_stale_fee_never_reaches_db_or_submission() {
+        let engine = fee_test_engine().await;
+        let topic = fee_test_topic();
+        engine
+            .outcome
+            .install_test_fee_snapshot(1, d("0.001344"), Decimal::ZERO);
+        let selected = engine.fee_context(&topic).unwrap();
+        let limits = ArbLimits {
+            cost_limit: d("100"),
+            min_profit: Decimal::ZERO,
+            min_apr: Decimal::ZERO,
+            days: 1,
+        };
+        let plan = {
+            let mut books = engine.books.lock().await;
+            books.set_tick_size(POLYMARKET, "pm-yes", d("0.01"));
+            for (platform, token) in [(POLYMARKET, "pm-yes"), (OUTCOME, "#11")] {
+                books.replace_snapshot(
+                    platform,
+                    token,
+                    vec![],
+                    vec![crate::book::Level {
+                        price: d("0.4"),
+                        size: d("30"),
+                    }],
+                    1,
+                    Instant::now(),
+                );
+            }
+            crate::calc::plan_arbitrage(
+                &topic,
+                books.get(POLYMARKET, "pm-yes").unwrap(),
+                books.get(OUTCOME, "#11").unwrap(),
+                topic.token(POLYMARKET, "yes").unwrap(),
+                topic.token(OUTCOME, "no").unwrap(),
+                &selected.context,
+                &limits,
+            )
+            .unwrap()
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        engine
+            .outcome
+            .install_test_fee_snapshot(1, d("0.002"), Decimal::ZERO);
+        engine
+            .execute_confirmed_plan(&topic, &plan, "unused", &selected, deadline)
+            .await
+            .unwrap();
+        engine
+            .outcome
+            .install_test_fee_snapshot(1, d("0.001344"), Decimal::ZERO);
+        let fresh = engine.fee_context(&topic).unwrap();
+        engine.outcome.expire_test_fee_snapshot(1);
+        engine
+            .execute_confirmed_plan(&topic, &plan, "unused", &fresh, deadline)
+            .await
+            .unwrap();
+        assert_eq!(engine.stats.snapshot_and_reset().orders, 0);
+    }
+
+    #[tokio::test]
+    async fn frozen_action_estimates_do_not_follow_refresh_and_include_pm_pair_reserve() {
+        let engine = fee_test_engine().await;
+        engine
+            .outcome
+            .install_test_fee_snapshot(1, d("0.001344"), d("0.0001"));
+        let frozen = engine.fee_context(&fee_test_topic()).unwrap();
+        let estimate = |platform| {
+            action_fee_estimate(
+                &frozen,
+                platform,
+                "test",
+                OrderSide::Buy,
+                d("30"),
+                d("12"),
+                d("0.0012"),
+                d("0.04032"),
+                d("12.0012"),
+            )
+        };
+        let before = estimate(POLYMARKET);
+        engine
+            .outcome
+            .install_test_fee_snapshot(1, d("0.003"), d("0.002"));
+        let after = estimate(POLYMARKET);
+        assert_eq!(before, after);
+        assert_eq!(after["action"]["settlement_reserve"], "0.04032");
+        assert_eq!(estimate(OUTCOME)["action"]["fee"], "0.0012");
+        assert_eq!(frozen.context.outcome_taker_rate, d("0.001344"));
+    }
+
+    #[test]
+    fn lifecycle_confirmation_rejects_resizing_or_switching_original_actions() {
+        let action = crate::hedge::HedgeAction {
+            platform: OUTCOME.into(),
+            token_id: "#11".into(),
+            label: "no".into(),
+            side: HedgeSide::Buy,
+            shares: d("30"),
+            cap_price: d("0.4"),
+            fee: Decimal::ZERO,
+            marginal_value: d("17.95968"),
+        };
+        let mut changed = action.clone();
+        changed.shares = d("29");
+        assert!(!same_hedge_quantity(&action, &changed));
+        changed = action.clone();
+        changed.side = HedgeSide::Sell;
+        assert!(!same_hedge_quantity(&action, &changed));
+        changed = action.clone();
+        changed.cap_price = d("0.41");
+        assert!(
+            same_hedge_quantity(&action, &changed),
+            "recomputed cap is separately funded"
+        );
+        let sell = |platform: &str, token: &str| TakeProfitAction {
+            platform: platform.into(),
+            token_id: token.into(),
+            label: "yes".into(),
+            shares: d("30"),
+            cap_price: d("0.6"),
+            fee: Decimal::ZERO,
+        };
+        let old = TakeProfitPlan {
+            actions: [sell(POLYMARKET, "pm"), sell(OUTCOME, "#11")],
+            shares: d("30"),
+            gross_revenue: d("36"),
+            total_fee: Decimal::ZERO,
+            gain: d("6"),
+        };
+        let mut resized = old.clone();
+        resized.shares = d("29");
+        resized
+            .actions
+            .iter_mut()
+            .for_each(|action| action.shares = d("29"));
+        assert!(!same_take_profit_quantity(&old, &resized));
+        let mut switched = old.clone();
+        switched.actions[1].token_id = "#10".into();
+        assert!(!same_take_profit_quantity(&old, &switched));
+        assert!(same_take_profit_quantity(&old, &old));
     }
 
     #[test]
@@ -3335,6 +3940,7 @@ mod tests {
             store.migrate().await?;
             let cfg = admission_test_config(&base);
             let outcome = OutcomeVenue::connect(&cfg)?;
+            outcome.install_test_fee_snapshot(0, Decimal::ZERO, Decimal::ZERO);
             let (pm, funder) = execution_test_venue(base).await;
             let (pm_sub_tx, _pm_sub_rx) = mpsc::channel(1);
             let (out_sub_tx, _out_sub_rx) = mpsc::channel(1);
@@ -3360,7 +3966,11 @@ mod tests {
                 platform: platform.into(),
                 token_id: id.into(),
                 label: label.into(),
-                option_id: "admission-market".into(),
+                option_id: if platform == OUTCOME {
+                    "0".into()
+                } else {
+                    "admission-market".into()
+                },
                 condition_id: Some("admission-condition".into()),
                 asset_id: (platform == OUTCOME).then_some(100_000_001),
                 side_index: None,
@@ -3369,7 +3979,7 @@ mod tests {
                 fee_rate: Some(Decimal::ZERO),
             };
             let pm_token = token(POLYMARKET, "123", "yes");
-            let out_token = token(OUTCOME, "#1", "no");
+            let out_token = token(OUTCOME, "#01", "no");
             let topic = Topic {
                 key: TopicKey::new(uuid::Uuid::new_v4(), 0),
                 title: "admission test".into(),
@@ -3380,6 +3990,7 @@ mod tests {
             let fees = FeeContext {
                 polymarket_fee_rate: Decimal::ZERO,
                 outcome_taker_rate: Decimal::ZERO,
+                outcome_builder_rate: Decimal::ZERO,
             };
             let limits = ArbLimits {
                 cost_limit: d("100"),
@@ -3394,7 +4005,7 @@ mod tests {
                     let mut books = engine.books.lock().await;
                     books.set_tick_size(POLYMARKET, "123", d("0.001"));
                     for (platform, id, price) in
-                        [(POLYMARKET, "123", "0.333"), (OUTCOME, "#1", "0.4")]
+                        [(POLYMARKET, "123", "0.333"), (OUTCOME, "#01", "0.4")]
                     {
                         books.replace_snapshot(
                             platform,
@@ -3409,7 +4020,7 @@ mod tests {
                         );
                     }
                     let pm_book = books.get(POLYMARKET, "123").unwrap();
-                    let out_book = books.get(OUTCOME, "#1").unwrap();
+                    let out_book = books.get(OUTCOME, "#01").unwrap();
                     let plan = crate::calc::plan_arbitrage(
                         &topic, pm_book, out_book, &pm_token, &out_token, &fees, &limits,
                     )
@@ -3434,7 +4045,7 @@ mod tests {
                         &topic,
                         &confirmed,
                         &funder,
-                        &fees,
+                        &engine.fee_context(&topic)?,
                         Instant::now() + Duration::from_secs(30),
                     ),
                 )
@@ -3531,6 +4142,7 @@ mod tests {
         let fees = FeeContext {
             polymarket_fee_rate: Decimal::ZERO,
             outcome_taker_rate: Decimal::ZERO,
+            outcome_builder_rate: Decimal::ZERO,
         };
         let limits = ArbLimits {
             cost_limit: d("100"),
@@ -3807,6 +4419,7 @@ mod tests {
                             req_shares: d("10"),
                             req_fee: Decimal::ZERO,
                             client_order_id: None,
+                            fee_estimate: None,
                         }],
                         0,
                         Instant::now() + Duration::from_secs(30),
@@ -3922,6 +4535,7 @@ mod tests {
                     platform: POLYMARKET, token_id: "yes", label: "yes", side: "BUY", intent: "arb_buy",
                     funder: Some("test-funder"), wallet: None, service: None,
                     req_price: d("0.5"), req_shares: d("10"), req_fee: Decimal::ZERO, client_order_id: None,
+                        fee_estimate: None,
                 }], 0, Instant::now() + Duration::from_secs(30)
             ).await?;
             let leg = store.open_legs().await?.into_iter().find(|leg| leg.id == ids[0]).unwrap();
@@ -4033,7 +4647,7 @@ mod tests {
                     d("10"), d("1"), d("9"), &json!([]), &[NewLeg {
                         platform:POLYMARKET,token_id:"yes",label:"yes",side:"BUY",intent:"arb_buy",
                         funder:Some("test-funder"),wallet:None,service:None,req_price:d("0.5"),req_shares:d("10"),
-                        req_fee:Decimal::ZERO,client_order_id:None,
+                        req_fee:Decimal::ZERO,client_order_id:None,fee_estimate:None,
                     }],
                     0, Instant::now() + Duration::from_secs(30),
                 ).await?;
@@ -4279,6 +4893,7 @@ mod tests {
         let fees = FeeContext {
             polymarket_fee_rate: d("0.07"),
             outcome_taker_rate: d("0.00035"),
+            outcome_builder_rate: Decimal::ZERO,
         };
         let (shares, price) = ack_fill(
             OUTCOME,
@@ -4289,9 +4904,9 @@ mod tests {
             &json!({}),
         )
         .unwrap();
-        let fee = estimate_taker_fee(OUTCOME, shares, price, &fees);
+        let fee = estimate_taker_fee(OUTCOME, OrderSide::Sell, shares, price, &fees);
         assert_eq!(fee, d("30") * d("0.949") * d("0.00035"));
-        let pm_fee = estimate_taker_fee(POLYMARKET, d("30"), d("0.40"), &fees);
+        let pm_fee = estimate_taker_fee(POLYMARKET, OrderSide::Buy, d("30"), d("0.40"), &fees);
         assert_eq!(pm_fee, d("30") * d("0.07") * d("0.40") * d("0.60"));
     }
 

@@ -73,6 +73,55 @@ pub async fn run() -> anyhow::Result<()> {
     });
     engine.refresh_discovery().await?;
 
+    // 已有订单对账先启动，费用 API 失败/超时只影响后续新增交易评估。
+    let engine_rec = engine.clone();
+    let rec_interval = cfg.reconcile_interval;
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(rec_interval);
+        loop {
+            tick.tick().await;
+            if let Err(err) = engine_rec.reconcile().await {
+                tracing::error!(error = %err, "reconcile failed");
+            }
+        }
+    });
+
+    if cfg.platform_enabled(OUTCOME) {
+        match engine.outcome.refresh_fees().await {
+            Ok(()) => engine.stats.outcome_fee_refresh_ok(),
+            Err(_) => {
+                engine.stats.outcome_fee_refresh_failed();
+                tracing::info!(
+                    service = "outcome",
+                    api = "fee_snapshot",
+                    available = false,
+                    "outcome fees unavailable at startup; reconciliation remains enabled"
+                );
+            }
+        }
+        let engine_fees = engine.clone();
+        let mut fee_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(outcome::fees::FEE_REFRESH_INTERVAL);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            tick.tick().await; // 首次刷新已完成，不在启动时重复请求。
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        tokio::select! {
+                            result = engine_fees.outcome.refresh_fees() => match result {
+                                Ok(()) => engine_fees.stats.outcome_fee_refresh_ok(),
+                                Err(_) => engine_fees.stats.outcome_fee_refresh_failed(),
+                            },
+                            _ = fee_shutdown.changed() => break,
+                        }
+                    }
+                    _ = fee_shutdown.changed() => break,
+                }
+            }
+        });
+    }
+
     if cfg.platform_enabled(POLYMARKET) {
         tokio::spawn(polymarket::run_market_ws(
             cfg.polymarket_ws_url.clone(),
@@ -139,18 +188,6 @@ pub async fn run() -> anyhow::Result<()> {
             tick.tick().await;
             if let Err(err) = engine_disc.refresh_discovery().await {
                 tracing::error!(error = %err, "discovery failed");
-            }
-        }
-    });
-
-    let engine_rec = engine.clone();
-    let rec_interval = cfg.reconcile_interval;
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(rec_interval);
-        loop {
-            tick.tick().await;
-            if let Err(err) = engine_rec.reconcile().await {
-                tracing::error!(error = %err, "reconcile failed");
             }
         }
     });

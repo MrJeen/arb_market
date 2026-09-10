@@ -2221,6 +2221,59 @@ fn scan_ids(rows: Vec<ArbOrderRow>) -> Vec<i64> {
     rows.into_iter().map(|row| row.id).collect()
 }
 
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn outcome_fee_estimates_survive_abort_timeout_and_lifecycle_insert() {
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let exercised: Result<()> = async {
+        fixture.store.migrate().await?;
+        let estimate = json!({
+            "model": "outcome_spot_close_v1", "taker_rate": "0.001344",
+            "settlement_policy": "estimated_from_taker_close", "actual": false
+        });
+        let legs: Vec<_> = (0..3).map(|_| NewLeg {
+            fee_estimate: Some(estimate.clone()),
+            ..identity_probe_leg()
+        }).collect();
+        let (order_id, ids) = fixture.store.insert_actived_order_with_legs(
+            TopicKey::new(Uuid::new_v4(), 0),
+            &MarketIdentity::new("polymarket", "fee-estimate-test")?,
+            "fee estimate", "fee estimate", None,
+            Decimal::ONE, Decimal::ZERO, Decimal::ONE, &json!([]), &legs, 0,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        ).await?;
+        // 签名证据存在时，费用快照失效不能撤销可能已经提交的腿。
+        sqlx::query("INSERT INTO signed_envelopes (leg_id, order_hash, payload) VALUES ($1,'test-envelope','{}')")
+            .bind(ids[1]).execute(&fixture.store.pool).await?;
+        fixture.store.abort_unsubmitted_legs(&ids[..2], "fee_snapshot_changed").await?;
+        let aborted = leg_snapshot(&fixture.store.pool, ids[0]).await?;
+        ensure!(aborted["status"] == "failed");
+        ensure!(aborted["last_order_info"]["fee_estimate"] == estimate);
+        let signed = leg_snapshot(&fixture.store.pool, ids[1]).await?;
+        ensure!(signed["status"] == "pending");
+        sqlx::query("UPDATE legs SET created_at=NOW()-INTERVAL '1 hour' WHERE id=$1")
+            .bind(ids[2]).execute(&fixture.store.pool).await?;
+        fixture.store.fail_stale_pending_unsubmitted(std::time::Duration::from_secs(300)).await?;
+        let expired = leg_snapshot(&fixture.store.pool, ids[2]).await?;
+        ensure!(expired["status"] == "failed");
+        ensure!(expired["last_order_info"]["fee_estimate"] == estimate);
+        ensure!(expired["actual_fee"].is_null());
+        let claim = Uuid::new_v4();
+        sqlx::query("UPDATE arb_orders SET lifecycle_action='rebalance', lifecycle_claim_id=$2, lifecycle_claimed_at=NOW() WHERE id=$1")
+            .bind(order_id).bind(claim).execute(&fixture.store.pool).await?;
+        let added = fixture.store.insert_legs_atomic(order_id, "rebalance", claim, &legs[..1]).await?;
+        let added = leg_snapshot(&fixture.store.pool, added[0]).await?;
+        ensure!(added["last_order_info"]["fee_estimate"] == estimate);
+        ensure!(added["actual_fee"].is_null());
+        Ok(())
+    }.await;
+    fixture
+        .cleanup()
+        .await
+        .expect("clean up fee estimate schema");
+    exercised.expect("estimate remains separate from actual fee and survives lifecycle writes");
+}
+
 fn identity_probe_leg() -> NewLeg<'static> {
     NewLeg {
         platform: "polymarket",
@@ -2234,6 +2287,7 @@ fn identity_probe_leg() -> NewLeg<'static> {
         req_price: Decimal::ONE,
         req_shares: Decimal::ONE,
         req_fee: Decimal::ZERO,
+        fee_estimate: None,
         client_order_id: None,
     }
 }
@@ -2259,6 +2313,7 @@ async fn actived_order_and_initial_legs_are_never_visible_without_each_other() {
                 req_price: Decimal::new(4, 1),
                 req_shares: Decimal::from(10),
                 req_fee: Decimal::ZERO,
+                fee_estimate: None,
                 client_order_id: None,
             },
             NewLeg {
@@ -2273,6 +2328,7 @@ async fn actived_order_and_initial_legs_are_never_visible_without_each_other() {
                 req_price: Decimal::new(55, 2),
                 req_shares: Decimal::from(10),
                 req_fee: Decimal::ZERO,
+                fee_estimate: None,
                 client_order_id: None,
             },
         ];
@@ -2625,6 +2681,7 @@ async fn stale_token_cannot_release_or_insert_under_new_claim() {
             req_price: Decimal::ONE,
             req_shares: Decimal::ONE,
             req_fee: Decimal::ZERO,
+            fee_estimate: None,
             client_order_id: None,
         };
         let stale_insert_failed = fixture

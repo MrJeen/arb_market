@@ -6,6 +6,7 @@ use crate::config::{OUTCOME, POLYMARKET};
 use crate::domain::{TokenRef, Topic};
 use crate::error::{Error, Result};
 use crate::platforms::polymarket::market_buy_base_units;
+use crate::platforms::OrderSide;
 use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -30,18 +31,20 @@ pub struct HedgeAction {
 
 pub type Positions = HashMap<String, HashMap<String, Decimal>>;
 
-/// 资金准入使用最终限价本金加已有估计费；不是预计成本或最坏费用上界。
+/// PM 保持最终限价本金加已有估计费；Outcome 按最终 cap 计本金和 builder 买费。
 pub(crate) fn hedge_buy_required(
     platform: &str,
     shares: Decimal,
     cap: Decimal,
     fee: Decimal,
+    fees: &FeeContext,
 ) -> Result<Decimal> {
     if shares <= Decimal::ZERO
         || !shares.fract().is_zero()
         || cap <= Decimal::ZERO
         || cap >= Decimal::ONE
         || fee < Decimal::ZERO
+        || fees.outcome_builder_rate < Decimal::ZERO
     {
         return Err(Error::msg("invalid rebalance buy funding inputs"));
     }
@@ -59,8 +62,15 @@ pub(crate) fn hedge_buy_required(
             .ok_or_else(|| Error::msg("rebalance buy funding outside decimal range"))?,
         _ => return Err(Error::msg("unsupported rebalance buy platform")),
     };
+    let funding_fee = if platform == OUTCOME {
+        principal
+            .checked_mul(fees.outcome_builder_rate)
+            .ok_or_else(|| Error::msg("rebalance buy funding outside decimal range"))?
+    } else {
+        fee
+    };
     principal
-        .checked_add(fee)
+        .checked_add(funding_fee)
         .ok_or_else(|| Error::msg("rebalance buy funding outside decimal range"))
 }
 
@@ -327,7 +337,7 @@ fn eval_sell(
     if qty <= Decimal::ZERO {
         return None;
     }
-    let fee = estimate_taker_fee(platform, qty, depth.avg, fees);
+    let fee = estimate_taker_fee(platform, OrderSide::Sell, qty, depth.avg, fees);
     let revenue = depth.avg * qty - fee;
     let trade_cost = depth.worst * qty;
     if below_venue_mins(platform, false, qty, trade_cost) {
@@ -374,7 +384,7 @@ fn eval_buy(
     if qty <= Decimal::ZERO {
         return None;
     }
-    let fee = estimate_taker_fee(platform, qty, depth.avg, fees);
+    let fee = estimate_taker_fee(platform, OrderSide::Buy, qty, depth.avg, fees);
     let cost = depth.avg * qty + fee;
     let trade_cost = depth.worst * qty;
     if below_venue_mins(platform, true, qty, trade_cost) {
@@ -387,7 +397,7 @@ fn eval_buy(
         depth.worst.max(depth.worst_plus_two),
         polymarket_tick(books, platform, token_id),
     )?;
-    let required = hedge_buy_required(platform, qty, cap, fee).ok()?;
+    let required = hedge_buy_required(platform, qty, cap, fee, fees).ok()?;
     let balance = balances.get(platform).copied().unwrap_or(Decimal::ZERO);
     if balance < required {
         return None;
@@ -401,8 +411,8 @@ fn eval_buy(
             shares: qty,
             cap_price: cap,
             fee,
-            // 补齐后锁定兑付 $1/share，边际价值 = 锁定兑付 - 买入成本。
-            marginal_value: qty - cost,
+            // 无论补 PM 还是 Outcome，新增配对部分都承担 Outcome 结算准备。
+            marginal_value: qty * (Decimal::ONE - fees.outcome_taker_rate) - cost,
         },
     })
 }
@@ -517,6 +527,7 @@ mod tests {
         FeeContext {
             polymarket_fee_rate: Decimal::ZERO,
             outcome_taker_rate: Decimal::ZERO,
+            outcome_builder_rate: Decimal::ZERO,
         }
     }
 
@@ -621,11 +632,21 @@ mod tests {
             let positions = imbalanced_positions(pm_qty, out_qty);
             let fees = FeeContext {
                 polymarket_fee_rate: d("0.07"),
-                outcome_taker_rate: d("0.00035"),
+                outcome_taker_rate: d("0.001344"),
+                outcome_builder_rate: d("0.0003"),
             };
-            let fee = estimate_taker_fee(buy_platform, d("10"), d("0.30"), &fees);
-            let required = hedge_buy_required(buy_platform, d("10"), d("0.90"), fee).unwrap();
-            assert_eq!(required, d("9") + fee);
+            let fee = estimate_taker_fee(buy_platform, OrderSide::Buy, d("10"), d("0.30"), &fees);
+            let required =
+                hedge_buy_required(buy_platform, d("10"), d("0.90"), fee, &fees).unwrap();
+            assert_eq!(
+                required,
+                d("9")
+                    + if buy_pm {
+                        fee
+                    } else {
+                        d("9") * fees.outcome_builder_rate
+                    }
+            );
             for balance in [d("5"), d("9"), required - d("0.00000001"), required] {
                 let actions = plan_hedge(
                     &topic(),
@@ -642,7 +663,10 @@ mod tests {
                     assert_eq!(actions[0].side, HedgeSide::Sell);
                 } else {
                     assert_eq!(actions[0].side, HedgeSide::Buy);
-                    assert_eq!(actions[0].marginal_value, d("7") - fee);
+                    assert_eq!(
+                        actions[0].marginal_value,
+                        d("7") - d("10") * fees.outcome_taker_rate - fee
+                    );
                 }
             }
         }
@@ -699,11 +723,102 @@ mod tests {
                 (d("1.5"), d("0.5"), d("0")),
                 (d("10"), d("1"), d("0")),
                 (d("10"), d("0.5"), d("-1")),
-                (Decimal::MAX, d("0.5"), Decimal::MAX),
+                (Decimal::MAX, Decimal::MAX, d("0")),
             ] {
-                assert!(hedge_buy_required(platform, shares, cap, fee).is_err());
+                assert!(hedge_buy_required(platform, shares, cap, fee, &fees()).is_err());
             }
         }
+    }
+
+    #[test]
+    fn filling_either_deficit_reserves_only_newly_paired_quantity() {
+        let now = Instant::now();
+        let fees = FeeContext {
+            outcome_taker_rate: d("0.001344"),
+            outcome_builder_rate: d("0.0003"),
+            ..fees()
+        };
+        for (platform, token, pm_qty, out_qty) in [
+            (POLYMARKET, "pm-yes", "6", "36"),
+            (OUTCOME, "#10", "36", "6"),
+        ] {
+            let mut books = BookStore::default();
+            books.replace_snapshot(
+                platform,
+                token,
+                vec![],
+                vec![Level {
+                    price: d("0.4"),
+                    size: d("10"),
+                }],
+                1,
+                now,
+            );
+            books.set_tick_size(POLYMARKET, "pm-yes", d("0.01"));
+            let actions = plan_hedge(
+                &topic(),
+                &imbalanced_positions(pm_qty, out_qty),
+                &books,
+                &HashMap::from([(platform.into(), d("100"))]),
+                &fees,
+                d("1.5"),
+                now,
+                Duration::from_secs(5),
+            );
+            assert_eq!(actions.len(), 1);
+            assert_eq!(actions[0].side, HedgeSide::Buy);
+            assert_eq!(actions[0].shares, d("10"));
+            let buy_fee = if platform == OUTCOME {
+                d("0.0012")
+            } else {
+                Decimal::ZERO
+            };
+            assert_eq!(actions[0].fee, buy_fee);
+            assert_eq!(actions[0].marginal_value, d("5.98656") - buy_fee);
+        }
+        let mut books = BookStore::default();
+        books.replace_snapshot(
+            OUTCOME,
+            "#10",
+            vec![Level {
+                price: d("0.9608"),
+                size: d("30"),
+            }],
+            vec![],
+            1,
+            now,
+        );
+        let sell = eval_sell(
+            OUTCOME,
+            "#10",
+            "no",
+            d("30"),
+            &books,
+            &fees,
+            now,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(sell.action.fee, d("0.047386656"));
+        assert_eq!(sell.action.marginal_value, d("28.824") - d("0.047386656"));
+    }
+
+    #[test]
+    fn outcome_cap_funding_ignores_protocol_reserve_and_rejects_builder_overflow() {
+        let context = FeeContext {
+            outcome_taker_rate: d("0.001344"),
+            ..fees()
+        };
+        assert_eq!(
+            hedge_buy_required(OUTCOME, d("30"), d("0.9"), Decimal::ZERO, &context).unwrap(),
+            d("27")
+        );
+        let context = FeeContext {
+            outcome_builder_rate: Decimal::MAX,
+            ..context
+        };
+        assert!(hedge_buy_required(OUTCOME, d("30"), d("0.9"), Decimal::ZERO, &context).is_err());
+        assert!(hedge_buy_required(POLYMARKET, d("10"), d("0.5"), Decimal::MAX, &fees()).is_err());
     }
 
     #[test]
@@ -828,7 +943,8 @@ mod tests {
     fn hedge_buy_and_sell_set_taker_fee() {
         let fees = FeeContext {
             polymarket_fee_rate: d("0.07"),
-            outcome_taker_rate: d("0.00035"),
+            outcome_taker_rate: d("0.001344"),
+            outcome_builder_rate: d("0.0003"),
         };
         let mut books = BookStore::default();
         let now = Instant::now();
@@ -858,7 +974,7 @@ mod tests {
         assert_eq!(buy[0].side, HedgeSide::Buy);
         assert_eq!(
             buy[0].fee,
-            estimate_taker_fee(OUTCOME, buy[0].shares, d("0.4"), &fees)
+            estimate_taker_fee(OUTCOME, OrderSide::Buy, buy[0].shares, d("0.4"), &fees)
         );
         assert!(buy[0].fee > Decimal::ZERO);
 
@@ -899,7 +1015,13 @@ mod tests {
         assert_eq!(sell[0].side, HedgeSide::Sell);
         assert_eq!(
             sell[0].fee,
-            estimate_taker_fee(POLYMARKET, sell[0].shares, d("0.50"), &fees)
+            estimate_taker_fee(
+                POLYMARKET,
+                OrderSide::Sell,
+                sell[0].shares,
+                d("0.50"),
+                &fees
+            )
         );
         assert!(sell[0].fee > Decimal::ZERO);
     }

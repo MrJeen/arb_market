@@ -38,7 +38,6 @@ pub struct Config {
     pub arb_cost_limit: Decimal,
     pub min_rebalance_qty: Decimal,
     pub polymarket_fee_bps_prior: Decimal,
-    pub outcome_taker_fee_rate: Decimal,
     pub pending_leg_timeout: Duration,
     pub unknown_leg_timeout: Duration,
     /// 累计已下单上限；0 表示不限制。
@@ -112,7 +111,6 @@ impl Config {
             polymarket_fee_bps_prior: parse_polymarket_fee_bps(
                 env_opt("POLYMARKET_FEE_BPS_PRIOR").as_deref(),
             )?,
-            outcome_taker_fee_rate: env_decimal("OUTCOME_TAKER_FEE_RATE", "0.00035")?,
             pending_leg_timeout: Duration::from_secs(env_u64("PENDING_LEG_TIMEOUT_SECS", 300)),
             unknown_leg_timeout: Duration::from_secs(env_u64("UNKNOWN_LEG_TIMEOUT_SECS", 300)),
             max_active_orders: env_u64("MAX_ACTIVE_ORDERS", 20) as usize,

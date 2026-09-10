@@ -6,6 +6,7 @@ use crate::calc::{
 use crate::config::{OUTCOME, POLYMARKET};
 use crate::domain::Topic;
 use crate::hedge::Positions;
+use crate::platforms::OrderSide;
 use rust_decimal::Decimal;
 use std::time::{Duration, Instant};
 
@@ -44,6 +45,7 @@ pub fn plan_take_profit(
     if labels.len() != 2
         || fees.polymarket_fee_rate < Decimal::ZERO
         || fees.outcome_taker_rate < Decimal::ZERO
+        || fees.outcome_builder_rate < Decimal::ZERO
     {
         return None;
     }
@@ -128,11 +130,13 @@ fn evaluate_pair(
                 }
                 let pm_gross = pm_revenue + (qty - lo) * pm_level.price;
                 let out_gross = out_revenue + (qty - lo) * out_level.price;
-                let pm_fee = estimate_taker_fee(POLYMARKET, qty, pm_gross / qty, fees);
-                let out_fee = estimate_taker_fee(OUTCOME, qty, out_gross / qty, fees);
+                let pm_fee =
+                    estimate_taker_fee(POLYMARKET, OrderSide::Sell, qty, pm_gross / qty, fees);
+                let out_fee =
+                    estimate_taker_fee(OUTCOME, OrderSide::Sell, qty, out_gross / qty, fees);
                 let gross_revenue = pm_gross + out_gross;
                 let total_fee = pm_fee + out_fee;
-                // 项目仅支持二元市场，一对跨平台互补份额固定兑付 q/1。
+                // 仍与放弃的毛兑付 q 比较，不用未核实的结算费准备放宽止盈。
                 let gain = gross_revenue - total_fee - qty;
                 if gain < min_gain
                     || best.as_ref().is_some_and(|plan| {
@@ -263,6 +267,7 @@ mod tests {
         FeeContext {
             polymarket_fee_rate: Decimal::ZERO,
             outcome_taker_rate: Decimal::ZERO,
+            outcome_builder_rate: Decimal::ZERO,
         }
     }
 
@@ -541,6 +546,7 @@ mod tests {
                 &FeeContext {
                     polymarket_fee_rate: d(pm_rate),
                     outcome_taker_rate: d(out_rate),
+                    outcome_builder_rate: Decimal::ZERO,
                 },
                 "0",
             )
@@ -616,8 +622,9 @@ mod tests {
             let Some((out_gross, out_cap)) = revenue_and_cap(&out.bids, qty, OUTCOME, None) else {
                 continue;
             };
-            let pm_fee = estimate_taker_fee(POLYMARKET, qty, pm_gross / qty, fees);
-            let out_fee = estimate_taker_fee(OUTCOME, qty, out_gross / qty, fees);
+            let pm_avg = pm_gross / qty;
+            let pm_fee = qty * fees.polymarket_fee_rate * pm_avg * (Decimal::ONE - pm_avg);
+            let out_fee = out_gross * (fees.outcome_taker_rate + fees.outcome_builder_rate);
             let gross_revenue = pm_gross + out_gross;
             let total_fee = pm_fee + out_fee;
             let gain = gross_revenue - total_fee - qty;
@@ -676,6 +683,7 @@ mod tests {
                 let fees = FeeContext {
                     polymarket_fee_rate: d(pm_rate),
                     outcome_taker_rate: d(out_rate),
+                    outcome_builder_rate: d("0.0003"),
                 };
                 for holdings in 1..=16 {
                     for min_gain in [d("-2"), d("0"), d("0.1"), d("1")] {
@@ -798,6 +806,32 @@ mod tests {
     }
 
     #[test]
+    fn builder_sell_fee_does_not_relax_gross_payout_baseline() {
+        let fees = FeeContext {
+            outcome_taker_rate: d("0.001344"),
+            outcome_builder_rate: d("0.0003"),
+            ..fees()
+        };
+        // 毛收入恰好 q：即使净持有估值更低，仍不允许按新基线放宽止盈。
+        assert!(partial_plan(&[("0.6", "30")], &[("0.4", "30")], "30", &fees, "0").is_none());
+        let plan = partial_plan(&[("0.7", "30")], &[("0.4", "30")], "30", &fees, "0").unwrap();
+        assert_eq!(plan.actions[1].fee, d("0.019728"));
+        assert_eq!(plan.gain, d("2.980272"));
+        assert_eq!(plan.gain, plan.gross_revenue - plan.total_fee - plan.shares);
+        assert!(partial_plan(
+            &[("0.7", "30")],
+            &[("0.4", "30")],
+            "30",
+            &FeeContext {
+                outcome_builder_rate: d("-0.0003"),
+                ..fees
+            },
+            "0"
+        )
+        .is_none());
+    }
+
+    #[test]
     fn subtracts_both_taker_fees() {
         let now = Instant::now();
         let mut books = BookStore::default();
@@ -806,6 +840,7 @@ mod tests {
         let fees = FeeContext {
             polymarket_fee_rate: d("0.07"),
             outcome_taker_rate: d("0.01"),
+            outcome_builder_rate: Decimal::ZERO,
         };
         let plan = plan_take_profit(
             &topic(),

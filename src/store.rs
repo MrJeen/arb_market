@@ -8,7 +8,7 @@ use crate::reconcile::{
     PmOrderConstraints, PmTradeScan,
 };
 use rust_decimal::Decimal;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -88,7 +88,7 @@ pub struct ClosedLegRef {
     pub platform: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct NewLeg<'a> {
     pub platform: &'a str,
     pub token_id: &'a str,
@@ -102,6 +102,16 @@ pub struct NewLeg<'a> {
     pub req_shares: Decimal,
     pub req_fee: Decimal,
     pub client_order_id: Option<&'a str>,
+    /// 策略估算依据，不作为成交实扣费用证据。
+    pub fee_estimate: Option<Value>,
+}
+
+impl NewLeg<'_> {
+    fn initial_order_info(&self) -> Option<Value> {
+        self.fee_estimate
+            .as_ref()
+            .map(|estimate| json!({ "fee_estimate": estimate }))
+    }
 }
 
 impl Store {
@@ -252,8 +262,8 @@ impl Store {
                 "INSERT INTO legs (
                     order_id, platform, token_id, label, side, intent,
                     funder_address, wallet_address, service, req_price, req_shares, req_fee,
-                    client_order_id, status
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending')
+                    client_order_id, last_order_info, status
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pending')
                  RETURNING id",
             )
             .bind(id)
@@ -269,6 +279,7 @@ impl Store {
             .bind(leg.req_shares)
             .bind(leg.req_fee)
             .bind(leg.client_order_id)
+            .bind(leg.initial_order_info())
             .fetch_one(&mut *tx)
             .await?;
             leg_ids.push(leg_id);
@@ -385,8 +396,8 @@ impl Store {
                 "INSERT INTO legs (
                     order_id, platform, token_id, label, side, intent,
                     funder_address, wallet_address, service, req_price, req_shares, req_fee,
-                    client_order_id, lifecycle_claim_id, status
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'pending')
+                    client_order_id, lifecycle_claim_id, last_order_info, status
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'pending')
                  RETURNING id",
             )
             .bind(order_id)
@@ -403,6 +414,7 @@ impl Store {
             .bind(leg.req_fee)
             .bind(leg.client_order_id)
             .bind(claim_id)
+            .bind(leg.initial_order_info())
             .fetch_one(&mut *tx)
             .await?;
             ids.push(id);
@@ -1420,11 +1432,28 @@ impl Store {
         Ok(exists.is_some())
     }
 
+    /// 最终准入失效只终止本次尚未签名/发送的腿，不能改变已有提交证据。
+    pub async fn abort_unsubmitted_legs(&self, leg_ids: &[i64], reason: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE legs SET status = 'failed', updated_at = clock_timestamp(),
+                    last_order_info = COALESCE(last_order_info, '{}'::jsonb)
+                        || jsonb_build_object('reason', $2::text)
+             WHERE id = ANY($1) AND status = 'pending' AND submitted_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM signed_envelopes e WHERE e.leg_id = legs.id)",
+        )
+        .bind(leg_ids)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn fail_stale_pending_unsubmitted(&self, timeout: Duration) -> Result<u64> {
         let secs = timeout.as_secs() as i64;
         let result = sqlx::query(
             "UPDATE legs SET status = 'failed', updated_at = NOW(),
-                    last_order_info = jsonb_build_object('reason','pending_timeout_unsubmitted')
+                    last_order_info = COALESCE(last_order_info, '{}'::jsonb)
+                        || jsonb_build_object('reason','pending_timeout_unsubmitted')
              WHERE status = 'pending'
                AND submitted_at IS NULL
                AND created_at < NOW() - make_interval(secs => $1)",
