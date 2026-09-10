@@ -1146,17 +1146,10 @@ mod tests {
         assert_eq!(p1.profit, p2.profit);
         assert!(p2.exact.compare(&p1.exact).is_gt());
         assert_eq!(
-            best_plan(
-                &topic,
-                &books,
-                &fees_zero(),
-                &b,
-                now,
-                std::time::Duration::from_secs(5)
-            )
-            .unwrap()
-            .pm
-            .token_id,
+            best_plan(&topic, &books, &fees_zero(), &b)
+                .unwrap()
+                .pm
+                .token_id,
             "pm-no"
         );
         // 最后一档只高 1e-28，乘不足一股后的 HTTP 成本差仅 1e-56。

@@ -522,12 +522,12 @@ mod tests {
                 pm: CalcBookState {
                     source: BookSource::Ws,
                     age_ms: 6000,
-                    invalid: false,
+                    invalid: kind != crate::calc::StaleKind::OutOnly,
                 },
                 out: CalcBookState {
                     source: BookSource::Rest,
                     age_ms: 7000,
-                    invalid: true,
+                    invalid: kind != crate::calc::StaleKind::PmOnly,
                 },
             }),
         }

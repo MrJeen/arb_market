@@ -267,7 +267,7 @@ impl Engine {
         let (plan, pm_book_ts, out_book_ts, pm_ask, pm_sz, out_ask, out_sz, skips, pairs) = {
             let books = self.books.lock().await;
             let now = Instant::now();
-            let plan = best_plan(&topic, &books, &fees, &limits, now, self.cfg.book_stale);
+            let plan = best_plan(&topic, &books, &fees, &limits);
             let (skips, pairs) =
                 inspect_calc(&topic, &books, &fees, &limits, now, self.cfg.book_stale);
             let (pm_book_ts, out_book_ts, pm_ask, pm_sz, out_ask, out_sz) = plan

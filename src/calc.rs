@@ -398,8 +398,6 @@ pub fn best_plan(
     books: &crate::book::BookStore,
     fees: &FeeContext,
     limits: &ArbLimits,
-    now: std::time::Instant,
-    stale: std::time::Duration,
 ) -> Option<ArbPlan> {
     let labels = topic.labels();
     let mut best: Option<ArbPlan> = None;
@@ -416,7 +414,8 @@ pub fn best_plan(
         let Some(out_book) = books.get(OUTCOME, &out_token.token_id) else {
             continue;
         };
-        if !pm_book.is_fresh(stale, now) || !out_book.is_fresh(stale, now) {
+        // 静止盘口可用于发现候选；实际下单仍须通过新鲜的双边 REST 确认。
+        if pm_book.stale || out_book.stale {
             continue;
         }
         if let Some(plan) =
@@ -460,6 +459,7 @@ pub struct CalcBookState {
 pub struct CalcStaleDetail {
     pub pm: CalcBookState,
     pub out: CalcBookState,
+    /// 仅作盘口年龄的诊断背景，不参与普通套利候选准入。
     pub threshold_ms: u64,
     pub kind: StaleKind,
 }
@@ -572,20 +572,11 @@ pub fn inspect_calc(
                         StaleKind::OutOnly => counts.stale_out_only += 1,
                         StaleKind::Both => counts.stale_both += 1,
                     }
-                    // 每侧只记一个原因；显式失效优先于年龄过期。
-                    if detail.kind != StaleKind::OutOnly {
-                        if detail.pm.invalid {
-                            counts.stale_pm_invalid += 1;
-                        } else {
-                            counts.stale_pm_expired += 1;
-                        }
+                    if detail.pm.invalid {
+                        counts.stale_pm_invalid += 1;
                     }
-                    if detail.kind != StaleKind::PmOnly {
-                        if detail.out.invalid {
-                            counts.stale_out_invalid += 1;
-                        } else {
-                            counts.stale_out_expired += 1;
-                        }
+                    if detail.out.invalid {
+                        counts.stale_out_invalid += 1;
                     }
                 }
             }
@@ -631,9 +622,7 @@ fn diagnose_pair(
     let Some((out_book, out_source)) = books.get_with_source(OUTCOME, &out_token.token_id) else {
         return sample;
     };
-    let pm_fresh = pm_book.is_fresh(stale, now);
-    let out_fresh = out_book.is_fresh(stale, now);
-    if !pm_fresh || !out_fresh {
+    if pm_book.stale || out_book.stale {
         sample.reason = "stale_book";
         sample.stale = Some(CalcStaleDetail {
             pm: CalcBookState {
@@ -647,10 +636,9 @@ fn diagnose_pair(
                 invalid: out_book.stale,
             },
             threshold_ms: stale.as_millis() as u64,
-            // 分类沿用原精度的新鲜度判断，不使用取整后的毫秒年龄。
-            kind: match (pm_fresh, out_fresh) {
-                (false, true) => StaleKind::PmOnly,
-                (true, false) => StaleKind::OutOnly,
+            kind: match (pm_book.stale, out_book.stale) {
+                (true, false) => StaleKind::PmOnly,
+                (false, true) => StaleKind::OutOnly,
                 _ => StaleKind::Both,
             },
         });
@@ -914,16 +902,8 @@ mod tests {
         }
     }
 
-    fn plan_with(books: &BookStore, now: Instant, limits: &ArbLimits) -> ArbPlan {
-        best_plan(
-            &sample_topic(),
-            books,
-            &fees_zero(),
-            limits,
-            now,
-            std::time::Duration::from_secs(5),
-        )
-        .expect("plan")
+    fn plan_with(books: &BookStore, limits: &ArbLimits) -> ArbPlan {
+        best_plan(&sample_topic(), books, &fees_zero(), limits).expect("plan")
     }
 
     #[test]
@@ -959,8 +939,15 @@ mod tests {
     #[test]
     fn inspect_stale_kinds_and_per_side_reasons() {
         let now = Instant::now();
-        // 同时失效和超龄时只计 invalid；边界年龄仍然新鲜。
-        let states = [(false, 5), (true, 1), (false, 6), (true, 6)];
+        // 年龄不影响候选准入，包括长期静止；显式失效仍须拒绝。
+        let states = [
+            (false, 1),
+            (false, 5),
+            (false, 6),
+            (false, 86400),
+            (true, 1),
+            (true, 86400),
+        ];
         for (pm_invalid, pm_age) in states {
             for (out_invalid, out_age) in states {
                 let mut books = BookStore::default();
@@ -992,8 +979,15 @@ mod tests {
                     now,
                     std::time::Duration::from_secs(5),
                 );
-                let pm_stale = pm_invalid || pm_age > 5;
-                let out_stale = out_invalid || out_age > 5;
+                let pm_stale = pm_invalid;
+                let out_stale = out_invalid;
+                let plan = best_plan(&sample_topic(), &books, &fees_zero(), &limits("0", "100"));
+                assert_eq!(plan.is_some(), !pm_invalid && !out_invalid);
+                if let Some(plan) = plan {
+                    assert_eq!(plan.net_shares, d("50"));
+                    assert_eq!(plan.total_cost, d("40"));
+                    assert_eq!(plan.profit, d("10"));
+                }
                 let expected = CalcSkipCounts {
                     missing_book: 1,
                     stale_book: u64::from(pm_stale || out_stale),
@@ -1001,9 +995,7 @@ mod tests {
                     stale_out_only: u64::from(!pm_stale && out_stale),
                     stale_both: u64::from(pm_stale && out_stale),
                     stale_pm_invalid: u64::from(pm_invalid),
-                    stale_pm_expired: u64::from(pm_stale && !pm_invalid),
                     stale_out_invalid: u64::from(out_invalid),
-                    stale_out_expired: u64::from(out_stale && !out_invalid),
                     ..CalcSkipCounts::default()
                 };
                 assert_eq!(counts, expected);
@@ -1128,7 +1120,7 @@ mod tests {
     }
 
     #[test]
-    fn inspect_stale_uses_selected_source_and_received_age() {
+    fn candidate_age_does_not_change_source_selection_or_invalid_diagnostics() {
         let now = Instant::now();
         for max_age in [5, 3600] {
             for pm_rest in [false, true] {
@@ -1155,7 +1147,7 @@ mod tests {
                                         size: d("50"),
                                     }],
                                     2,
-                                    now - std::time::Duration::from_secs(2),
+                                    now - std::time::Duration::from_secs(10),
                                     None,
                                 )
                                 .unwrap();
@@ -1169,11 +1161,23 @@ mod tests {
                         now,
                         std::time::Duration::from_secs(1),
                     );
+                    assert_eq!(
+                        counts,
+                        CalcSkipCounts {
+                            missing_book: 1,
+                            ..Default::default()
+                        }
+                    );
+                    assert!(pairs.iter().all(|pair| pair.stale.is_none()));
+                    assert!(
+                        best_plan(&sample_topic(), &books, &fees_zero(), &limits("0", "100"))
+                            .is_some()
+                    );
                     let expected_state = |rest| {
                         if rest && max_age == 5 {
                             CalcBookState {
                                 source: BookSource::Rest,
-                                age_ms: 2000,
+                                age_ms: 10000,
                                 invalid: false,
                             }
                         } else {
@@ -1184,26 +1188,51 @@ mod tests {
                             }
                         }
                     };
+                    for (platform, id, rest) in
+                        [(POLYMARKET, "pm-yes", pm_rest), (OUTCOME, "#10", out_rest)]
+                    {
+                        let (book, source) = books.get_with_source(platform, id).unwrap();
+                        assert_eq!(source, expected_state(rest).source);
+                        assert_eq!(
+                            now.duration_since(book.received_at).as_millis() as u64,
+                            expected_state(rest).age_ms
+                        );
+                    }
+                    // 仅 PM 显式失效，另一侧无论来自旧 WS 还是旧 REST 都不能归为失效。
+                    books.mark_platform_stale(POLYMARKET);
+                    let (counts, pairs) = inspect_calc(
+                        &sample_topic(),
+                        &books,
+                        &fees_zero(),
+                        &limits("0", "100"),
+                        now,
+                        std::time::Duration::from_secs(1),
+                    );
                     let sample = pairs.iter().find(|p| p.reason == "stale_book").unwrap();
                     assert_eq!(
                         sample.stale,
                         Some(CalcStaleDetail {
-                            pm: expected_state(pm_rest),
+                            pm: CalcBookState {
+                                source: BookSource::Ws,
+                                age_ms: 60000,
+                                invalid: true
+                            },
                             out: expected_state(out_rest),
                             threshold_ms: 1000,
-                            kind: StaleKind::Both,
+                            kind: StaleKind::PmOnly,
                         })
                     );
-                    assert_eq!(counts.stale_both, 1);
-                    assert_eq!(counts.stale_pm_expired, 1);
-                    assert_eq!(counts.stale_out_expired, 1);
+                    assert_eq!(counts.stale_pm_invalid, 1);
+                    assert_eq!(counts.stale_both, 0);
+                    assert_eq!(counts.stale_pm_expired, 0);
+                    assert_eq!(counts.stale_out_expired, 0);
                 }
             }
         }
     }
 
     #[test]
-    fn inspect_stale_preserves_submillisecond_boundary() {
+    fn candidate_ignores_age_at_and_beyond_freshness_boundary() {
         let now = Instant::now();
         let threshold = std::time::Duration::from_secs(5);
         let mut books = BookStore::default();
@@ -1229,13 +1258,54 @@ mod tests {
             now,
             threshold,
         );
-        assert_eq!(counts.stale_pm_only, 1);
-        assert_eq!(counts.stale_pm_expired, 1);
-        assert_eq!(counts.stale_out_expired, 0);
-        let detail = pairs.iter().find_map(|p| p.stale).unwrap();
-        assert_eq!(detail.kind, StaleKind::PmOnly);
-        assert_eq!(detail.pm.age_ms, detail.threshold_ms);
-        assert_eq!(detail.out.age_ms, detail.threshold_ms);
+        assert_eq!(
+            counts,
+            CalcSkipCounts {
+                missing_book: 1,
+                ..Default::default()
+            }
+        );
+        assert!(pairs.iter().all(|pair| pair.stale.is_none()));
+        assert!(best_plan(&sample_topic(), &books, &fees_zero(), &limits("0", "100")).is_some());
+        assert!(!books
+            .get(POLYMARKET, "pm-yes")
+            .unwrap()
+            .is_fresh(threshold, now));
+        assert!(books.get(OUTCOME, "#10").unwrap().is_fresh(threshold, now));
+    }
+
+    #[test]
+    fn unchanged_old_ws_books_can_generate_candidates_without_renewing_ttl() {
+        let now = Instant::now();
+        let old = now - std::time::Duration::from_secs(86400);
+        let mut books = BookStore::default();
+        for (platform, id) in [(POLYMARKET, "pm-yes"), (OUTCOME, "#10")] {
+            snapshot(&mut books, platform, id, vec![("0.40", "50")], old);
+            assert_eq!(
+                books.replace_snapshot(
+                    platform,
+                    id,
+                    vec![],
+                    vec![Level {
+                        price: d("0.40"),
+                        size: d("50"),
+                    }],
+                    2,
+                    now
+                ),
+                crate::book::BookUpdate::VerifiedUnchanged
+            );
+            let book = books.get(platform, id).unwrap();
+            assert_eq!(book.received_at, old);
+            assert!(!book.stale);
+            assert!(!book.is_fresh(std::time::Duration::from_secs(5), now));
+        }
+        let plan = plan_with(&books, &limits("0", "100"));
+        assert_eq!(plan.profit, d("10"));
+        assert_eq!(
+            inspect_reasons(&books, now, &limits("0", "100")),
+            vec!["missing_book"]
+        );
     }
 
     #[test]
@@ -1256,7 +1326,13 @@ mod tests {
         let fees = fees_zero();
         let limits = limits("0", "100");
         let threshold = std::time::Duration::from_secs(5);
-        let plan = best_plan(&topic, &books, &fees, &limits, now, threshold);
+        let plan = best_plan(&topic, &books, &fees, &limits);
+        assert!(plan.is_some());
+        let (counts, pairs) = inspect_calc(&topic, &books, &fees, &limits, now, threshold);
+        assert_eq!(counts, CalcSkipCounts::default());
+        assert!(pairs.is_empty());
+        books.invalidate_ws(POLYMARKET, "pm-no", crate::book::BookReject::InvalidPayload);
+        let plan = best_plan(&topic, &books, &fees, &limits);
         let executable = plan.as_ref().expect("fresh direction remains executable");
         assert_eq!(executable.pm.label, "yes");
         assert_eq!(executable.outcome.label, "no");
@@ -1277,7 +1353,7 @@ mod tests {
                 found: 1,
                 stale_book: 1,
                 stale_pm_only: 1,
-                stale_pm_expired: 1,
+                stale_pm_invalid: 1,
                 ..Default::default()
             }
         );
@@ -1288,10 +1364,11 @@ mod tests {
     fn inspect_reports_unit_cost_and_venue_min() {
         let mut books = BookStore::default();
         let now = Instant::now();
-        snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.60", "50")], now);
-        snapshot(&mut books, OUTCOME, "#10", vec![("0.50", "50")], now);
-        snapshot(&mut books, POLYMARKET, "pm-no", vec![("0.40", "3")], now);
-        snapshot(&mut books, OUTCOME, "#11", vec![("0.40", "3")], now);
+        let old = now - std::time::Duration::from_secs(86400);
+        snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.60", "50")], old);
+        snapshot(&mut books, OUTCOME, "#10", vec![("0.50", "50")], old);
+        snapshot(&mut books, POLYMARKET, "pm-no", vec![("0.40", "3")], old);
+        snapshot(&mut books, OUTCOME, "#11", vec![("0.40", "3")], old);
         let reasons = inspect_reasons(&books, now, &limits("-1", "10"));
         assert!(reasons.contains(&"unit_cost_ge_revenue"));
         assert!(reasons.contains(&"venue_min"));
@@ -1778,7 +1855,7 @@ mod tests {
             now,
         );
         snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "20")], now);
-        let plan = plan_with(&books, now, &limits("1", "100"));
+        let plan = plan_with(&books, &limits("1", "100"));
         assert_eq!(plan.net_shares, d("20"));
         assert_eq!(plan.pm.cost, d("7.95"));
         assert_eq!(plan.pm.cap_price, d("0.40"));
@@ -1790,7 +1867,7 @@ mod tests {
         let now = Instant::now();
         snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
         snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
-        let plan = plan_with(&books, now, &limits("3", "100"));
+        let plan = plan_with(&books, &limits("3", "100"));
         // 过门槛后买满档深：50 股、成本 40，而不是刚过线的 15 股。
         assert_eq!(plan.net_shares, d("50"));
         assert_eq!(plan.total_cost, d("40"));
@@ -1811,7 +1888,7 @@ mod tests {
             now,
         );
         snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "10000")], now);
-        let plan = plan_with(&books, now, &limits("3", "100"));
+        let plan = plan_with(&books, &limits("3", "100"));
         assert_eq!(plan.net_shares, d("125"));
         assert_eq!(plan.total_cost, d("100"));
         assert_eq!(plan.profit, d("25"));
@@ -1843,9 +1920,10 @@ mod tests {
         let now = Instant::now();
         snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
         snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
-        snapshot(&mut books, POLYMARKET, "pm-no", vec![("0.20", "50")], now);
-        snapshot(&mut books, OUTCOME, "#11", vec![("0.30", "50")], now);
-        let plan = plan_with(&books, now, &limits("3", "100"));
+        let old = now - std::time::Duration::from_secs(86400);
+        snapshot(&mut books, POLYMARKET, "pm-no", vec![("0.20", "50")], old);
+        snapshot(&mut books, OUTCOME, "#11", vec![("0.30", "50")], old);
+        let plan = plan_with(&books, &limits("3", "100"));
         // yes+no 单位成本 0.80 ROI=0.25；no+yes 单位成本 0.50 ROI=1.00。两边都买满 50。
         assert_eq!(plan.pm.label, "no");
         assert_eq!(plan.outcome.label, "yes");
@@ -1859,14 +1937,7 @@ mod tests {
         let now = Instant::now();
         snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "20")], now);
         snapshot(&mut books, OUTCOME, "#10", vec![("0.09", "10")], now);
-        let plan = best_plan(
-            &sample_topic(),
-            &books,
-            &fees_zero(),
-            &limits("0.1", "100"),
-            now,
-            std::time::Duration::from_secs(5),
-        );
+        let plan = best_plan(&sample_topic(), &books, &fees_zero(), &limits("0.1", "100"));
         // Outcome 10 * 0.09 = 0.90 < $1，整档吃完仍不够最小名义。
         assert!(plan.is_none());
     }
@@ -1883,7 +1954,7 @@ mod tests {
             now,
         );
         snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "40.9")], now);
-        let plan = plan_with(&books, now, &limits("3", "100"));
+        let plan = plan_with(&books, &limits("3", "100"));
         assert_eq!(plan.outcome.shares, floor_shares(plan.outcome.shares));
         assert_eq!(plan.net_shares, d("40"));
     }
@@ -1898,14 +1969,7 @@ mod tests {
         limits.days = 365;
         limits.min_apr = d("0.30");
         // ROI=0.25，APR=0.25 < 0.30。
-        let plan = best_plan(
-            &sample_topic(),
-            &books,
-            &fees_zero(),
-            &limits,
-            now,
-            std::time::Duration::from_secs(5),
-        );
+        let plan = best_plan(&sample_topic(), &books, &fees_zero(), &limits);
         assert!(plan.is_none());
     }
 
@@ -2029,14 +2093,7 @@ mod tests {
             now,
         );
         snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
-        let plan = best_plan(
-            &sample_topic(),
-            &books,
-            &fees_zero(),
-            &limits("3", "100"),
-            now,
-            std::time::Duration::from_secs(5),
-        );
+        let plan = best_plan(&sample_topic(), &books, &fees_zero(), &limits("3", "100"));
         assert!(plan.is_none());
     }
 
@@ -2056,7 +2113,7 @@ mod tests {
         let now = Instant::now();
         snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
         snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
-        let first = plan_with(&books, now, &limits("3", "100"));
+        let first = plan_with(&books, &limits("3", "100"));
         let mut http = BookStore::default();
         snapshot(&mut http, POLYMARKET, "pm-yes", vec![("0.55", "50")], now);
         snapshot(&mut http, OUTCOME, "#10", vec![("0.55", "50")], now);
@@ -2077,7 +2134,7 @@ mod tests {
         let now = Instant::now();
         snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
         snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
-        let first = plan_with(&books, now, &limits("3", "100"));
+        let first = plan_with(&books, &limits("3", "100"));
         let mut http = BookStore::default();
         snapshot(&mut http, POLYMARKET, "pm-yes", vec![("0.39", "80")], now);
         snapshot(&mut http, OUTCOME, "#10", vec![("0.39", "80")], now);
@@ -2112,7 +2169,7 @@ mod tests {
             now,
         );
         snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "200")], now);
-        let first = plan_with(&books, now, &limits("1", "100"));
+        let first = plan_with(&books, &limits("1", "100"));
         assert_eq!(first.pm.shares, d("100"));
         assert_eq!(first.pm.cost, d("39.55"));
         let pm_balance = d("39.70");
@@ -2141,7 +2198,7 @@ mod tests {
         let mut books = BookStore::default();
         snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
         snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
-        let first = plan_with(&books, now, &limits("1", "100"));
+        let first = plan_with(&books, &limits("1", "100"));
         let fees = FeeContext {
             polymarket_fee_rate: d("0.07"),
             outcome_taker_rate: d("0.00035"),
@@ -2223,7 +2280,7 @@ mod tests {
         let mut books = BookStore::default();
         snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
         snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
-        let mut first = plan_with(&books, now, &limits("1", "100"));
+        let mut first = plan_with(&books, &limits("1", "100"));
         first.pm.cap_price = d("0.451");
         let mut pm = books.get(POLYMARKET, "pm-yes").unwrap().clone();
         let out = books.get(OUTCOME, "#10").unwrap();
@@ -2283,7 +2340,7 @@ mod tests {
         let mut books = BookStore::default();
         snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
         snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
-        let first = plan_with(&books, now, &limits("1", "100"));
+        let first = plan_with(&books, &limits("1", "100"));
         let pm = books.get(POLYMARKET, "pm-yes").unwrap();
         let out = books.get(OUTCOME, "#10").unwrap();
         for (bounds, expected) in [
@@ -2375,7 +2432,7 @@ mod tests {
         let now = Instant::now();
         snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
         snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
-        let first = plan_with(&books, now, &limits("3", "100"));
+        let first = plan_with(&books, &limits("3", "100"));
         let mut http = BookStore::default();
         snapshot(&mut http, POLYMARKET, "pm-yes", vec![("0.42", "80")], now);
         snapshot(&mut http, OUTCOME, "#10", vec![("0.42", "80")], now);
@@ -2407,7 +2464,7 @@ mod tests {
         let now = Instant::now();
         snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
         snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
-        let first = plan_with(&books, now, &limits("3", "100"));
+        let first = plan_with(&books, &limits("3", "100"));
         let mut http = BookStore::default();
         snapshot(&mut http, POLYMARKET, "pm-yes", vec![("0.40", "10")], now);
         snapshot(&mut http, OUTCOME, "#10", vec![("0.40", "10")], now);
@@ -2469,7 +2526,7 @@ mod tests {
         let now = Instant::now();
         snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
         snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
-        let first = plan_with(&books, now, &limits("3", "100"));
+        let first = plan_with(&books, &limits("3", "100"));
         let pm = OrderBook {
             platform: POLYMARKET.to_string(),
             token_id: "pm-yes".into(),
