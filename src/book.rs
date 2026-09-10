@@ -27,6 +27,21 @@ pub struct Level {
     pub size: Decimal,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BookSource {
+    Ws,
+    Rest,
+}
+
+impl BookSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ws => "ws",
+            Self::Rest => "rest",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OrderBook {
     pub platform: String,
@@ -687,14 +702,33 @@ impl BookStore {
     }
 
     pub fn get(&self, platform: &str, token_id: &str) -> Option<&OrderBook> {
-        self.get_at(platform, token_id, Instant::now())
+        self.get_with_source(platform, token_id)
+            .map(|(book, _)| book)
     }
 
     pub fn get_at(&self, platform: &str, token_id: &str, now: Instant) -> Option<&OrderBook> {
+        self.get_with_source_at(platform, token_id, now)
+            .map(|(book, _)| book)
+    }
+
+    pub fn get_with_source(
+        &self,
+        platform: &str,
+        token_id: &str,
+    ) -> Option<(&OrderBook, BookSource)> {
+        self.get_with_source_at(platform, token_id, Instant::now())
+    }
+
+    pub fn get_with_source_at(
+        &self,
+        platform: &str,
+        token_id: &str,
+        now: Instant,
+    ) -> Option<(&OrderBook, BookSource)> {
         let key = TokenBookKey::new(platform, token_id);
         let ws = self.books.get(&key);
         if ws.is_some_and(|book| book.is_fresh(self.max_age, now)) {
-            return ws;
+            return ws.map(|book| (book, BookSource::Ws));
         }
         let epoch = self.epochs.get(platform).copied().unwrap_or(0);
         let rest = self.sync.get(&key).and_then(|state| {
@@ -702,7 +736,8 @@ impl BookStore {
                 .then_some(state.rest.as_ref())
                 .flatten()
         });
-        rest.or(ws)
+        rest.map(|book| (book, BookSource::Rest))
+            .or_else(|| ws.map(|book| (book, BookSource::Ws)))
     }
 
     pub fn index_token(&mut self, platform: &str, token_id: &str, topic: TopicKey) {
@@ -1501,6 +1536,102 @@ mod tests {
             .unwrap()
             .asks
             .is_empty());
+    }
+
+    #[test]
+    fn source_selection_preserves_references_and_freshness_boundaries() {
+        let now = Instant::now();
+        let max_age = Duration::from_secs(5);
+        let mut store = BookStore::new(max_age);
+        let key = TokenBookKey::new(POLYMARKET, "t");
+        let assert_selected = |store: &BookStore, at, expected| {
+            let (book, source) = store.get_with_source_at(POLYMARKET, "t", at).unwrap();
+            assert_eq!(source, expected);
+            assert!(std::ptr::eq(
+                book,
+                store.get_at(POLYMARKET, "t", at).unwrap()
+            ));
+            let stored = match source {
+                BookSource::Ws => store.books.get(&key).unwrap(),
+                BookSource::Rest => store.sync.get(&key).unwrap().rest.as_ref().unwrap(),
+            };
+            assert!(std::ptr::eq(book, stored));
+        };
+        assert!(store.get_with_source_at(POLYMARKET, "t", now).is_none());
+        assert!(store.get_at(POLYMARKET, "t", now).is_none());
+        store.replace_snapshot(POLYMARKET, "t", vec![], asks("3"), 100, now);
+        assert_selected(&store, now, BookSource::Ws);
+        assert_selected(
+            &store,
+            now + max_age + Duration::from_nanos(1),
+            BookSource::Ws,
+        );
+        let ticket = store.begin_rest(POLYMARKET, "t");
+        store
+            .accept_rest(
+                &ticket,
+                vec![],
+                asks("4"),
+                101,
+                now + Duration::from_secs(4),
+                None,
+            )
+            .unwrap();
+        for (age, source) in [
+            (max_age, BookSource::Ws),
+            (max_age + Duration::from_nanos(1), BookSource::Rest),
+            (Duration::from_secs(9), BookSource::Rest),
+            (
+                Duration::from_secs(9) + Duration::from_nanos(1),
+                BookSource::Rest,
+            ),
+        ] {
+            assert_selected(&store, now + age, source);
+        }
+        // 增量推进版本后，旧 REST 不能遮住已过期的 WS。
+        store.apply_levels(POLYMARKET, "t", &[(false, d("0.5"), d("0"))], 101, now);
+        assert_selected(&store, now + Duration::from_secs(10), BookSource::Ws);
+        store.mark_platform_stale(POLYMARKET);
+        let ticket = store.begin_rest(POLYMARKET, "t");
+        store
+            .accept_rest(&ticket, vec![], asks("4"), 102, now, None)
+            .unwrap();
+        assert_selected(&store, now, BookSource::Rest);
+        store.begin_platform_connection(POLYMARKET);
+        assert_selected(&store, now, BookSource::Ws);
+    }
+
+    #[test]
+    fn source_getters_borrow_rest_only_and_invalid_ws_fallback() {
+        let now = Instant::now();
+        let mut store = BookStore::default();
+        assert!(store.get_with_source(POLYMARKET, "t").is_none());
+        assert!(store.get(POLYMARKET, "t").is_none());
+        let ticket = store.begin_rest(POLYMARKET, "t");
+        store
+            .accept_rest(
+                &ticket,
+                vec![],
+                asks("3"),
+                100,
+                now - Duration::from_secs(60),
+                None,
+            )
+            .unwrap();
+        let (book, source) = store.get_with_source(POLYMARKET, "t").unwrap();
+        assert_eq!(source, BookSource::Rest);
+        assert!(std::ptr::eq(book, store.get(POLYMARKET, "t").unwrap()));
+        assert!(!book.is_fresh(Duration::from_secs(5), now));
+        store.mark_platform_stale(POLYMARKET);
+        assert!(store.get_with_source(POLYMARKET, "t").is_none());
+        store.replace_snapshot(POLYMARKET, "t", vec![], asks("4"), 101, now);
+        store.mark_platform_stale(POLYMARKET);
+        let (book, source) = store.get_with_source(POLYMARKET, "t").unwrap();
+        assert_eq!(source, BookSource::Ws);
+        assert!(book.stale);
+        assert!(std::ptr::eq(book, store.get(POLYMARKET, "t").unwrap()));
+        assert_eq!(BookSource::Ws.as_str(), "ws");
+        assert_eq!(BookSource::Rest.as_str(), "rest");
     }
 
     #[test]

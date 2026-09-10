@@ -1965,24 +1965,60 @@ pub fn apply_ws_message(
     changed
 }
 
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestBookSkipCounts {
+    pub missing_token: u64,
+    pub no_ticket: u64,
+    pub parse_error: u64,
+    pub invalid_payload: u64,
+    pub older_timestamp: u64,
+    pub timestamp_conflict: u64,
+    pub epoch_changed: u64,
+    pub revision_changed: u64,
+}
+
+impl RestBookSkipCounts {
+    pub fn total(&self) -> u64 {
+        self.missing_token
+            + self.no_ticket
+            + self.parse_error
+            + self.invalid_payload
+            + self.older_timestamp
+            + self.timestamp_conflict
+            + self.epoch_changed
+            + self.revision_changed
+    }
+
+    fn record_rejection(&mut self, reason: crate::book::BookReject) {
+        use crate::book::BookReject;
+        match reason {
+            BookReject::InvalidPayload => self.invalid_payload += 1,
+            BookReject::OlderTimestamp => self.older_timestamp += 1,
+            BookReject::TimestampConflict => self.timestamp_conflict += 1,
+            BookReject::EpochChanged => self.epoch_changed += 1,
+            BookReject::RevisionChanged => self.revision_changed += 1,
+        }
+    }
+}
+
 pub fn apply_rest_books(
     books: &mut BookStore,
     payloads: &[Value],
     tickets: &[crate::book::RestTicket],
     now: Instant,
-) -> (Vec<String>, usize) {
+) -> (Vec<String>, RestBookSkipCounts) {
     let mut applied = Vec::new();
-    let mut rejected = 0;
+    let mut rejected = RestBookSkipCounts::default();
     for payload in payloads {
         let Some(token) = book_token(payload) else {
-            rejected += 1;
+            rejected.missing_token += 1;
             continue;
         };
         let Some(ticket) = tickets
             .iter()
             .find(|t| t.key.platform == POLYMARKET && t.key.token_id == token)
         else {
-            rejected += 1;
+            rejected.no_ticket += 1;
             continue;
         };
         match parse_book_json(payload) {
@@ -1991,23 +2027,59 @@ pub fn apply_rest_books(
                 asks,
                 exchange_ts_ms: ts,
                 tick_size,
-            }) => {
-                if books
-                    .accept_rest(ticket, bids, asks, ts, now, tick_size)
-                    .is_ok()
-                {
-                    applied.push(token.into());
-                } else {
-                    rejected += 1;
-                }
-            }
+            }) => match books.accept_rest(ticket, bids, asks, ts, now, tick_size) {
+                Ok(_) => applied.push(token.into()),
+                Err(reason) => rejected.record_rejection(reason),
+            },
             Err(err) => {
-                rejected += 1;
+                rejected.parse_error += 1;
                 tracing::warn!(platform = POLYMARKET, token, error = %err, "invalid REST book");
             }
         }
     }
     (applied, rejected)
+}
+
+// 错误可能携带 URL、HTTP 内容或帧；仅允许静态类别进入连接日志。
+fn market_ws_error_kind(error: &tokio_tungstenite::tungstenite::Error) -> &'static str {
+    use tokio_tungstenite::tungstenite::Error;
+    match error {
+        Error::ConnectionClosed => "connection_closed",
+        Error::AlreadyClosed => "already_closed",
+        Error::Io(_) => "io",
+        Error::Tls(_) => "tls",
+        Error::Capacity(_) => "capacity",
+        Error::Protocol(_) => "protocol",
+        Error::WriteBufferFull(_) => "write_buffer_full",
+        Error::Utf8 => "utf8",
+        Error::AttackAttempt => "attack_attempt",
+        Error::Url(_) => "url",
+        Error::Http(_) => "http",
+        Error::HttpFormat(_) => "http_format",
+    }
+}
+
+fn log_market_ws_failure(
+    event: &'static str,
+    reason: &'static str,
+    started: Instant,
+    subscription_count: usize,
+    error: &tokio_tungstenite::tungstenite::Error,
+) {
+    let io_kind = match error {
+        tokio_tungstenite::tungstenite::Error::Io(error) => Some(error.kind()),
+        _ => None,
+    };
+    tracing::warn!(
+        service = "polymarket",
+        event,
+        reason,
+        ?io_kind,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        subscription_count,
+        error_kind = market_ws_error_kind(error),
+        "polymarket market ws failure"
+    );
 }
 
 pub async fn run_market_ws(
@@ -2019,72 +2091,154 @@ pub async fn run_market_ws(
 ) {
     let mut subscribed = Vec::new();
     loop {
+        let started = Instant::now();
         if *shutdown.borrow() {
+            tracing::info!(
+                service = "polymarket",
+                event = "ws_stopped",
+                reason = "shutdown",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                subscription_count = subscribed.len(),
+                "polymarket market ws stopped"
+            );
             break;
         }
         match tokio_tungstenite::connect_async(&url).await {
             Ok((ws, _)) => {
                 books.lock().await.begin_platform_connection(POLYMARKET);
-                tracing::info!("polymarket market ws connected");
+                tracing::info!(
+                    service = "polymarket",
+                    event = "ws_connected",
+                    reason = "connected",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    subscription_count = subscribed.len(),
+                    "polymarket market ws connected"
+                );
                 let (mut write, mut read) = ws.split();
                 if !subscribed.is_empty() {
-                    let _ = write
+                    if let Err(err) = write
                         .send(Message::Text(
                             json!({"operation":"subscribe","assets_ids": subscribed})
                                 .to_string()
                                 .into(),
                         ))
-                        .await;
+                        .await
+                    {
+                        log_market_ws_failure(
+                            "ws_send_failed",
+                            "initial_subscribe_failed",
+                            started,
+                            subscribed.len(),
+                            &err,
+                        );
+                    }
                 }
                 let mut ping = tokio::time::interval(Duration::from_secs(10));
                 loop {
                     tokio::select! {
                         _ = ping.tick() => {
-                            if write.send(Message::Text("PING".into())).await.is_err() {
+                            if let Err(err) = write.send(Message::Text("PING".into())).await {
+                                log_market_ws_failure("ws_disconnected", "ping_send_failed",
+                                    started, subscribed.len(), &err);
                                 break;
                             }
                         }
                         msg = sub_rx.recv() => {
-                            let Some(tokens) = msg else { return; };
+                            let Some(tokens) = msg else {
+                                tracing::info!(service = "polymarket", event = "ws_stopped",
+                                    reason = "subscription_channel_closed",
+                                    elapsed_ms = started.elapsed().as_millis() as u64,
+                                    subscription_count = subscribed.len(), "polymarket market ws stopped");
+                                return;
+                            };
                             let dropped: Vec<_> = subscribed
                                 .iter()
                                 .filter(|id| !tokens.contains(*id))
                                 .cloned()
                                 .collect();
                             if !dropped.is_empty() {
-                                if write.send(Message::Text(
+                                if let Err(err) = write.send(Message::Text(
                                     json!({"operation":"unsubscribe","assets_ids": dropped}).to_string().into()
-                                )).await.is_err() {
+                                )).await {
+                                    log_market_ws_failure("ws_disconnected", "unsubscribe_failed",
+                                        started, subscribed.len(), &err);
                                     break;
                                 }
                             }
                             subscribed = tokens;
-                            if write.send(Message::Text(
+                            if let Err(err) = write.send(Message::Text(
                                 json!({"operation":"subscribe","assets_ids": subscribed}).to_string().into()
-                            )).await.is_err() {
+                            )).await {
+                                log_market_ws_failure("ws_disconnected", "subscribe_failed",
+                                    started, subscribed.len(), &err);
                                 break;
                             }
                         }
                         incoming = read.next() => {
-                            let Some(Ok(msg)) = incoming else { break; };
+                            let msg = match incoming {
+                                Some(Ok(msg)) => msg,
+                                Some(Err(err)) => {
+                                    log_market_ws_failure("ws_disconnected", "read_error",
+                                        started, subscribed.len(), &err);
+                                    break;
+                                }
+                                None => {
+                                    tracing::warn!(service = "polymarket", event = "ws_disconnected",
+                                        reason = "eof", elapsed_ms = started.elapsed().as_millis() as u64,
+                                        subscription_count = subscribed.len(), "polymarket market ws ended");
+                                    break;
+                                }
+                            };
                             let text = match msg {
                                 Message::Text(t) => t.to_string(),
                                 Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
                                 Message::Ping(p) => {
-                                    let _ = write.send(Message::Pong(p)).await;
+                                    if let Err(err) = write.send(Message::Pong(p)).await {
+                                        log_market_ws_failure("ws_send_failed", "pong_send_failed",
+                                            started, subscribed.len(), &err);
+                                    }
+                                    continue;
+                                }
+                                Message::Close(frame) => {
+                                    tracing::info!(service = "polymarket", event = "ws_close_received",
+                                        reason = "close_frame", elapsed_ms = started.elapsed().as_millis() as u64,
+                                        subscription_count = subscribed.len(),
+                                        close_code = ?frame.map(|f| u16::from(f.code)),
+                                        "polymarket market ws close received");
                                     continue;
                                 }
                                 _ => continue,
                             };
                             handle_ws_text(&text, &books, &calc_tx).await;
                         }
-                        _ = wait_shutdown(&shutdown) => return,
+                        _ = wait_shutdown(&shutdown) => {
+                            let reason = if *shutdown.borrow() { "shutdown" } else { "shutdown_channel_closed" };
+                            tracing::info!(service = "polymarket", event = "ws_stopped", reason,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                subscription_count = subscribed.len(), "polymarket market ws stopped");
+                            return;
+                        },
                     }
                 }
                 books.lock().await.mark_platform_stale(POLYMARKET);
             }
-            Err(err) => tracing::warn!(error = %err, "polymarket ws connect failed"),
+            Err(err) => log_market_ws_failure(
+                "ws_connect_failed",
+                "connect_failed",
+                started,
+                subscribed.len(),
+                &err,
+            ),
         }
+        tracing::info!(
+            service = "polymarket",
+            event = "ws_reconnect_wait",
+            reason = "retry",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            subscription_count = subscribed.len(),
+            delay_ms = 2000,
+            "polymarket market ws reconnect scheduled"
+        );
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
@@ -2220,6 +2374,350 @@ pub(crate) mod tests {
     use super::*;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncWriteExt;
+
+    #[derive(Debug)]
+    struct WsLogEvent {
+        level: tracing::Level,
+        fields: HashMap<String, String>,
+    }
+
+    impl tracing::field::Visit for WsLogEvent {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .insert(field.name().into(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields.insert(field.name().into(), value.into());
+        }
+    }
+
+    struct WsLogCapture(mpsc::UnboundedSender<WsLogEvent>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WsLogCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut captured = WsLogEvent {
+                level: *event.metadata().level(),
+                fields: HashMap::new(),
+            };
+            event.record(&mut captured);
+            let _ = self.0.send(captured);
+        }
+    }
+
+    struct MarketWsFixture {
+        listener: tokio::net::TcpListener,
+        server: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        books: Arc<Mutex<BookStore>>,
+        subscriptions: mpsc::Sender<Vec<String>>,
+        shutdown: tokio::sync::watch::Sender<bool>,
+        logs: mpsc::UnboundedReceiver<WsLogEvent>,
+        client: tokio::task::JoinHandle<()>,
+    }
+
+    impl MarketWsFixture {
+        async fn new() -> Self {
+            use tracing::instrument::WithSubscriber;
+            use tracing_subscriber::prelude::*;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}/private-url-marker", listener.local_addr().unwrap());
+            let books = Arc::new(Mutex::new(BookStore::default()));
+            let (calc_tx, _calc_rx) = mpsc::channel(10);
+            let (subscriptions, sub_rx) = mpsc::channel(10);
+            let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+            let (log_tx, logs) = mpsc::unbounded_channel();
+            let subscriber = tracing_subscriber::registry().with(WsLogCapture(log_tx));
+            let client = tokio::spawn(
+                run_market_ws(url, books.clone(), calc_tx, sub_rx, shutdown_rx)
+                    .with_subscriber(subscriber),
+            );
+            let (socket, _) = listener.accept().await.unwrap();
+            let server = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let mut fixture = Self {
+                listener,
+                server,
+                books,
+                subscriptions,
+                shutdown,
+                logs,
+                client,
+            };
+            fixture.log("ws_connected").await;
+            assert_eq!(
+                fixture.server.next().await.unwrap().unwrap(),
+                Message::Text("PING".into())
+            );
+            fixture
+        }
+
+        async fn log(&mut self, event: &str) -> WsLogEvent {
+            loop {
+                let entry = self.logs.recv().await.unwrap();
+                if entry.fields.get("event").map(String::as_str) == Some(event) {
+                    assert_eq!(entry.fields["service"], "polymarket");
+                    assert!(entry.fields.contains_key("elapsed_ms"));
+                    assert!(entry.fields.contains_key("subscription_count"));
+                    let rendered = format!("{:?}", entry.fields);
+                    for secret in [
+                        "private-url-marker",
+                        "private-frame-marker",
+                        "private-close-marker",
+                    ] {
+                        assert!(!rendered.contains(secret));
+                    }
+                    return entry;
+                }
+            }
+        }
+
+        async fn seed_book(&mut self) {
+            self.server
+                .send(Message::Binary(
+                    json!({"event_type":"book","asset_id":"t",
+                "timestamp":"100","bids":[],"asks":[]})
+                    .to_string()
+                    .into_bytes()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            // Pong 是已处理前一帧的屏障，不依赖 sleep 或调度次数。
+            self.server
+                .send(Message::Ping(
+                    "private-frame-marker".as_bytes().to_vec().into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                self.server.next().await.unwrap().unwrap(),
+                Message::Pong("private-frame-marker".as_bytes().to_vec().into())
+            );
+            assert!(!self.books.lock().await.get(POLYMARKET, "t").unwrap().stale);
+        }
+
+        async fn subscribe(&mut self, tokens: &[&str]) {
+            self.subscriptions
+                .send(tokens.iter().map(|token| (*token).into()).collect())
+                .await
+                .unwrap();
+            let message = self
+                .server
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&message).unwrap(),
+                json!({"operation":"subscribe","assets_ids":tokens})
+            );
+        }
+
+        async fn close_frame(&mut self) {
+            use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+            self.server
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Normal,
+                    reason: "private-close-marker".into(),
+                })))
+                .await
+                .unwrap();
+            let entry = self.log("ws_close_received").await;
+            assert_eq!(entry.level, tracing::Level::INFO);
+            assert_eq!(entry.fields["close_code"], "Some(1000)");
+            assert!(!self.client.is_finished());
+            assert!(!self.books.lock().await.get(POLYMARKET, "t").unwrap().stale);
+        }
+    }
+
+    #[tokio::test]
+    async fn market_ws_normal_stops_and_close_keep_books_current() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for stop in [
+                "shutdown",
+                "shutdown_channel_closed",
+                "subscription_channel_closed",
+            ] {
+                let mut fixture = MarketWsFixture::new().await;
+                fixture.seed_book().await;
+                fixture.close_frame().await;
+                // 服务端保持 TCP 打开，Close 本身不会触发 stale 或重连。
+                let replacement_sub = mpsc::channel(1).0;
+                let replacement_shutdown = tokio::sync::watch::channel(false).0;
+                match stop {
+                    "shutdown" => fixture.shutdown.send(true).unwrap(),
+                    "shutdown_channel_closed" => drop(std::mem::replace(
+                        &mut fixture.shutdown,
+                        replacement_shutdown,
+                    )),
+                    "subscription_channel_closed" => drop(std::mem::replace(
+                        &mut fixture.subscriptions,
+                        replacement_sub,
+                    )),
+                    _ => unreachable!(),
+                }
+                let entry = fixture.log("ws_stopped").await;
+                assert_eq!(entry.level, tracing::Level::INFO);
+                assert_eq!(entry.fields["reason"], stop);
+                fixture.client.await.unwrap();
+                assert!(
+                    !fixture
+                        .books
+                        .lock()
+                        .await
+                        .get(POLYMARKET, "t")
+                        .unwrap()
+                        .stale
+                );
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn market_ws_close_then_subscription_failure_marks_stale() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for (initial, next, reason) in [
+                (vec![], vec!["t"], "subscribe_failed"),
+                (vec!["t"], vec![], "unsubscribe_failed"),
+            ] {
+                let mut fixture = MarketWsFixture::new().await;
+                fixture.seed_book().await;
+                if !initial.is_empty() {
+                    fixture.subscribe(&initial).await;
+                }
+                fixture.close_frame().await;
+                fixture
+                    .subscriptions
+                    .send(next.iter().map(|t| (*t).into()).collect())
+                    .await
+                    .unwrap();
+                let entry = fixture.log("ws_disconnected").await;
+                assert_eq!(entry.level, tracing::Level::WARN);
+                assert_eq!(entry.fields["reason"], reason);
+                assert_eq!(entry.fields["error_kind"], "protocol");
+                fixture.log("ws_reconnect_wait").await;
+                assert!(
+                    fixture
+                        .books
+                        .lock()
+                        .await
+                        .get(POLYMARKET, "t")
+                        .unwrap()
+                        .stale
+                );
+                fixture.client.abort();
+                assert!(fixture.client.await.unwrap_err().is_cancelled());
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn market_ws_read_error_reconnects_after_two_seconds_and_resubscribes() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut fixture = MarketWsFixture::new().await;
+            fixture.seed_book().await;
+            fixture.subscribe(&["t"]).await;
+            let before = fixture.books.lock().await.begin_rest(POLYMARKET, "t");
+            // 不发送 Close 的 TCP EOF 在 tungstenite 中是 read_error。
+            fixture.server.get_mut().shutdown().await.unwrap();
+            let entry = fixture.log("ws_disconnected").await;
+            assert_eq!(entry.fields["reason"], "read_error");
+            fixture.log("ws_reconnect_wait").await;
+            assert!(
+                fixture
+                    .books
+                    .lock()
+                    .await
+                    .get(POLYMARKET, "t")
+                    .unwrap()
+                    .stale
+            );
+            // 网络事件完成后再冻结时间，避免 I/O 等待触发虚拟时钟自动推进。
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_millis(1999)).await;
+            assert!(fixture.logs.try_recv().is_err());
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::time::resume();
+            let (socket, _) = fixture.listener.accept().await.unwrap();
+            let mut reconnected = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let entry = fixture.log("ws_connected").await;
+            assert_eq!(entry.fields["subscription_count"], "1");
+            let message = reconnected
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&message).unwrap(),
+                json!({"operation":"subscribe","assets_ids":["t"]})
+            );
+            assert!(fixture.books.lock().await.begin_rest(POLYMARKET, "t").epoch > before.epoch);
+            fixture.shutdown.send(true).unwrap();
+            fixture.client.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn market_ws_failure_logs_only_safe_error_categories() {
+        use tokio_tungstenite::tungstenite::Error as WsError;
+        use tracing_subscriber::prelude::*;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let subscriber = tracing_subscriber::registry().with(WsLogCapture(tx));
+        tracing::subscriber::with_default(subscriber, || {
+            for (error, expected) in [
+                (
+                    WsError::Io(std::io::Error::other("private-url-marker")),
+                    "io",
+                ),
+                (
+                    WsError::WriteBufferFull(Message::Text("private-frame-marker".into())),
+                    "write_buffer_full",
+                ),
+                (
+                    WsError::Http(tokio_tungstenite::tungstenite::http::Response::new(Some(
+                        b"private-frame-marker".to_vec(),
+                    ))),
+                    "http",
+                ),
+            ] {
+                for reason in [
+                    "initial_subscribe_failed",
+                    "pong_send_failed",
+                    "ping_send_failed",
+                    "connect_failed",
+                ] {
+                    log_market_ws_failure("ws_send_failed", reason, Instant::now(), 3, &error);
+                    let entry = rx.try_recv().unwrap();
+                    assert_eq!(entry.level, tracing::Level::WARN);
+                    assert_eq!(entry.fields["error_kind"], expected);
+                    assert_eq!(
+                        entry.fields["io_kind"],
+                        if expected == "io" {
+                            "Some(Other)"
+                        } else {
+                            "None"
+                        }
+                    );
+                    assert_eq!(entry.fields["reason"], reason);
+                    assert_eq!(entry.fields["subscription_count"], "3");
+                    assert!(!format!("{:?}", entry.fields).contains("private-"));
+                }
+            }
+        });
+    }
 
     fn cache_test_venue() -> PolymarketVenue {
         PolymarketVenue {
@@ -2647,7 +3145,7 @@ pub(crate) mod tests {
                 let tickets = vec![books.begin_rest(POLYMARKET, "t")];
                 assert_eq!(
                     apply_rest_books(&mut books, &[snapshot.clone()], &tickets, later),
-                    (vec!["t".into()], 0)
+                    (vec!["t".into()], RestBookSkipCounts::default())
                 );
             } else {
                 assert_eq!(
@@ -2728,10 +3226,178 @@ pub(crate) mod tests {
             .into();
         let (accepted, rejected) = apply_rest_books(&mut books, &payloads, &tickets, now);
         assert_eq!(accepted, vec!["b"]);
-        assert_eq!(rejected, 2);
+        assert_eq!(
+            rejected,
+            RestBookSkipCounts {
+                no_ticket: 1,
+                revision_changed: 1,
+                ..Default::default()
+            }
+        );
         assert!(books.get(POLYMARKET, "unsolicited").is_none());
         assert!(books.get(POLYMARKET, "missing").is_none());
-        assert_eq!(apply_rest_books(&mut books, &payloads, &tickets, now).1, 3);
+        assert_eq!(
+            apply_rest_books(&mut books, &payloads, &tickets, now).1,
+            RestBookSkipCounts {
+                no_ticket: 1,
+                revision_changed: 2,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn rest_skip_counts_map_every_book_rejection_and_total() {
+        use crate::book::BookReject;
+        for (reason, expected) in [
+            (
+                BookReject::InvalidPayload,
+                RestBookSkipCounts {
+                    invalid_payload: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                BookReject::OlderTimestamp,
+                RestBookSkipCounts {
+                    older_timestamp: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                BookReject::TimestampConflict,
+                RestBookSkipCounts {
+                    timestamp_conflict: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                BookReject::EpochChanged,
+                RestBookSkipCounts {
+                    epoch_changed: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                BookReject::RevisionChanged,
+                RestBookSkipCounts {
+                    revision_changed: 1,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let mut counts = RestBookSkipCounts::default();
+            counts.record_rejection(reason);
+            assert_eq!(counts, expected);
+            assert_eq!(counts.total(), 1);
+        }
+        assert_eq!(RestBookSkipCounts::default().total(), 0);
+        assert_eq!(
+            RestBookSkipCounts {
+                missing_token: 1,
+                no_ticket: 2,
+                parse_error: 3,
+                invalid_payload: 4,
+                older_timestamp: 5,
+                timestamp_conflict: 6,
+                epoch_changed: 7,
+                revision_changed: 8,
+            }
+            .total(),
+            36
+        );
+    }
+
+    #[test]
+    fn rest_skip_counts_preserve_reachable_branch_precedence() {
+        let now = Instant::now();
+        let mut books = BookStore::default();
+        for token in ["old", "conflict"] {
+            books.replace_snapshot(POLYMARKET, token, vec![], vec![], 200, now);
+        }
+        let tickets = ["bad", "old", "conflict", "epoch", "revision", "ok"]
+            .map(|token| books.begin_rest(POLYMARKET, token));
+        let mut tickets = tickets.to_vec();
+        tickets
+            .iter_mut()
+            .find(|t| t.key.token_id == "epoch")
+            .unwrap()
+            .epoch += 1;
+        books.set_tick_size(POLYMARKET, "revision", Decimal::new(1, 2));
+        let mut foreign = books.begin_rest("other_platform", "foreign");
+        foreign.revision += 1;
+        tickets.push(foreign);
+        // 身份、票据、解析先于 accept_rest；无效载荷已由严格解析器拦截。
+        let payloads = vec![
+            json!({"timestamp":"bad"}),
+            json!({"asset_id":"unsolicited","timestamp":"bad"}),
+            json!({"asset_id":"foreign","timestamp":"bad"}),
+            json!({"asset_id":"bad","timestamp":"bad"}),
+            json!({"asset_id":"epoch","timestamp":"bad"}),
+            json!({"asset_id":"old","timestamp":"100","bids":[],"asks":[]}),
+            json!({"asset_id":"conflict","timestamp":"200","bids":[],"asks":[{"price":"0.5","size":"1"}]}),
+            json!({"asset_id":"epoch","timestamp":"100","bids":[],"asks":[]}),
+            json!({"asset_id":"revision","timestamp":"100","bids":[],"asks":[]}),
+            json!({"asset_id":"ok","timestamp":"100","bids":[],"asks":[]}),
+        ];
+        let (applied, skipped) = apply_rest_books(&mut books, &payloads, &tickets, now);
+        assert_eq!(applied, vec!["ok"]);
+        assert_eq!(
+            skipped,
+            RestBookSkipCounts {
+                missing_token: 1,
+                no_ticket: 2,
+                parse_error: 2,
+                older_timestamp: 1,
+                timestamp_conflict: 1,
+                epoch_changed: 1,
+                revision_changed: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            applied.len() as u64 + skipped.total(),
+            payloads.len() as u64
+        );
+        assert!(books.get(POLYMARKET, "conflict").unwrap().asks.is_empty());
+        assert!(books.get(POLYMARKET, "epoch").is_none());
+    }
+
+    #[test]
+    fn rest_skip_counts_count_returned_payloads_not_missing_responses() {
+        let now = Instant::now();
+        let mut books = BookStore::default();
+        let tickets = ["a", "not_returned"].map(|token| books.begin_rest(POLYMARKET, token));
+        assert_eq!(
+            apply_rest_books(&mut books, &[], &tickets, now),
+            (vec![], RestBookSkipCounts::default())
+        );
+        assert_eq!(
+            apply_rest_books(&mut books, &[], &[], now),
+            (vec![], RestBookSkipCounts::default())
+        );
+        let payload = json!({"asset_id":"a","timestamp":"100","bids":[],"asks":[]});
+        assert_eq!(
+            apply_rest_books(&mut books, &[payload.clone()], &[], now),
+            (
+                vec![],
+                RestBookSkipCounts {
+                    no_ticket: 1,
+                    ..Default::default()
+                }
+            )
+        );
+        assert_eq!(
+            apply_rest_books(&mut books, &[payload.clone(), payload], &tickets, now),
+            (
+                vec!["a".into()],
+                RestBookSkipCounts {
+                    revision_changed: 1,
+                    ..Default::default()
+                }
+            )
+        );
+        assert!(books.get(POLYMARKET, "not_returned").is_none());
     }
 
     #[tokio::test]
@@ -2817,7 +3483,13 @@ pub(crate) mod tests {
             let ticket = books.begin_rest(POLYMARKET, "t");
             assert_eq!(
                 apply_rest_books(&mut books, &[old], &[ticket], now),
-                (vec![], 1)
+                (
+                    vec![],
+                    RestBookSkipCounts {
+                        older_timestamp: 1,
+                        ..Default::default()
+                    }
+                )
             );
             assert_eq!(books.tick_size(POLYMARKET, "t"), Some(Decimal::new(1, 3)));
             assert_eq!(books.get(POLYMARKET, "t").unwrap().exchange_ts_ms, 100);
@@ -2839,7 +3511,7 @@ pub(crate) mod tests {
             json!({"asset_id":"t","timestamp":"201","bids":[],"asks":[],"tick_size":"0.001"});
         assert_eq!(
             apply_rest_books(&mut books, &[restored], &[ticket], now),
-            (vec!["t".into()], 0)
+            (vec!["t".into()], RestBookSkipCounts::default())
         );
         assert_eq!(books.tick_size(POLYMARKET, "t"), Some(Decimal::new(1, 3)));
     }
@@ -2939,7 +3611,13 @@ pub(crate) mod tests {
             now,
         );
         assert_eq!(applied, vec!["t2".to_string()]);
-        assert_eq!(skipped_old, 1);
+        assert_eq!(
+            skipped_old,
+            RestBookSkipCounts {
+                older_timestamp: 1,
+                ..Default::default()
+            }
+        );
         assert_eq!(
             books.get(POLYMARKET, "t1").unwrap().asks[0].price,
             Decimal::from_str("0.40").unwrap()

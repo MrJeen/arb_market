@@ -1,7 +1,7 @@
 use crate::book::{BookStore, DirtyCoalescer, OrderBook};
 use crate::calc::{
     best_plan, confirm_plan, confirm_plan_reason, diagnose_books, first_usable_ask, inspect_calc,
-    ArbLimits, ArbPlan, CalcMissSnapshot, FeeContext,
+    ArbLimits, ArbPlan, FeeContext,
 };
 use crate::config::{Config, OUTCOME, POLYMARKET};
 use crate::discovery::{load_active_topics, load_topic};
@@ -264,22 +264,12 @@ impl Engine {
             min_apr: self.cfg.arb_min_apr,
             days: crate::calc::days_until(topic.end_date),
         };
-        let (plan, pm_book_ts, out_book_ts, pm_ask, pm_sz, out_ask, out_sz) = {
+        let (plan, pm_book_ts, out_book_ts, pm_ask, pm_sz, out_ask, out_sz, skips, pairs) = {
             let books = self.books.lock().await;
             let now = Instant::now();
             let plan = best_plan(&topic, &books, &fees, &limits, now, self.cfg.book_stale);
             let (skips, pairs) =
                 inspect_calc(&topic, &books, &fees, &limits, now, self.cfg.book_stale);
-            self.stats.add_missing_book(skips.missing_book);
-            self.stats.add_stale_book(skips.stale_book);
-            self.stats.add_unit_cost(skips.unit_cost);
-            self.stats.add_unprofitable(skips.unprofitable);
-            if plan.is_none() && !pairs.is_empty() {
-                self.stats.record_calc_miss(CalcMissSnapshot {
-                    topic: topic.key.as_str(),
-                    pairs,
-                });
-            }
             let (pm_book_ts, out_book_ts, pm_ask, pm_sz, out_ask, out_sz) = plan
                 .as_ref()
                 .map(|p| {
@@ -311,8 +301,13 @@ impl Engine {
                 pm_sz,
                 out_ask,
                 out_sz,
+                skips,
+                pairs,
             )
         };
+        self.stats.record_calc_skips(&skips);
+        self.stats
+            .record_calc_samples(topic.key, pairs, plan.is_none());
         self.stats.calc();
         let Some(plan) = plan else {
             return Ok(());
@@ -2644,28 +2639,28 @@ impl Engine {
             }
         };
         let now = Instant::now();
-        let (applied, skipped_old, topics) = {
+        let (applied, skipped, topics) = {
             let mut books = self.books.lock().await;
-            let (applied, skipped_old) = crate::platforms::polymarket::apply_rest_books(
+            let (applied, skipped) = crate::platforms::polymarket::apply_rest_books(
                 &mut books, &payloads, &tickets, now,
             );
             let mut topics = Vec::new();
             for token in &applied {
                 topics.extend(books.topics_for(POLYMARKET, token));
             }
-            (applied, skipped_old, topics)
+            (applied, skipped, topics)
         };
         let elapsed_ms = started.elapsed().as_millis() as u64;
         self.stats.record_pm_book_resync(
             stale.len(),
-            Some((payloads.len(), applied.len(), skipped_old)),
+            Some((payloads.len(), applied.len(), skipped)),
             elapsed_ms,
         );
         tracing::debug!(
             stale = stale.len(),
             requested = stale.len(),
             applied = applied.len(),
-            skipped_old,
+            skipped = skipped.total(),
             topics = topics.len(),
             elapsed_ms,
             "polymarket book resync"

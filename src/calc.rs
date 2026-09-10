@@ -1,4 +1,4 @@
-use crate::book::{Level, OrderBook};
+use crate::book::{BookSource, Level, OrderBook};
 use crate::config::{OUTCOME, POLYMARKET};
 use crate::domain::{TokenRef, Topic};
 use crate::platforms::OrderSide;
@@ -438,8 +438,55 @@ pub fn best_plan(
 pub struct CalcSkipCounts {
     pub missing_book: u64,
     pub stale_book: u64,
+    pub stale_pm_only: u64,
+    pub stale_out_only: u64,
+    pub stale_both: u64,
+    pub stale_pm_invalid: u64,
+    pub stale_pm_expired: u64,
+    pub stale_out_invalid: u64,
+    pub stale_out_expired: u64,
     pub unit_cost: u64,
     pub unprofitable: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CalcBookState {
+    pub source: BookSource,
+    pub age_ms: u64,
+    pub invalid: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CalcStaleDetail {
+    pub pm: CalcBookState,
+    pub out: CalcBookState,
+    pub threshold_ms: u64,
+    pub kind: StaleKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaleKind {
+    PmOnly,
+    OutOnly,
+    Both,
+}
+
+impl StaleKind {
+    pub fn index(self) -> usize {
+        match self {
+            Self::PmOnly => 0,
+            Self::OutOnly => 1,
+            Self::Both => 2,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PmOnly => "pm_only",
+            Self::OutOnly => "out_only",
+            Self::Both => "both",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -453,6 +500,7 @@ pub struct CalcPairSample {
     pub unit_cost: Option<Decimal>,
     pub unit_expected_revenue: Option<Decimal>,
     pub reason: &'static str,
+    pub stale: Option<CalcStaleDetail>,
 }
 
 impl CalcPairSample {
@@ -516,7 +564,31 @@ pub fn inspect_calc(
         }
         match sample.reason {
             "missing_book" => counts.missing_book += 1,
-            "stale_book" => counts.stale_book += 1,
+            "stale_book" => {
+                counts.stale_book += 1;
+                if let Some(detail) = sample.stale {
+                    match detail.kind {
+                        StaleKind::PmOnly => counts.stale_pm_only += 1,
+                        StaleKind::OutOnly => counts.stale_out_only += 1,
+                        StaleKind::Both => counts.stale_both += 1,
+                    }
+                    // 每侧只记一个原因；显式失效优先于年龄过期。
+                    if detail.kind != StaleKind::OutOnly {
+                        if detail.pm.invalid {
+                            counts.stale_pm_invalid += 1;
+                        } else {
+                            counts.stale_pm_expired += 1;
+                        }
+                    }
+                    if detail.kind != StaleKind::PmOnly {
+                        if detail.out.invalid {
+                            counts.stale_out_invalid += 1;
+                        } else {
+                            counts.stale_out_expired += 1;
+                        }
+                    }
+                }
+            }
             "unit_cost_ge_revenue" => counts.unit_cost += 1,
             _ => counts.unprofitable += 1,
         }
@@ -545,6 +617,7 @@ fn diagnose_pair(
         unit_cost: None,
         unit_expected_revenue: None,
         reason: "missing_book",
+        stale: None,
     };
     let Some(pm_token) = topic.token(POLYMARKET, pm_label) else {
         return sample;
@@ -552,14 +625,35 @@ fn diagnose_pair(
     let Some(out_token) = topic.token(OUTCOME, out_label) else {
         return sample;
     };
-    let Some(pm_book) = books.get(POLYMARKET, &pm_token.token_id) else {
+    let Some((pm_book, pm_source)) = books.get_with_source(POLYMARKET, &pm_token.token_id) else {
         return sample;
     };
-    let Some(out_book) = books.get(OUTCOME, &out_token.token_id) else {
+    let Some((out_book, out_source)) = books.get_with_source(OUTCOME, &out_token.token_id) else {
         return sample;
     };
-    if !pm_book.is_fresh(stale, now) || !out_book.is_fresh(stale, now) {
+    let pm_fresh = pm_book.is_fresh(stale, now);
+    let out_fresh = out_book.is_fresh(stale, now);
+    if !pm_fresh || !out_fresh {
         sample.reason = "stale_book";
+        sample.stale = Some(CalcStaleDetail {
+            pm: CalcBookState {
+                source: pm_source,
+                age_ms: now.duration_since(pm_book.received_at).as_millis() as u64,
+                invalid: pm_book.stale,
+            },
+            out: CalcBookState {
+                source: out_source,
+                age_ms: now.duration_since(out_book.received_at).as_millis() as u64,
+                invalid: out_book.stale,
+            },
+            threshold_ms: stale.as_millis() as u64,
+            // 分类沿用原精度的新鲜度判断，不使用取整后的毫秒年龄。
+            kind: match (pm_fresh, out_fresh) {
+                (false, true) => StaleKind::PmOnly,
+                (true, false) => StaleKind::OutOnly,
+                _ => StaleKind::Both,
+            },
+        });
         return sample;
     }
     diagnose_loaded(
@@ -587,6 +681,7 @@ pub fn diagnose_books(
         unit_cost: None,
         unit_expected_revenue: None,
         reason: "missing_book",
+        stale: None,
     };
     let Some(pm_token) = topic.token(POLYMARKET, pm_label) else {
         return sample;
@@ -854,8 +949,339 @@ mod tests {
         )
         .1
         .into_iter()
-        .map(|p| p.reason)
+        .map(|p| {
+            assert_eq!(p.stale, None);
+            p.reason
+        })
         .collect()
+    }
+
+    #[test]
+    fn inspect_stale_kinds_and_per_side_reasons() {
+        let now = Instant::now();
+        // 同时失效和超龄时只计 invalid；边界年龄仍然新鲜。
+        let states = [(false, 5), (true, 1), (false, 6), (true, 6)];
+        for (pm_invalid, pm_age) in states {
+            for (out_invalid, out_age) in states {
+                let mut books = BookStore::default();
+                snapshot(
+                    &mut books,
+                    POLYMARKET,
+                    "pm-yes",
+                    vec![("0.40", "50")],
+                    now - std::time::Duration::from_secs(pm_age),
+                );
+                snapshot(
+                    &mut books,
+                    OUTCOME,
+                    "#10",
+                    vec![("0.40", "50")],
+                    now - std::time::Duration::from_secs(out_age),
+                );
+                if pm_invalid {
+                    books.mark_platform_stale(POLYMARKET);
+                }
+                if out_invalid {
+                    books.mark_platform_stale(OUTCOME);
+                }
+                let (counts, pairs) = inspect_calc(
+                    &sample_topic(),
+                    &books,
+                    &fees_zero(),
+                    &limits("0", "100"),
+                    now,
+                    std::time::Duration::from_secs(5),
+                );
+                let pm_stale = pm_invalid || pm_age > 5;
+                let out_stale = out_invalid || out_age > 5;
+                let expected = CalcSkipCounts {
+                    missing_book: 1,
+                    stale_book: u64::from(pm_stale || out_stale),
+                    stale_pm_only: u64::from(pm_stale && !out_stale),
+                    stale_out_only: u64::from(!pm_stale && out_stale),
+                    stale_both: u64::from(pm_stale && out_stale),
+                    stale_pm_invalid: u64::from(pm_invalid),
+                    stale_pm_expired: u64::from(pm_stale && !pm_invalid),
+                    stale_out_invalid: u64::from(out_invalid),
+                    stale_out_expired: u64::from(out_stale && !out_invalid),
+                    ..CalcSkipCounts::default()
+                };
+                assert_eq!(counts, expected);
+                assert_eq!(
+                    counts.stale_book,
+                    counts.stale_pm_only + counts.stale_out_only + counts.stale_both
+                );
+                let sample = diagnose_pair(
+                    &sample_topic(),
+                    &books,
+                    &fees_zero(),
+                    &limits("0", "100"),
+                    now,
+                    std::time::Duration::from_secs(5),
+                    "yes",
+                    "no",
+                );
+                if !pm_stale && !out_stale {
+                    assert_eq!(sample.reason, "ok");
+                    assert_eq!(sample.stale, None);
+                    assert_eq!(pairs.len(), 1);
+                    continue;
+                }
+                let (kind, index, name) = match (pm_stale, out_stale) {
+                    (true, false) => (StaleKind::PmOnly, 0, "pm_only"),
+                    (false, true) => (StaleKind::OutOnly, 1, "out_only"),
+                    _ => (StaleKind::Both, 2, "both"),
+                };
+                assert_eq!(kind.index(), index);
+                assert_eq!(kind.as_str(), name);
+                assert_eq!(sample.reason, "stale_book");
+                assert_eq!(
+                    sample.stale,
+                    Some(CalcStaleDetail {
+                        pm: CalcBookState {
+                            source: BookSource::Ws,
+                            age_ms: pm_age * 1000,
+                            invalid: pm_invalid
+                        },
+                        out: CalcBookState {
+                            source: BookSource::Ws,
+                            age_ms: out_age * 1000,
+                            invalid: out_invalid
+                        },
+                        threshold_ms: 5000,
+                        kind,
+                    })
+                );
+                assert_eq!(
+                    pairs
+                        .iter()
+                        .find(|p| p.reason == "stale_book")
+                        .unwrap()
+                        .stale,
+                    sample.stale
+                );
+                assert_eq!(sample.pm_ask, None);
+                assert_eq!(sample.out_ask, None);
+            }
+        }
+    }
+
+    #[test]
+    fn inspect_missing_books_or_tokens_do_not_count_stale() {
+        let now = Instant::now();
+        for present in [None, Some(POLYMARKET), Some(OUTCOME)] {
+            let mut books = BookStore::default();
+            if let Some(platform) = present {
+                let id = if platform == POLYMARKET {
+                    "pm-yes"
+                } else {
+                    "#10"
+                };
+                snapshot(
+                    &mut books,
+                    platform,
+                    id,
+                    vec![("0.40", "50")],
+                    now - std::time::Duration::from_secs(60),
+                );
+                books.mark_platform_stale(platform);
+            }
+            let (counts, pairs) = inspect_calc(
+                &sample_topic(),
+                &books,
+                &fees_zero(),
+                &limits("0", "100"),
+                now,
+                std::time::Duration::from_secs(5),
+            );
+            assert_eq!(
+                counts,
+                CalcSkipCounts {
+                    missing_book: 2,
+                    ..CalcSkipCounts::default()
+                }
+            );
+            assert_eq!(pairs.len(), 2);
+            assert!(pairs
+                .iter()
+                .all(|p| p.reason == "missing_book" && p.stale.is_none()));
+        }
+        let mut books = BookStore::default();
+        snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+        snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+        for missing in [POLYMARKET, OUTCOME] {
+            let mut topic = sample_topic();
+            topic.tokens.retain(|t| t.platform != missing);
+            let sample = diagnose_pair(
+                &topic,
+                &books,
+                &fees_zero(),
+                &limits("0", "100"),
+                now,
+                std::time::Duration::from_secs(5),
+                "yes",
+                "no",
+            );
+            assert_eq!(sample.reason, "missing_book");
+            assert_eq!(sample.stale, None);
+        }
+    }
+
+    #[test]
+    fn inspect_stale_uses_selected_source_and_received_age() {
+        let now = Instant::now();
+        for max_age in [5, 3600] {
+            for pm_rest in [false, true] {
+                for out_rest in [false, true] {
+                    let mut books = BookStore::new(std::time::Duration::from_secs(max_age));
+                    for (platform, id, rest) in
+                        [(POLYMARKET, "pm-yes", pm_rest), (OUTCOME, "#10", out_rest)]
+                    {
+                        snapshot(
+                            &mut books,
+                            platform,
+                            id,
+                            vec![("0.40", "50")],
+                            now - std::time::Duration::from_secs(60),
+                        );
+                        if rest {
+                            let ticket = books.begin_rest(platform, id);
+                            books
+                                .accept_rest(
+                                    &ticket,
+                                    vec![],
+                                    vec![Level {
+                                        price: d("0.40"),
+                                        size: d("50"),
+                                    }],
+                                    2,
+                                    now - std::time::Duration::from_secs(2),
+                                    None,
+                                )
+                                .unwrap();
+                        }
+                    }
+                    let (counts, pairs) = inspect_calc(
+                        &sample_topic(),
+                        &books,
+                        &fees_zero(),
+                        &limits("0", "100"),
+                        now,
+                        std::time::Duration::from_secs(1),
+                    );
+                    let expected_state = |rest| {
+                        if rest && max_age == 5 {
+                            CalcBookState {
+                                source: BookSource::Rest,
+                                age_ms: 2000,
+                                invalid: false,
+                            }
+                        } else {
+                            CalcBookState {
+                                source: BookSource::Ws,
+                                age_ms: 60000,
+                                invalid: false,
+                            }
+                        }
+                    };
+                    let sample = pairs.iter().find(|p| p.reason == "stale_book").unwrap();
+                    assert_eq!(
+                        sample.stale,
+                        Some(CalcStaleDetail {
+                            pm: expected_state(pm_rest),
+                            out: expected_state(out_rest),
+                            threshold_ms: 1000,
+                            kind: StaleKind::Both,
+                        })
+                    );
+                    assert_eq!(counts.stale_both, 1);
+                    assert_eq!(counts.stale_pm_expired, 1);
+                    assert_eq!(counts.stale_out_expired, 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inspect_stale_preserves_submillisecond_boundary() {
+        let now = Instant::now();
+        let threshold = std::time::Duration::from_secs(5);
+        let mut books = BookStore::default();
+        snapshot(
+            &mut books,
+            POLYMARKET,
+            "pm-yes",
+            vec![("0.40", "50")],
+            now - threshold - std::time::Duration::from_nanos(1),
+        );
+        snapshot(
+            &mut books,
+            OUTCOME,
+            "#10",
+            vec![("0.40", "50")],
+            now - threshold,
+        );
+        let (counts, pairs) = inspect_calc(
+            &sample_topic(),
+            &books,
+            &fees_zero(),
+            &limits("0", "100"),
+            now,
+            threshold,
+        );
+        assert_eq!(counts.stale_pm_only, 1);
+        assert_eq!(counts.stale_pm_expired, 1);
+        assert_eq!(counts.stale_out_expired, 0);
+        let detail = pairs.iter().find_map(|p| p.stale).unwrap();
+        assert_eq!(detail.kind, StaleKind::PmOnly);
+        assert_eq!(detail.pm.age_ms, detail.threshold_ms);
+        assert_eq!(detail.out.age_ms, detail.threshold_ms);
+    }
+
+    #[test]
+    fn executable_direction_still_records_other_direction_stale_stats() {
+        let now = Instant::now();
+        let mut books = BookStore::default();
+        snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+        snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+        snapshot(
+            &mut books,
+            POLYMARKET,
+            "pm-no",
+            vec![("0.40", "50")],
+            now - std::time::Duration::from_secs(6),
+        );
+        snapshot(&mut books, OUTCOME, "#11", vec![("0.40", "50")], now);
+        let topic = sample_topic();
+        let fees = fees_zero();
+        let limits = limits("0", "100");
+        let threshold = std::time::Duration::from_secs(5);
+        let plan = best_plan(&topic, &books, &fees, &limits, now, threshold);
+        let executable = plan.as_ref().expect("fresh direction remains executable");
+        assert_eq!(executable.pm.label, "yes");
+        assert_eq!(executable.outcome.label, "no");
+        let (counts, pairs) = inspect_calc(&topic, &books, &fees, &limits, now, threshold);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].pm_label, "no");
+        assert_eq!(pairs[0].out_label, "yes");
+        assert_eq!(pairs[0].reason, "stale_book");
+        assert_eq!(pairs[0].stale.unwrap().kind, StaleKind::PmOnly);
+
+        let stats = crate::stats::MinuteStats::new();
+        stats.found();
+        stats.record_calc_skips(&counts);
+        stats.record_calc_samples(topic.key, pairs, plan.is_none());
+        assert_eq!(
+            stats.snapshot_and_reset(),
+            crate::stats::MinuteSnapshot {
+                found: 1,
+                stale_book: 1,
+                stale_pm_only: 1,
+                stale_pm_expired: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(stats.snapshot_and_reset(), Default::default());
     }
 
     #[test]
@@ -2096,6 +2522,8 @@ mod tests {
         let mut http = BookStore::default();
         snapshot(&mut http, POLYMARKET, "pm-yes", vec![("0.40", "2")], now);
         snapshot(&mut http, OUTCOME, "#10", vec![("0.40", "2")], now);
+        http.mark_platform_stale(POLYMARKET);
+        http.mark_platform_stale(OUTCOME);
         let sample = diagnose_books(
             &sample_topic(),
             http.get(POLYMARKET, "pm-yes").unwrap(),
@@ -2108,5 +2536,6 @@ mod tests {
         assert_eq!(sample.reason, "venue_min");
         assert_eq!(sample.pm_ask, Some(d("0.40")));
         assert_eq!(sample.pm_sz, Some(d("2")));
+        assert_eq!(sample.stale, None);
     }
 }

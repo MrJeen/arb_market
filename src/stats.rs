@@ -1,19 +1,56 @@
-use crate::calc::CalcMissSnapshot;
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::calc::{CalcMissSnapshot, CalcPairSample, CalcSkipCounts, CalcStaleDetail};
+use crate::domain::TopicKey;
+use crate::platforms::polymarket::RestBookSkipCounts;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
+
+#[derive(Default)]
+struct CalcSamples {
+    last_miss: Option<CalcMissSnapshot>,
+    stale: [Option<StaleSample>; 3],
+}
+
+struct StaleSample {
+    topic: TopicKey,
+    pm_label: String,
+    out_label: String,
+    detail: CalcStaleDetail,
+}
+
+impl StaleSample {
+    fn log(&self) {
+        let d = self.detail;
+        tracing::info!(
+            topic = %self.topic.as_str(),
+            pm_label = %self.pm_label,
+            out_label = %self.out_label,
+            stale_side = d.kind.as_str(),
+            pm_source = d.pm.source.as_str(),
+            pm_age_ms = d.pm.age_ms,
+            pm_invalid = d.pm.invalid,
+            out_source = d.out.source.as_str(),
+            out_age_ms = d.out.age_ms,
+            out_invalid = d.out.invalid,
+            threshold_ms = d.threshold_ms,
+            "stale book sample"
+        );
+    }
+}
 
 macro_rules! minute_stats {
     ($($name:ident),+ $(,)?) => {
         pub struct MinuteStats {
             $($name: AtomicU64,)+
-            last_miss: Mutex<Option<CalcMissSnapshot>>,
+            samples: Mutex<CalcSamples>,
+            stale_sample_mask: AtomicU8,
         }
 
         impl Default for MinuteStats {
             fn default() -> Self {
                 Self {
                     $($name: AtomicU64::new(0),)+
-                    last_miss: Mutex::new(None),
+                    samples: Mutex::new(CalcSamples::default()),
+                    stale_sample_mask: AtomicU8::new(0),
                 }
             }
         }
@@ -46,15 +83,14 @@ macro_rules! minute_stats {
                     $( $name = s.$name, )+
                     "minute stats"
                 );
-                let miss = self
-                    .last_miss
-                    .lock()
-                    .unwrap_or_else(|err| err.into_inner())
-                    .take();
+                let samples = self.take_samples();
                 if s.found == 0 {
-                    if let Some(miss) = miss {
+                    if let Some(miss) = samples.last_miss {
                         miss.log();
                     }
+                }
+                for sample in samples.stale.into_iter().flatten() {
+                    sample.log();
                 }
             }
         }
@@ -68,6 +104,13 @@ minute_stats! {
     found,
     missing_book,
     stale_book,
+    stale_pm_only,
+    stale_out_only,
+    stale_both,
+    stale_pm_invalid,
+    stale_pm_expired,
+    stale_out_invalid,
+    stale_out_expired,
     unit_cost,
     unprofitable,
     no_topic,
@@ -121,6 +164,14 @@ minute_stats! {
     pm_book_resync_returned,
     pm_book_resync_applied,
     pm_book_resync_skipped,
+    pm_book_resync_skip_missing_token,
+    pm_book_resync_skip_no_ticket,
+    pm_book_resync_skip_parse_error,
+    pm_book_resync_skip_invalid_payload,
+    pm_book_resync_skip_older_timestamp,
+    pm_book_resync_skip_timestamp_conflict,
+    pm_book_resync_skip_epoch_changed,
+    pm_book_resync_skip_revision_changed,
     pm_book_resync_failed,
     pm_book_resync_elapsed_ms,
     pm_book_resync_max_ms,
@@ -143,7 +194,7 @@ impl MinuteStats {
     pub fn record_pm_book_resync(
         &self,
         requested: usize,
-        result: Option<(usize, usize, usize)>,
+        result: Option<(usize, usize, RestBookSkipCounts)>,
         elapsed_ms: u64,
     ) {
         self.pm_book_resync_batches();
@@ -155,7 +206,39 @@ impl MinuteStats {
             self.pm_book_resync_applied
                 .fetch_add(applied as u64, Ordering::Relaxed);
             self.pm_book_resync_skipped
-                .fetch_add(skipped as u64, Ordering::Relaxed);
+                .fetch_add(skipped.total(), Ordering::Relaxed);
+            for (counter, count) in [
+                (
+                    &self.pm_book_resync_skip_missing_token,
+                    skipped.missing_token,
+                ),
+                (&self.pm_book_resync_skip_no_ticket, skipped.no_ticket),
+                (&self.pm_book_resync_skip_parse_error, skipped.parse_error),
+                (
+                    &self.pm_book_resync_skip_invalid_payload,
+                    skipped.invalid_payload,
+                ),
+                (
+                    &self.pm_book_resync_skip_older_timestamp,
+                    skipped.older_timestamp,
+                ),
+                (
+                    &self.pm_book_resync_skip_timestamp_conflict,
+                    skipped.timestamp_conflict,
+                ),
+                (
+                    &self.pm_book_resync_skip_epoch_changed,
+                    skipped.epoch_changed,
+                ),
+                (
+                    &self.pm_book_resync_skip_revision_changed,
+                    skipped.revision_changed,
+                ),
+            ] {
+                if count > 0 {
+                    counter.fetch_add(count, Ordering::Relaxed);
+                }
+            }
         } else {
             self.pm_book_resync_failed();
         }
@@ -221,14 +304,85 @@ impl MinuteStats {
         }
     }
 
+    pub fn record_calc_skips(&self, counts: &CalcSkipCounts) {
+        self.add_missing_book(counts.missing_book);
+        self.add_stale_book(counts.stale_book);
+        self.add_unit_cost(counts.unit_cost);
+        self.add_unprofitable(counts.unprofitable);
+        for (counter, count) in [
+            (&self.stale_pm_only, counts.stale_pm_only),
+            (&self.stale_out_only, counts.stale_out_only),
+            (&self.stale_both, counts.stale_both),
+            (&self.stale_pm_invalid, counts.stale_pm_invalid),
+            (&self.stale_pm_expired, counts.stale_pm_expired),
+            (&self.stale_out_invalid, counts.stale_out_invalid),
+            (&self.stale_out_expired, counts.stale_out_expired),
+        ] {
+            if count > 0 {
+                counter.fetch_add(count, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn record_calc_samples(&self, topic: TopicKey, pairs: Vec<CalcPairSample>, missed: bool) {
+        let mask = self.stale_sample_mask.load(Ordering::Relaxed);
+        let needs_stale = pairs.iter().any(|pair| {
+            pair.stale
+                .is_some_and(|d| mask & (1 << d.kind.index()) == 0)
+        });
+        let needs_miss = missed && !pairs.is_empty();
+        if !needs_stale && !needs_miss {
+            return;
+        }
+        let mut samples = self.samples.lock().unwrap_or_else(|err| err.into_inner());
+        // 位图只是快速提示；提交与清空同锁，窗口按提交时刻归属。
+        for pair in &pairs {
+            let Some(detail) = pair.stale else { continue };
+            let index = detail.kind.index();
+            if samples.stale[index].is_none() {
+                samples.stale[index] = Some(StaleSample {
+                    topic,
+                    pm_label: pair.pm_label.clone(),
+                    out_label: pair.out_label.clone(),
+                    detail,
+                });
+                self.stale_sample_mask
+                    .fetch_or(1 << index, Ordering::Relaxed);
+            }
+        }
+        if needs_miss {
+            samples.last_miss = Some(CalcMissSnapshot {
+                topic: topic.as_str(),
+                pairs,
+            });
+        }
+    }
+
     pub fn record_calc_miss(&self, snapshot: CalcMissSnapshot) {
-        *self.last_miss.lock().unwrap_or_else(|err| err.into_inner()) = Some(snapshot);
+        self.samples
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .last_miss = Some(snapshot);
+    }
+
+    fn take_samples(&self) -> CalcSamples {
+        let mut samples = self.samples.lock().unwrap_or_else(|err| err.into_inner());
+        let taken = std::mem::take(&mut *samples);
+        self.stale_sample_mask.store(0, Ordering::Relaxed);
+        taken
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn skipped(n: u64) -> RestBookSkipCounts {
+        RestBookSkipCounts {
+            revision_changed: n,
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn snapshot_returns_counts_and_resets() {
@@ -270,9 +424,9 @@ mod tests {
     #[test]
     fn book_refresh_stats_count_results_latency_and_reset() {
         let stats = MinuteStats::new();
-        stats.record_pm_book_resync(4, Some((3, 2, 1)), 250);
+        stats.record_pm_book_resync(4, Some((3, 2, skipped(1))), 250);
         stats.record_pm_book_resync(2, None, 500);
-        stats.record_pm_book_resync(1, Some((0, 0, 0)), 10);
+        stats.record_pm_book_resync(1, Some((0, 0, skipped(0))), 10);
         for platform in [crate::config::POLYMARKET, crate::config::OUTCOME] {
             stats.record_hedge_book(platform, Some(true), 100);
             stats.record_hedge_book(platform, Some(false), 200);
@@ -309,7 +463,7 @@ mod tests {
             (300, 300)
         );
         assert_eq!(stats.snapshot_and_reset(), MinuteSnapshot::default());
-        stats.record_pm_book_resync(1, Some((1, 1, 0)), 5);
+        stats.record_pm_book_resync(1, Some((1, 1, skipped(0))), 5);
         stats.record_hedge_book(crate::config::POLYMARKET, Some(true), 2);
         let next = stats.snapshot_and_reset();
         assert_eq!(next.pm_book_resync_max_ms, 5);
@@ -325,7 +479,7 @@ mod tests {
                 let stats = &stats;
                 scope.spawn(move || {
                     for _ in 0..100 {
-                        stats.record_pm_book_resync(2, Some((2, 1, 1)), elapsed_ms);
+                        stats.record_pm_book_resync(2, Some((2, 1, skipped(1))), elapsed_ms);
                         stats.record_hedge_book(crate::config::OUTCOME, Some(true), elapsed_ms);
                     }
                 });
@@ -347,6 +501,193 @@ mod tests {
         let stats = MinuteStats::new();
         stats.add_stale_book(0);
         assert_eq!(stats.snapshot_and_reset().stale_book, 0);
+    }
+
+    fn stale_pair(kind: crate::calc::StaleKind) -> CalcPairSample {
+        use crate::book::BookSource;
+        use crate::calc::CalcBookState;
+        CalcPairSample {
+            pm_label: "yes".into(),
+            out_label: "no".into(),
+            pm_ask: None,
+            pm_sz: None,
+            out_ask: None,
+            out_sz: None,
+            unit_cost: None,
+            unit_expected_revenue: None,
+            reason: "stale_book",
+            stale: Some(CalcStaleDetail {
+                kind,
+                threshold_ms: 5000,
+                pm: CalcBookState {
+                    source: BookSource::Ws,
+                    age_ms: 6000,
+                    invalid: false,
+                },
+                out: CalcBookState {
+                    source: BookSource::Rest,
+                    age_ms: 7000,
+                    invalid: true,
+                },
+            }),
+        }
+    }
+
+    fn topic() -> TopicKey {
+        TopicKey::new(uuid::Uuid::nil(), 1)
+    }
+
+    #[test]
+    fn stale_samples_are_bounded_by_kind_and_reset() {
+        use crate::calc::StaleKind::*;
+        let stats = MinuteStats::new();
+        for _ in 0..10 {
+            stats.record_calc_samples(topic(), vec![stale_pair(PmOnly)], false);
+        }
+        stats.record_calc_samples(topic(), vec![stale_pair(OutOnly), stale_pair(Both)], true);
+        let samples = stats.take_samples();
+        assert_eq!(samples.stale.iter().flatten().count(), 3);
+        assert_eq!(samples.last_miss.unwrap().pairs.len(), 2);
+        assert_eq!(stats.stale_sample_mask.load(Ordering::Relaxed), 0);
+        assert!(stats.take_samples().stale.iter().all(Option::is_none));
+        stats.record_calc_samples(topic(), vec![stale_pair(Both)], false);
+        assert!(stats.take_samples().stale[Both.index()].is_some());
+    }
+
+    #[test]
+    fn stale_logs_are_emitted_with_found_and_not_replayed() {
+        #[derive(Clone)]
+        struct Buffer(std::sync::Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Buffer(Default::default());
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            use crate::calc::StaleKind::*;
+            let stats = MinuteStats::new();
+            stats.found();
+            stats.record_calc_samples(
+                topic(),
+                vec![stale_pair(PmOnly), stale_pair(OutOnly), stale_pair(Both)],
+                false,
+            );
+            stats.log_and_reset();
+            stats.log_and_reset();
+        });
+        let output = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(output.matches("stale book sample").count(), 3);
+        assert!(!output.contains("calc miss sample"));
+        assert!(output.contains("pm_source=\"ws\"") || output.contains("pm_source=ws"));
+        assert!(output.contains("threshold_ms=5000"));
+    }
+
+    #[test]
+    fn concurrent_sampling_and_drain_preserve_kind_slots() {
+        use crate::calc::StaleKind::*;
+        let stats = MinuteStats::new();
+        let barrier = std::sync::Barrier::new(5);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let stats = &stats;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..100 {
+                        stats.record_calc_samples(
+                            topic(),
+                            vec![stale_pair(PmOnly), stale_pair(OutOnly), stale_pair(Both)],
+                            false,
+                        );
+                        stats.record_calc_skips(&CalcSkipCounts {
+                            stale_book: 3,
+                            stale_pm_only: 1,
+                            stale_out_only: 1,
+                            stale_both: 1,
+                            stale_pm_expired: 2,
+                            stale_out_invalid: 2,
+                            ..Default::default()
+                        });
+                    }
+                });
+            }
+            barrier.wait();
+            for _ in 0..100 {
+                let samples = stats.take_samples();
+                for (index, sample) in samples.stale.iter().enumerate() {
+                    if let Some(sample) = sample {
+                        assert_eq!(sample.detail.kind.index(), index);
+                    }
+                }
+            }
+        });
+        let s = stats.snapshot_and_reset();
+        assert_eq!(s.stale_book, 1200);
+        assert_eq!(
+            s.stale_book,
+            s.stale_pm_only + s.stale_out_only + s.stale_both
+        );
+        assert_eq!(
+            s.stale_pm_invalid + s.stale_pm_expired,
+            s.stale_pm_only + s.stale_both
+        );
+        assert_eq!(
+            s.stale_out_invalid + s.stale_out_expired,
+            s.stale_out_only + s.stale_both
+        );
+        assert_eq!(stats.snapshot_and_reset(), MinuteSnapshot::default());
+    }
+
+    #[test]
+    fn resync_skip_breakdown_preserves_total_and_reset() {
+        let stats = MinuteStats::new();
+        stats.record_pm_book_resync(
+            10,
+            Some((
+                10,
+                2,
+                RestBookSkipCounts {
+                    missing_token: 1,
+                    no_ticket: 1,
+                    parse_error: 1,
+                    invalid_payload: 1,
+                    older_timestamp: 1,
+                    timestamp_conflict: 1,
+                    epoch_changed: 1,
+                    revision_changed: 1,
+                },
+            )),
+            20,
+        );
+        let s = stats.snapshot_and_reset();
+        let counts = [
+            s.pm_book_resync_skip_missing_token,
+            s.pm_book_resync_skip_no_ticket,
+            s.pm_book_resync_skip_parse_error,
+            s.pm_book_resync_skip_invalid_payload,
+            s.pm_book_resync_skip_older_timestamp,
+            s.pm_book_resync_skip_timestamp_conflict,
+            s.pm_book_resync_skip_epoch_changed,
+            s.pm_book_resync_skip_revision_changed,
+        ];
+        assert_eq!(counts, [1; 8]);
+        assert_eq!(s.pm_book_resync_skipped, counts.iter().sum::<u64>());
+        assert_eq!(
+            s.pm_book_resync_returned,
+            s.pm_book_resync_applied + s.pm_book_resync_skipped
+        );
+        assert_eq!(stats.snapshot_and_reset(), MinuteSnapshot::default());
     }
 
     #[test]
