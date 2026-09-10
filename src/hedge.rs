@@ -83,6 +83,69 @@ struct Depth {
 
 struct Candidate {
     action: HedgeAction,
+    required_usdc: Option<Decimal>,
+}
+
+struct CandidateGroup {
+    excess: String,
+    deficit: String,
+    qty_needed: Decimal,
+    candidates: Vec<Candidate>,
+}
+
+pub(crate) struct HedgeCandidates {
+    groups: Vec<CandidateGroup>,
+}
+
+impl HedgeCandidates {
+    /// 只查询已通过盘口、最小下单量和资金计算校验的买候选平台，稳定去重。
+    pub(crate) fn buy_platforms(&self) -> Vec<String> {
+        let mut platforms = Vec::new();
+        for candidate in self.groups.iter().flat_map(|group| &group.candidates) {
+            if candidate.required_usdc.is_some() && !platforms.contains(&candidate.action.platform)
+            {
+                platforms.push(candidate.action.platform.clone());
+            }
+        }
+        platforms
+    }
+
+    pub(crate) fn select(self, balances: &HashMap<String, Decimal>) -> Vec<HedgeAction> {
+        self.groups
+            .into_iter()
+            .filter_map(|group| {
+                // 各组独立判定，不聚合或扣减余额；缺余额按 0 处理，卖候选始终保留。
+                let best = group
+                    .candidates
+                    .into_iter()
+                    .filter(|candidate| {
+                        candidate.required_usdc.is_none_or(|required| {
+                            balances
+                                .get(&candidate.action.platform)
+                                .copied()
+                                .unwrap_or(Decimal::ZERO)
+                                >= required
+                        })
+                    })
+                    // 组内保持 sell → buy，max_by 同分取后者，即买入。
+                    .max_by(|a, b| a.action.marginal_value.cmp(&b.action.marginal_value))?;
+                tracing::info!(
+                    excess = %group.excess,
+                    deficit = %group.deficit,
+                    qty_needed = %group.qty_needed,
+                    chosen = %format!("{} {} {}", best.action.platform, match best.action.side {
+                        HedgeSide::Buy => "BUY",
+                        HedgeSide::Sell => "SELL",
+                    }, best.action.label),
+                    shares = %best.action.shares,
+                    cap = %best.action.cap_price,
+                    marginal_value = %best.action.marginal_value,
+                    "hedge chose higher marginal value"
+                );
+                Some(best.action)
+            })
+            .collect()
+    }
 }
 
 struct Imbalance<'a> {
@@ -189,22 +252,34 @@ pub fn plan_hedge(
     now: Instant,
     stale: Duration,
 ) -> Vec<HedgeAction> {
+    hedge_candidates(topic, positions, books, fees, min_qty, now, stale).select(balances)
+}
+
+pub(crate) fn hedge_candidates(
+    topic: &Topic,
+    positions: &Positions,
+    books: &BookStore,
+    fees: &FeeContext,
+    min_qty: Decimal,
+    now: Instant,
+    stale: Duration,
+) -> HedgeCandidates {
+    let mut groups = Vec::new();
     let labels = topic.labels();
     let Some((diff1, diff2)) = position_diffs(positions, &labels) else {
-        return Vec::new();
+        return HedgeCandidates { groups };
     };
-    let mut actions = Vec::new();
-    if let Some(action) = hedge_one(
-        topic, &labels[0], &labels[1], diff1, books, balances, fees, min_qty, now, stale,
-    ) {
-        actions.push(action);
+    for (pm_label, out_label, diff) in [
+        (labels[0].as_str(), labels[1].as_str(), diff1),
+        (labels[1].as_str(), labels[0].as_str(), diff2),
+    ] {
+        if let Some(group) = hedge_one(
+            topic, pm_label, out_label, diff, books, fees, min_qty, now, stale,
+        ) {
+            groups.push(group);
+        }
     }
-    if let Some(action) = hedge_one(
-        topic, &labels[1], &labels[0], diff2, books, balances, fees, min_qty, now, stale,
-    ) {
-        actions.push(action);
-    }
-    actions
+    HedgeCandidates { groups }
 }
 
 fn hedge_one(
@@ -213,12 +288,11 @@ fn hedge_one(
     out_label: &str,
     diff: Decimal,
     books: &BookStore,
-    balances: &HashMap<String, Decimal>,
     fees: &FeeContext,
     min_qty: Decimal,
     now: Instant,
     stale: Duration,
-) -> Option<HedgeAction> {
+) -> Option<CandidateGroup> {
     let imb = imbalance_for(topic, pm_label, out_label, diff, min_qty)?;
     let mut candidates = Vec::new();
     if let Some(sell) = eval_sell(
@@ -239,30 +313,18 @@ fn hedge_one(
         &imb.deficit_token.label,
         imb.qty_needed,
         books,
-        balances,
         fees,
         now,
         stale,
     ) {
         candidates.push(buy);
     }
-    let best = candidates
-        .into_iter()
-        .max_by(|a, b| a.action.marginal_value.cmp(&b.action.marginal_value))?;
-    tracing::info!(
-        excess = %format!("{}.{}", imb.excess_platform, imb.excess_token.label),
-        deficit = %format!("{}.{}", imb.deficit_platform, imb.deficit_token.label),
-        qty_needed = %imb.qty_needed,
-        chosen = %format!("{} {} {}", best.action.platform, match best.action.side {
-            HedgeSide::Buy => "BUY",
-            HedgeSide::Sell => "SELL",
-        }, best.action.label),
-        shares = %best.action.shares,
-        cap = %best.action.cap_price,
-        marginal_value = %best.action.marginal_value,
-        "hedge chose higher marginal value"
-    );
-    Some(best.action)
+    Some(CandidateGroup {
+        excess: format!("{}.{}", imb.excess_platform, imb.excess_token.label),
+        deficit: format!("{}.{}", imb.deficit_platform, imb.deficit_token.label),
+        qty_needed: imb.qty_needed,
+        candidates,
+    })
 }
 
 /// 差额超过股数门槛，但按现价两边都低于交易所最小名义/股数，无法再下对冲单。
@@ -365,6 +427,7 @@ fn eval_sell(
             fee,
             marginal_value: revenue,
         },
+        required_usdc: None,
     })
 }
 
@@ -374,7 +437,6 @@ fn eval_buy(
     label: &str,
     qty_needed: Decimal,
     books: &BookStore,
-    balances: &HashMap<String, Decimal>,
     fees: &FeeContext,
     now: Instant,
     stale: Duration,
@@ -398,10 +460,6 @@ fn eval_buy(
         polymarket_tick(books, platform, token_id),
     )?;
     let required = hedge_buy_required(platform, qty, cap, fee, fees).ok()?;
-    let balance = balances.get(platform).copied().unwrap_or(Decimal::ZERO);
-    if balance < required {
-        return None;
-    }
     Some(Candidate {
         action: HedgeAction {
             platform: platform.into(),
@@ -414,6 +472,7 @@ fn eval_buy(
             // 无论补 PM 还是 Outcome，新增配对部分都承担 Outcome 结算准备。
             marginal_value: qty * (Decimal::ONE - fees.outcome_taker_rate) - cost,
         },
+        required_usdc: Some(required),
     })
 }
 
@@ -593,6 +652,272 @@ mod tests {
         )
     }
 
+    fn candidates(books: &BookStore, now: Instant, pm_yes: &str, out_no: &str) -> HedgeCandidates {
+        hedge_candidates(
+            &topic(),
+            &imbalanced_positions(pm_yes, out_no),
+            books,
+            &fees(),
+            d("1.5"),
+            now,
+            Duration::from_secs(5),
+        )
+    }
+
+    #[test]
+    fn buy_platforms_exclude_absent_and_unusable_candidates() {
+        let now = Instant::now();
+        for (name, platform, token, pm_qty, out_qty, price, size, age, tick, expected) in [
+            (
+                "balanced", OUTCOME, "#10", "10", "10", "0.4", "10", 0, "0.01", false,
+            ),
+            (
+                "threshold",
+                OUTCOME,
+                "#10",
+                "11.5",
+                "10",
+                "0.4",
+                "10",
+                0,
+                "0.01",
+                false,
+            ),
+            (
+                "empty depth",
+                OUTCOME,
+                "#10",
+                "10",
+                "0",
+                "0.4",
+                "0",
+                0,
+                "0.01",
+                false,
+            ),
+            (
+                "invalid price",
+                OUTCOME,
+                "#10",
+                "10",
+                "0",
+                "0",
+                "10",
+                0,
+                "0.01",
+                false,
+            ),
+            (
+                "minimum notional",
+                OUTCOME,
+                "#10",
+                "10",
+                "0",
+                "0.05",
+                "10",
+                0,
+                "0.01",
+                false,
+            ),
+            (
+                "minimum shares",
+                POLYMARKET,
+                "pm-yes",
+                "0",
+                "3",
+                "0.5",
+                "10",
+                0,
+                "0.01",
+                false,
+            ),
+            (
+                "missing tick",
+                POLYMARKET,
+                "pm-yes",
+                "0",
+                "10",
+                "0.4",
+                "10",
+                0,
+                "0",
+                false,
+            ),
+            (
+                "stale", OUTCOME, "#10", "10", "0", "0.4", "10", 6, "0.01", false,
+            ),
+            (
+                "valid outcome",
+                OUTCOME,
+                "#10",
+                "10",
+                "0",
+                "0.4",
+                "10",
+                0,
+                "0.01",
+                true,
+            ),
+            (
+                "valid pm", POLYMARKET, "pm-yes", "0", "10", "0.4", "10", 0, "0.01", true,
+            ),
+        ] {
+            let mut books = BookStore::default();
+            books.replace_snapshot(
+                platform,
+                token,
+                vec![],
+                vec![Level {
+                    price: d(price),
+                    size: d(size),
+                }],
+                1,
+                now - Duration::from_secs(age),
+            );
+            if tick != "0" {
+                books.set_tick_size(POLYMARKET, "pm-yes", d(tick));
+            }
+            let candidates = candidates(&books, now, pm_qty, out_qty);
+            let expected_platforms = if expected {
+                vec![platform.to_string()]
+            } else {
+                vec![]
+            };
+            assert_eq!(candidates.buy_platforms(), expected_platforms, "{name}");
+            assert!(candidates.select(&HashMap::new()).is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn buy_platforms_are_stable_and_groups_do_not_share_funding() {
+        let now = Instant::now();
+        let mut books = BookStore::default();
+        for (platform, token) in [
+            (POLYMARKET, "pm-no"),
+            (POLYMARKET, "pm-yes"),
+            (OUTCOME, "#11"),
+            (OUTCOME, "#10"),
+        ] {
+            books.replace_snapshot(
+                platform,
+                token,
+                vec![],
+                vec![Level {
+                    price: d("0.4"),
+                    size: d("10"),
+                }],
+                1,
+                now,
+            );
+            if platform == POLYMARKET {
+                books.set_tick_size(platform, token, d("0.01"));
+            }
+        }
+        // labels 为 no → yes；分别覆盖同平台去重和两个方向的平台顺序。
+        for (pm_no, pm_yes, out_yes, out_no, expected) in [
+            ("10", "10", "0", "0", vec![OUTCOME]),
+            ("0", "0", "10", "10", vec![POLYMARKET]),
+            ("10", "0", "0", "10", vec![OUTCOME, POLYMARKET]),
+            ("0", "10", "10", "0", vec![POLYMARKET, OUTCOME]),
+        ] {
+            let mut positions = imbalanced_positions(pm_yes, out_no);
+            positions
+                .get_mut(POLYMARKET)
+                .unwrap()
+                .insert("no".into(), d(pm_no));
+            positions
+                .get_mut(OUTCOME)
+                .unwrap()
+                .insert("yes".into(), d(out_yes));
+            let candidates = hedge_candidates(
+                &topic(),
+                &positions,
+                &books,
+                &fees(),
+                d("1.5"),
+                now,
+                Duration::from_secs(5),
+            );
+            assert_eq!(candidates.buy_platforms(), expected);
+            let expected_tokens: Vec<_> = candidates
+                .groups
+                .iter()
+                .map(|group| {
+                    assert_eq!(group.candidates.len(), 1);
+                    assert_eq!(group.candidates[0].required_usdc, Some(d("4")));
+                    group.candidates[0].action.token_id.clone()
+                })
+                .collect();
+            // 同平台两笔各需 4U，余额 4U 仍各自通过，不能聚合成 8U 或扣减。
+            let balances = HashMap::from([(POLYMARKET.into(), d("4")), (OUTCOME.into(), d("4"))]);
+            let actions = candidates.select(&balances);
+            assert_eq!(actions.len(), 2);
+            assert!(actions.iter().all(|action| action.side == HedgeSide::Buy));
+            assert_eq!(
+                actions
+                    .iter()
+                    .map(|action| action.token_id.clone())
+                    .collect::<Vec<_>>(),
+                expected_tokens
+            );
+            assert_eq!(
+                actions[0].token_id,
+                if pm_no == "10" { "#11" } else { "pm-no" }
+            );
+            assert_eq!(
+                actions[1].token_id,
+                if pm_yes == "10" { "#10" } else { "pm-yes" }
+            );
+        }
+    }
+
+    #[test]
+    fn equal_marginal_value_prefers_buy_after_funding_filter() {
+        let now = Instant::now();
+        let mut books = BookStore::default();
+        books.replace_snapshot(
+            POLYMARKET,
+            "pm-yes",
+            vec![Level {
+                price: d("0.6"),
+                size: d("10"),
+            }],
+            vec![],
+            1,
+            now,
+        );
+        books.set_tick_size(POLYMARKET, "pm-yes", d("0.01"));
+        books.replace_snapshot(
+            OUTCOME,
+            "#10",
+            vec![],
+            vec![Level {
+                price: d("0.4"),
+                size: d("10"),
+            }],
+            1,
+            now,
+        );
+        for (balances, expected_side) in [
+            (HashMap::new(), HedgeSide::Sell),
+            (HashMap::from([(OUTCOME.into(), d("4"))]), HedgeSide::Buy),
+        ] {
+            let candidates = candidates(&books, now, "10", "0");
+            let group = &candidates.groups[0];
+            assert_eq!(group.candidates.len(), 2);
+            assert_eq!(group.candidates[0].action.side, HedgeSide::Sell);
+            assert_eq!(group.candidates[0].required_usdc, None);
+            assert_eq!(group.candidates[1].action.side, HedgeSide::Buy);
+            assert_eq!(
+                group.candidates[0].action.marginal_value,
+                group.candidates[1].action.marginal_value
+            );
+            let actions = candidates.select(&balances);
+            assert_eq!(actions.len(), 1);
+            assert_eq!(actions[0].side, expected_side);
+        }
+    }
+
     #[test]
     fn buy_funding_uses_final_cap_and_fee_before_candidate_selection() {
         let now = Instant::now();
@@ -648,16 +973,20 @@ mod tests {
                     }
             );
             for balance in [d("5"), d("9"), required - d("0.00000001"), required] {
-                let actions = plan_hedge(
+                let candidates = hedge_candidates(
                     &topic(),
                     &positions,
                     &books,
-                    &HashMap::from([(buy_platform.into(), balance)]),
                     &fees,
                     d("1.5"),
                     now,
                     Duration::from_secs(5),
                 );
+                assert_eq!(candidates.buy_platforms(), vec![buy_platform]);
+                let group = &candidates.groups[0];
+                assert_eq!(group.candidates[0].required_usdc, None);
+                assert_eq!(group.candidates[1].required_usdc, Some(required));
+                let actions = candidates.select(&HashMap::from([(buy_platform.into(), balance)]));
                 assert_eq!(actions.len(), 1);
                 if balance < required {
                     assert_eq!(actions[0].side, HedgeSide::Sell);
@@ -699,6 +1028,7 @@ mod tests {
             1,
             now,
         );
+        assert!(candidates(&books, now, "0", "7").buy_platforms().is_empty());
         let balances = HashMap::from([(POLYMARKET.into(), d("100"))]);
         let actions = plan(&books, &balances, now, "0", "7");
         assert_eq!(actions.len(), 1);
@@ -1215,7 +1545,11 @@ mod tests {
             now,
         );
         books.set_tick_size(POLYMARKET, "pm-yes", d("0.01"));
-        let actions = plan(&books, &HashMap::new(), now, "9", "6");
+        let candidates = candidates(&books, now, "9", "6");
+        assert!(candidates.buy_platforms().is_empty());
+        assert_eq!(candidates.groups[0].candidates.len(), 1);
+        assert_eq!(candidates.groups[0].candidates[0].required_usdc, None);
+        let actions = candidates.select(&HashMap::new());
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].platform, POLYMARKET);
         assert_eq!(actions[0].side, HedgeSide::Sell);

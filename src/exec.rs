@@ -8,8 +8,8 @@ use crate::discovery::{load_active_topics, load_topic};
 use crate::domain::{MarketIdentity, Topic, TopicKey};
 use crate::error::{Error, Result};
 use crate::hedge::{
-    hedge_buy_required, hedge_order_tokens, leftover_untradeable, needs_rebalance, plan_hedge,
-    HedgeSide,
+    hedge_buy_required, hedge_candidates, hedge_order_tokens, leftover_untradeable,
+    needs_rebalance, plan_hedge, HedgeSide,
 };
 use crate::notify::{
     self, NatsNotifier, PlaceNotice, PlaceResult, SettlementNotice, TakeProfitCompletedNotice,
@@ -1433,25 +1433,7 @@ impl Engine {
             }
             Some(true) => {}
         }
-        // Full-access planning reads balances regardless of the trading switch so dry-run
-        // calculations match live trading. Reduce-only deliberately leaves balances empty.
         let order_funder = self.store.order_pm_funder(order.id).await?;
-        let mut balances = HashMap::new();
-        if settlement_access == SettlementAccess::All {
-            if let Some(funder) = order_funder.as_deref() {
-                match self.pm.balance(funder).await {
-                    Ok(bal) => {
-                        balances.insert(POLYMARKET.to_string(), bal);
-                    }
-                    Err(err) => {
-                        tracing::warn!(order_id = order.id, funder, error = %err, "hedge polymarket balance unavailable")
-                    }
-                }
-            }
-            if let Ok(bal) = self.outcome.user_state().await {
-                balances.insert(OUTCOME.to_string(), bal);
-            }
-        }
         let order_tokens = hedge_order_tokens(&topic, &positions, self.cfg.min_rebalance_qty);
         self.refresh_hedge_books(order.id, &order_tokens).await;
         for (platform, token_id) in &order_tokens {
@@ -1459,18 +1441,17 @@ impl Engine {
                 let _ = self.ensure_pm_tick(token_id).await;
             }
         }
-        let actions = {
-            let books = self.books.lock().await;
-            plan_hedge(
+        let Some(actions) = self
+            .funded_hedge_plan(
+                order.id,
                 &topic,
                 &positions,
-                &books,
-                &balances,
-                &fees,
-                self.cfg.min_rebalance_qty,
-                Instant::now(),
-                self.cfg.book_stale,
+                order_funder.as_deref(),
+                settlement_access,
             )
+            .await
+        else {
+            return Ok(());
         };
         if actions.is_empty() {
             let untradeable = {
@@ -2278,6 +2259,89 @@ impl Engine {
         }
     }
 
+    async fn funded_hedge_plan(
+        &self,
+        order_id: i64,
+        topic: &Topic,
+        positions: &crate::hedge::Positions,
+        funder: Option<&str>,
+        access: SettlementAccess,
+    ) -> Option<Vec<crate::hedge::HedgeAction>> {
+        let selected = self.available_fees(topic)?;
+        let buy_platforms = {
+            let books = self.books.lock().await;
+            hedge_candidates(
+                topic,
+                positions,
+                &books,
+                &selected.context,
+                self.cfg.min_rebalance_qty,
+                Instant::now(),
+                self.cfg.book_stale,
+            )
+            .buy_platforms()
+        };
+        // 关闭提交仍按真实资金试算；仅减仓模式不查询买入资金。
+        let balances = self
+            .hedge_candidate_balances(order_id, funder, access, &buy_platforms)
+            .await;
+        // 余额等待可能跨过盘口或费用有效期，不能沿用预筛时的候选。
+        // 新出现但本轮未查询的平台按缺失余额过滤，留待下一轮重新评估。
+        let books = self.books.lock().await;
+        let selected = self.available_fees(topic)?;
+        Some(plan_hedge(
+            topic,
+            positions,
+            &books,
+            &balances,
+            &selected.context,
+            self.cfg.min_rebalance_qty,
+            Instant::now(),
+            self.cfg.book_stale,
+        ))
+    }
+
+    async fn hedge_candidate_balances(
+        &self,
+        order_id: i64,
+        funder: Option<&str>,
+        access: SettlementAccess,
+        platforms: &[String],
+    ) -> HashMap<String, Decimal> {
+        let mut balances = HashMap::new();
+        if access != SettlementAccess::All {
+            return balances;
+        }
+        if platforms.iter().any(|platform| platform == POLYMARKET) {
+            if let Some(funder) = funder {
+                match self.pm.balance(funder).await {
+                    Ok(bal) => {
+                        balances.insert(POLYMARKET.to_string(), bal);
+                    }
+                    Err(err) => {
+                        tracing::warn!(order_id, funder, error = %err, "hedge polymarket balance unavailable")
+                    }
+                }
+            }
+        }
+        if platforms.iter().any(|platform| platform == OUTCOME) {
+            if let Ok(bal) = self.outcome.user_state().await {
+                balances.insert(OUTCOME.to_string(), bal);
+            }
+        }
+        balances
+    }
+
+    async fn load_outcome_buy_balance(
+        &self,
+        balances: &mut HashMap<String, Decimal>,
+    ) -> Result<()> {
+        if !balances.contains_key(OUTCOME) {
+            balances.insert(OUTCOME.to_string(), self.outcome.user_state().await?);
+        }
+        Ok(())
+    }
+
     async fn complete_rebalance(&self, order_id: i64) -> Result<()> {
         // 先落最终实际值；失败时保留 pending/actived，下一轮仍可重试并避免漏通知。
         let (actual_cost, _actual_rev, actual_profit) =
@@ -2325,7 +2389,7 @@ impl Engine {
                 self.require_outcome_token(&action.token_id, action.shares)
                     .await?;
             } else {
-                balances.insert(OUTCOME.to_string(), self.outcome.user_state().await?);
+                self.load_outcome_buy_balance(&mut balances).await?;
             }
         }
         let tokens = hedge_order_tokens(topic, positions, self.cfg.min_rebalance_qty);
@@ -3469,6 +3533,405 @@ mod tests {
             }
         }
         topic
+    }
+
+    // 只接受余额接口，不接受下单；可在首个响应前暂停以验证等待后的重算。
+    async fn balance_test_server(
+        replies: Vec<(u16, Value)>,
+        pause: Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Vec<String>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut replies = replies.into_iter();
+            let mut pause = pause;
+            let mut requests = Vec::new();
+            loop {
+                let (mut socket, _) = tokio::select! {
+                    _ = &mut stop_rx => break,
+                    accepted = listener.accept() => accepted.unwrap(),
+                };
+                let mut bytes = Vec::new();
+                let (body_start, length) = loop {
+                    let mut buffer = [0u8; 4096];
+                    let n = tokio::time::timeout(Duration::from_secs(3), socket.read(&mut buffer))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    assert!(bytes.len() < 65_536);
+                    if let Some(index) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = std::str::from_utf8(&bytes[..index]).unwrap();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (key, value) = line.split_once(':')?;
+                                key.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        assert!(length < 65_536);
+                        break (index + 4, length);
+                    }
+                };
+                while bytes.len() < body_start + length {
+                    let mut buffer = [0u8; 4096];
+                    let n = tokio::time::timeout(Duration::from_secs(3), socket.read(&mut buffer))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                }
+                let request = std::str::from_utf8(&bytes[..body_start])
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_string();
+                if request.starts_with("POST /info ") {
+                    let body: Value =
+                        serde_json::from_slice(&bytes[body_start..body_start + length]).unwrap();
+                    assert_eq!(body["type"], "spotClearinghouseState");
+                } else {
+                    assert!(request.starts_with("GET /balance-allowance?"));
+                    assert!(request.contains("asset_type=COLLATERAL"));
+                }
+                requests.push(request);
+                if let Some((arrived, release)) = pause.take() {
+                    arrived.send(()).unwrap();
+                    tokio::time::timeout(Duration::from_secs(3), release)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                let (status, body) = replies.next().expect("unexpected extra balance request");
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            assert!(
+                replies.next().is_none(),
+                "expected balance request was not made"
+            );
+            requests
+        });
+        (base, stop_tx, server)
+    }
+
+    fn usdc_reply(balance: &str) -> (u16, Value) {
+        (
+            200,
+            json!({"balances": [{"coin": "USDC", "total": balance, "hold": "0"}]}),
+        )
+    }
+
+    async fn balance_test_engine(base: &str) -> (Engine, String) {
+        let mut engine = fee_test_engine().await;
+        engine.cfg = admission_test_config(base);
+        engine.outcome = OutcomeVenue::connect(&engine.cfg).unwrap();
+        let (pm, funder) =
+            crate::platforms::polymarket::tests::execution_test_venue(base.into()).await;
+        engine.pm = pm;
+        engine
+            .outcome
+            .install_test_fee_snapshot(1, Decimal::ZERO, Decimal::ZERO);
+        (engine, funder)
+    }
+
+    async fn hedge_balance_books(engine: &Engine, platform: &str, buy: bool) {
+        let tokens = if platform == POLYMARKET {
+            ["pm-no", "pm-yes"]
+        } else {
+            ["#11", "#10"]
+        };
+        let mut books = engine.books.lock().await;
+        for token in tokens {
+            books.set_tick_size(platform, token, d("0.01"));
+            books.replace_snapshot(
+                platform,
+                token,
+                vec![crate::book::Level {
+                    price: d("0.4"),
+                    size: d("30"),
+                }],
+                if buy {
+                    vec![crate::book::Level {
+                        price: d("0.4"),
+                        size: d("30"),
+                    }]
+                } else {
+                    vec![]
+                },
+                1,
+                Instant::now(),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hedge_balances_follow_candidates_and_permissions() {
+        for case in [
+            "empty",
+            "sell",
+            "stale",
+            "reduce",
+            "missing-funder",
+            "outcome",
+            "pm",
+            "both",
+            "insufficient",
+            "error",
+        ] {
+            let replies = match case {
+                "pm" => vec![(200, json!({"balance": "100000000"}))],
+                "both" => vec![(200, json!({"balance": "100000000"})), usdc_reply("100")],
+                "outcome" => vec![usdc_reply("100")],
+                "insufficient" => vec![usdc_reply("0")],
+                "error" => vec![(503, json!({"error": "test"}))],
+                _ => vec![],
+            };
+            let expected_requests = replies.len();
+            let (base, stop, server) = balance_test_server(replies, None).await;
+            let (engine, funder) = balance_test_engine(&base).await;
+            let topic = fee_test_topic();
+            let mut positions = crate::hedge::Positions::new();
+            let excess = if matches!(case, "pm" | "missing-funder") {
+                OUTCOME
+            } else {
+                POLYMARKET
+            };
+            for label in ["no", "yes"] {
+                positions
+                    .entry(excess.into())
+                    .or_default()
+                    .insert(label.into(), d("30"));
+            }
+            if case == "both" {
+                positions.clear();
+                positions.insert(POLYMARKET.into(), HashMap::from([("no".into(), d("30"))]));
+                positions.insert(OUTCOME.into(), HashMap::from([("no".into(), d("30"))]));
+            }
+            if case != "empty" {
+                hedge_balance_books(&engine, POLYMARKET, !matches!(case, "sell")).await;
+                hedge_balance_books(&engine, OUTCOME, !matches!(case, "sell")).await;
+            }
+            if case == "stale" {
+                engine.books.lock().await.mark_platform_stale(OUTCOME);
+            }
+            let access = if case == "reduce" {
+                SettlementAccess::ReduceOnly
+            } else {
+                SettlementAccess::All
+            };
+            let funder = if case == "missing-funder" {
+                None
+            } else {
+                Some(funder.as_str())
+            };
+            // 默认关闭提交，但规划仍按有效买入候选查询真实资金。
+            assert!(!engine.cfg.enable_rebalance);
+            let actions = engine
+                .funded_hedge_plan(1, &topic, &positions, funder, access)
+                .await
+                .unwrap();
+            if matches!(case, "outcome" | "pm" | "both") {
+                assert_eq!(actions.len(), 2, "{case}");
+                assert!(
+                    actions.iter().all(|action| action.side == HedgeSide::Buy),
+                    "{case}"
+                );
+            } else if case == "empty" {
+                assert!(actions.is_empty());
+            } else {
+                assert_eq!(actions.len(), 2, "{case}");
+                assert!(
+                    actions.iter().all(|action| action.side == HedgeSide::Sell),
+                    "{case}"
+                );
+            }
+            stop.send(()).unwrap();
+            let requests = server.await.unwrap();
+            assert_eq!(requests.len(), expected_requests, "{case}");
+            let pm_count = requests
+                .iter()
+                .filter(|request| request.starts_with("GET "))
+                .count();
+            assert_eq!(
+                pm_count,
+                usize::from(matches!(case, "pm" | "both")),
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hedge_rechecks_books_and_fees_after_balance_wait() {
+        for mutation in ["stale", "fee-expired", "fee-changed", "new-platform"] {
+            let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let (base, stop, server) =
+                balance_test_server(vec![usdc_reply("100")], Some((arrived_tx, release_rx))).await;
+            let (engine, funder) = balance_test_engine(&base).await;
+            hedge_balance_books(&engine, POLYMARKET, false).await;
+            hedge_balance_books(&engine, OUTCOME, true).await;
+            let topic = fee_test_topic();
+            let positions = crate::hedge::Positions::from([
+                (POLYMARKET.into(), HashMap::from([("yes".into(), d("30"))])),
+                (OUTCOME.into(), HashMap::from([("yes".into(), d("30"))])),
+            ]);
+            let planning = engine.funded_hedge_plan(
+                1,
+                &topic,
+                &positions,
+                Some(&funder),
+                SettlementAccess::All,
+            );
+            let mutate = async {
+                tokio::time::timeout(Duration::from_secs(3), arrived_rx)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                match mutation {
+                    "stale" => engine.books.lock().await.mark_platform_stale(OUTCOME),
+                    "fee-expired" => engine.outcome.expire_test_fee_snapshot(1),
+                    "fee-changed" => {
+                        engine
+                            .outcome
+                            .install_test_fee_snapshot(1, d("0.9"), Decimal::ZERO)
+                    }
+                    "new-platform" => hedge_balance_books(&engine, POLYMARKET, true).await,
+                    _ => unreachable!(),
+                }
+                release_tx.send(()).unwrap();
+            };
+            let (actions, ()) = tokio::join!(planning, mutate);
+            if mutation == "fee-expired" {
+                assert!(actions.is_none());
+            } else {
+                let actions = actions.unwrap();
+                if mutation == "new-platform" {
+                    assert!(actions
+                        .iter()
+                        .any(|a| a.platform == OUTCOME && a.side == HedgeSide::Buy));
+                    assert!(!actions
+                        .iter()
+                        .any(|a| a.platform == POLYMARKET && a.side == HedgeSide::Buy));
+                } else {
+                    assert!(actions.iter().all(|a| a.side == HedgeSide::Sell));
+                }
+            }
+            stop.send(()).unwrap();
+            assert_eq!(server.await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn outcome_execution_balance_is_local_to_each_stage() {
+        let (base, stop, server) =
+            balance_test_server(vec![usdc_reply("100"), usdc_reply("0")], None).await;
+        let (engine, _) = balance_test_engine(&base).await;
+        let planning = engine
+            .hedge_candidate_balances(
+                1,
+                None,
+                SettlementAccess::All,
+                &[OUTCOME.into(), OUTCOME.into()],
+            )
+            .await;
+        assert_eq!(planning[OUTCOME], d("100"));
+        let mut execution = HashMap::new();
+        engine
+            .load_outcome_buy_balance(&mut execution)
+            .await
+            .unwrap();
+        engine
+            .load_outcome_buy_balance(&mut execution)
+            .await
+            .unwrap();
+        assert_eq!(execution[OUTCOME], Decimal::ZERO);
+        stop.send(()).unwrap();
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn hedge_reconfirmation_requires_original_action_to_remain_selected() {
+        let engine = fee_test_engine().await;
+        engine
+            .outcome
+            .install_test_fee_snapshot(1, Decimal::ZERO, Decimal::ZERO);
+        hedge_balance_books(&engine, POLYMARKET, true).await;
+        hedge_balance_books(&engine, OUTCOME, true).await;
+        let topic = fee_test_topic();
+        let positions = crate::hedge::Positions::from([(
+            POLYMARKET.into(),
+            HashMap::from([("yes".into(), d("30"))]),
+        )]);
+        let fees = engine.available_fees(&topic).unwrap();
+        let funded = HashMap::from([(OUTCOME.into(), d("100"))]);
+        let mut books = engine.books.lock().await;
+        let plan = |books: &BookStore, balances: &HashMap<String, Decimal>| {
+            plan_hedge(
+                &topic,
+                &positions,
+                books,
+                balances,
+                &fees.context,
+                engine.cfg.min_rebalance_qty,
+                Instant::now(),
+                engine.cfg.book_stale,
+            )
+        };
+        let original = plan(&books, &funded).remove(0);
+        assert_eq!(original.side, HedgeSide::Buy);
+        // 第二阶段余额下降：原买入不可确认，不能直接换成卖单提交。
+        let no_cash = plan(&books, &HashMap::from([(OUTCOME.into(), Decimal::ZERO)]));
+        assert_eq!(no_cash[0].side, HedgeSide::Sell);
+        assert!(!no_cash
+            .iter()
+            .any(|action| same_hedge_quantity(&original, action)));
+        // 买候选仍有效且资金足够，但卖出已更优，也必须拒绝原买入。
+        books.replace_snapshot(
+            POLYMARKET,
+            "pm-yes",
+            vec![crate::book::Level {
+                price: d("0.8"),
+                size: d("30"),
+            }],
+            vec![],
+            2,
+            Instant::now(),
+        );
+        assert_eq!(
+            hedge_candidates(
+                &topic,
+                &positions,
+                &books,
+                &fees.context,
+                engine.cfg.min_rebalance_qty,
+                Instant::now(),
+                engine.cfg.book_stale,
+            )
+            .buy_platforms(),
+            vec![OUTCOME.to_string()]
+        );
+        let better_sell = plan(&books, &funded);
+        assert_eq!(better_sell[0].side, HedgeSide::Sell);
+        assert!(!better_sell
+            .iter()
+            .any(|action| same_hedge_quantity(&original, action)));
     }
 
     #[tokio::test]
