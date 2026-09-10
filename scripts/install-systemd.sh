@@ -26,11 +26,42 @@ if [[ ! -f "$UNIT_SRC" ]]; then
   exit 1
 fi
 
+if systemctl is-active --quiet market-arb.service; then
+  echo "请先停止 market-arb.service，再安装并校正状态文件权限。" >&2
+  exit 1
+fi
+
+# 原子保存需要在根目录创建临时文件；拒绝跟随状态路径中的符号链接。
+STATE_FILES=(
+  polymarket_api_creds.json
+  polymarket_api_creds.json.tmp
+  polymarket_funder_cursor
+  polymarket_funder_cursor.cursor.tmp
+)
+for name in "${STATE_FILES[@]}"; do
+  path="$INSTALL_DIR/$name"
+  if [[ -L "$path" || ( -e "$path" && ! -f "$path" ) ]]; then
+    echo "状态路径不是普通文件，拒绝修改权限: $path" >&2
+    exit 1
+  fi
+done
+
 if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
   useradd --system --home-dir "$INSTALL_DIR" --shell /usr/sbin/nologin "$SERVICE_USER"
 fi
 
 install -d -m 0755 "$INSTALL_DIR/dist"
+# 只调整根目录的组权限，不递归改变工作树；保留部署用户的目录属主。
+chgrp "$SERVICE_USER" "$INSTALL_DIR"
+chmod g+rwx "$INSTALL_DIR"
+for name in "${STATE_FILES[@]}"; do
+  path="$INSTALL_DIR/$name"
+  if [[ -f "$path" ]]; then
+    chown "$SERVICE_USER:$SERVICE_USER" "$path"
+    chmod 0600 "$path"
+  fi
+done
+
 if [[ "$(readlink -f "$BIN_SRC")" == "$(readlink -f "$BIN_DST")" ]]; then
   # 工作树就是安装目录时，二进制已在目标路径，只校正属主。
   chown "$SERVICE_USER:$SERVICE_USER" "$BIN_DST"

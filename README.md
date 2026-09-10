@@ -192,9 +192,13 @@ sudo ./scripts/start.sh
 
 工作目录、`.env`、账户 JSON、二进制都在 `/var/www/arb_market`（二进制在 `dist/`，已 gitignore）。`git pull` 不会覆盖它们。
 
+`polymarket_api_creds.json` 和 `polymarket_funder_cursor` 也保存在该工作目录，不需要配置状态目录。安装脚本保留根目录属主，仅将根目录的组设为服务组并授予组读写、执行权限，不递归修改工作树；已有状态文件及实际写入用的临时文件会校正为服务用户所有、权限 `0600`，不会清空内容。异常的符号链接或非普通文件会阻止安装，需要先人工核对。service 使用 `UMask=0077` 保护新建文件。
+
+注意：`.gitignore` 不负责文件系统权限。状态保存采用临时文件加重命名，需要根目录可写；这也意味着服务用户能够删除或重命名根目录中的其他目录项。此部署方式接受这一权限边界。
+
 ## 日常更新
 
-脚本或 unit 有改动时：【本机】编二进制并 scp，【服务器】`git pull` 后重启。
+普通代码或脚本更新：【本机】编二进制并 scp，【服务器】`git pull` 后重启。若 unit 或安装权限逻辑有改动，还需要按下方步骤重新安装 unit。
 
 【本机】
 
@@ -209,6 +213,14 @@ scp dist/market-arb arb:/var/www/arb_market/dist/market-arb.new
 cd /var/www/arb_market
 git pull
 sudo ./scripts/restart.sh
+```
+
+unit 或安装权限逻辑更新时（包括首次应用根目录写权限修复），在 `git pull` 后用以下步骤替代上面的直接重启。安装前先停服务，避免状态文件写入与权限校正并发；安装脚本会执行 `daemon-reload`：
+
+```bash
+sudo ./scripts/stop.sh
+sudo ./scripts/install-systemd.sh
+sudo ./scripts/start.sh
 ```
 
 只更新二进制、unit 没变时，不必在服务器 `git pull`。【本机】一条命令即可（会编译、scp、远程 restart）：
