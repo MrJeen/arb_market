@@ -3282,9 +3282,10 @@ async fn persist_submit(
     platform: &str,
     side: OrderSide,
     result: &SubmitResult,
-    _fees: &FeeContext,
+    fees: &FeeContext,
     response: &serde_json::Value,
 ) -> Result<()> {
+    let matched_fill = pm_matched_submit_fill(platform, side, result, fees, response);
     let (status, oid, evidence) = match result {
         SubmitResult::Ack {
             order_id,
@@ -3296,10 +3297,35 @@ async fn persist_submit(
         } => {
             let expected = ack_fill(platform, side, *making, *taking, *avg_px, envelope)
                 .map(|(shares, _)| shares);
+            let mut evidence = json!({"kind":"ack","expected_shares":expected});
+            if let Some((shares, price, fee)) = matched_fill {
+                evidence["fill"] = json!({
+                    "source":"submit_response", "shares":shares, "price":price,
+                    "fee":fee, "fee_source":"estimated", "fee_rate":fees.polymarket_fee_rate,
+                    "fee_formula":"shares * rate * price * (1 - price)",
+                });
+            } else if platform == POLYMARKET
+                && response.get("status").and_then(Value::as_str) == Some("matched")
+            {
+                tracing::warn!(
+                    service = "polymarket",
+                    operation = "submit_fill",
+                    endpoint = "/order",
+                    leg_id,
+                    order_id,
+                    response_status = "matched",
+                    reason = "invalid_matched_amounts",
+                    "matched submission retained for reconciliation"
+                );
+            }
             (
-                "actived",
+                if matched_fill.is_some() {
+                    "matched"
+                } else {
+                    "actived"
+                },
                 Some(order_id.as_str()),
-                json!({"kind":"ack","expected_shares":expected}),
+                evidence,
             )
         }
         SubmitResult::NoMatch { message, .. } => (
@@ -3323,8 +3349,33 @@ async fn persist_submit(
         ),
     };
     store
-        .record_submission(leg_id, status, oid, &evidence, response)
+        .record_submission_with_fill(leg_id, status, oid, &evidence, response, matched_fill)
         .await
+}
+
+fn pm_matched_submit_fill(
+    platform: &str,
+    side: OrderSide,
+    result: &SubmitResult,
+    fees: &FeeContext,
+    response: &Value,
+) -> Option<(Decimal, Decimal, Decimal)> {
+    if platform != POLYMARKET
+        || response.get("success").and_then(Value::as_bool) != Some(true)
+        || response.get("status").and_then(Value::as_str) != Some("matched")
+    {
+        return None;
+    }
+    let SubmitResult::Ack { making, taking, .. } = result else {
+        return None;
+    };
+    // BUY/SELL 的 making、taking 含义相反；只使用响应金额，不回退到请求量或限价。
+    let (shares, price) = pm_fak_fill(side, *making, *taking)?;
+    if price > Decimal::ONE || fees.polymarket_fee_rate < Decimal::ZERO {
+        return None;
+    }
+    let fee = crate::calc::estimate_polymarket_fee(shares, price, fees);
+    Some((shares, price, fee))
 }
 
 pub fn ack_fill(
@@ -5319,6 +5370,160 @@ mod tests {
         assert_eq!(parent_terminal_status(false, false), Some("cancelled"));
         // 单腿 matched + 另一腿 cancelled：无 open 腿且有正成交 → completed
         assert_eq!(parent_terminal_status(false, true), Some("completed"));
+    }
+
+    #[test]
+    fn pm_matched_response_uses_returned_amounts_and_estimated_fee() {
+        let mut fees = FeeContext {
+            polymarket_fee_rate: d("0.07"),
+            outcome_taker_rate: Decimal::ZERO,
+            outcome_builder_rate: Decimal::ZERO,
+        };
+        for side in [OrderSide::Buy, OrderSide::Sell] {
+            let (making, taking) = match side {
+                OrderSide::Buy => ("1.2", "3"),
+                OrderSide::Sell => ("3", "1.2"),
+            };
+            let response = json!({
+                "success":true, "status":"matched", "orderID":"oid",
+                "makingAmount":making, "takingAmount":taking, "fee":"999",
+            });
+            let result = crate::platforms::polymarket::parse_submit(
+                &response,
+                "hash".into(),
+                json!({"price":"0.9", "shares":"10"}),
+            );
+            assert_eq!(
+                pm_matched_submit_fill(POLYMARKET, side, &result, &fees, &response),
+                Some((d("3"), d("0.4"), d("0.0504"))),
+            );
+            assert!(pm_matched_submit_fill(OUTCOME, side, &result, &fees, &response).is_none());
+            for (field, value) in [
+                ("status", json!("live")),
+                ("status", json!("delayed")),
+                ("success", json!(false)),
+                ("makingAmount", Value::Null),
+                ("takingAmount", json!("bad")),
+                ("makingAmount", json!("0")),
+                ("takingAmount", json!("-1")),
+            ] {
+                let mut invalid = response.clone();
+                invalid[field] = value;
+                let parsed =
+                    crate::platforms::polymarket::parse_submit(&invalid, "hash".into(), json!({}));
+                assert!(
+                    pm_matched_submit_fill(POLYMARKET, side, &parsed, &fees, &invalid).is_none(),
+                    "{field}"
+                );
+            }
+        }
+        let response = json!({"success":true,"status":"matched","orderID":"oid","makingAmount":"1.2","takingAmount":"3"});
+        let result =
+            crate::platforms::polymarket::parse_submit(&response, "hash".into(), json!({}));
+        fees.polymarket_fee_rate = Decimal::ZERO;
+        assert_eq!(
+            pm_matched_submit_fill(POLYMARKET, OrderSide::Buy, &result, &fees, &response)
+                .unwrap()
+                .2,
+            Decimal::ZERO
+        );
+        // 买卖方向颠倒会得到大于 1 的成交价格，不能入账。
+        assert!(
+            pm_matched_submit_fill(POLYMARKET, OrderSide::Sell, &result, &fees, &response)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+    async fn pm_matched_submission_accounts_atomically_without_trade_polling() {
+        let uri = std::env::var("APP_POSTGRES_URI").expect("requires a test database");
+        let admin = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&uri)
+            .await
+            .unwrap();
+        let schema = format!("pm_submit_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let search_path = schema.clone();
+        let exercised: anyhow::Result<()> = async {
+            let pool = sqlx::postgres::PgPoolOptions::new().max_connections(2).after_connect(move |conn, _| {
+                let path = search_path.clone();
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('search_path', $1, false)").bind(path).execute(conn).await?;
+                    Ok(())
+                })
+            }).connect(&uri).await?;
+            let mut engine = fee_test_engine().await;
+            engine.store = Store { pool };
+            let store = &engine.store;
+            store.migrate().await?;
+            let fees = FeeContext { polymarket_fee_rate:d("0.07"), outcome_taker_rate:Decimal::ZERO, outcome_builder_rate:Decimal::ZERO };
+            for side in [OrderSide::Buy, OrderSide::Sell] {
+                let identity = MarketIdentity::new(POLYMARKET, "test-condition")?;
+                let (parent, ids) = store.insert_actived_order_with_legs(
+                    TopicKey::new(uuid::Uuid::new_v4(), 0), &identity,
+                    "PM submit test", "PM submit test", None, d("10"), d("1"), d("9"), &json!([]),
+                    &[NewLeg {
+                        platform:POLYMARKET, token_id:"yes", label:"yes", side:side.as_str(), intent:"arb_buy",
+                        funder:Some("test-funder"), wallet:None, service:None,
+                        req_price:d("0.5"), req_shares:d("10"), req_fee:d("1"), client_order_id:None, fee_estimate:None,
+                    }], 0, Instant::now() + Duration::from_secs(30),
+                ).await?;
+                let id = ids[0];
+                let oid = format!("oid-{id}");
+                store.insert_envelope(id, &oid, &json!({}), &json!({}), None).await?;
+                let stale = store.open_legs().await?.into_iter().find(|leg|leg.id == id).unwrap();
+                let (making, taking) = if side == OrderSide::Buy { ("1.2", "3") } else { ("3", "1.2") };
+                let response = json!({"success":true,"status":"matched","orderID":oid,"makingAmount":making,"takingAmount":taking});
+                let result = crate::platforms::polymarket::parse_submit(&response, oid.clone(), json!({}));
+                if side == OrderSide::Buy {
+                    // 父单刷新失败时，提交响应与腿账务也必须一起回滚。
+                    sqlx::query("CREATE FUNCTION reject_parent_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test parent failure'; END $$").execute(&store.pool).await?;
+                    sqlx::query("CREATE TRIGGER reject_parent BEFORE UPDATE ON arb_orders FOR EACH ROW EXECUTE FUNCTION reject_parent_update()").execute(&store.pool).await?;
+                    assert!(persist_submit(store,id,POLYMARKET,side,&result,&fees,&response).await.is_err());
+                    let row:(String,Option<Decimal>,Option<Value>)=sqlx::query_as("SELECT l.status,l.actual_shares,e.submit_response FROM legs l JOIN signed_envelopes e ON e.leg_id=l.id WHERE l.id=$1").bind(id).fetch_one(&store.pool).await?;
+                    assert_eq!(row.0, "pending");
+                    assert!(row.1.is_none());
+                    assert!(row.2.is_none());
+                    sqlx::query("DROP TRIGGER reject_parent ON arb_orders").execute(&store.pool).await?;
+                } else {
+                    // 先前仅观察到的部分明细不能与提交返回的总量叠加。
+                    sqlx::query("INSERT INTO fills(leg_id,third_order_id,trade_id,shares,price) VALUES($1,$2,'observed',1,0.4)").bind(id).bind(&oid).execute(&store.pool).await?;
+                }
+                persist_submit(store,id,POLYMARKET,side,&result,&fees,&response).await?;
+                persist_submit(store,id,POLYMARKET,side,&result,&fees,&response).await?;
+                let row:(String,Decimal,Decimal,Decimal,Value)=sqlx::query_as("SELECT status,actual_shares,actual_price,actual_fee,last_order_info FROM legs WHERE id=$1").bind(id).fetch_one(&store.pool).await?;
+                assert_eq!((row.0.as_str(),row.1,row.2,row.3),("matched",d("3"),d("0.4"),d("0.0504")));
+                assert_eq!(row.4["submission"]["fill"]["source"],"submit_response");
+                assert_eq!(row.4["fee_sources"],json!(["estimated"]));
+                assert!(store.open_legs().await?.is_empty());
+                let positions=store.positions_for_order(parent).await?;
+                assert_eq!(position_qty(&positions,POLYMARKET,"yes"), if side==OrderSide::Buy {d("3")} else {d("-3")});
+                let actual:(String,Decimal)=sqlx::query_as("SELECT status,actual_cost FROM arb_orders WHERE id=$1").bind(parent).fetch_one(&store.pool).await?;
+                assert_eq!(actual.0,"completed");
+                if side==OrderSide::Buy { assert_eq!(actual.1,d("1.2504")); }
+                // HTTP 端点不可用；matched 腿不再调度 order/trades 查询。
+                engine.reconcile().await?;
+                let poll=OrderPoll {found:true,status:"matched".into(),order_id:Some(oid.clone()),..Default::default()};
+                assert!(store.record_order_poll(&stale,&poll).await?.is_none());
+                let evidence=FillEvidence {poll,page_complete:true,history_complete:true,expected_shares:None,outcome_scan:None,pm_scan:None,pm_order_constraints:None};
+                assert_eq!(store.record_reconciliation(&stale,&[],&evidence,&Value::Null).await?,LegResolution::Pending("stale_leg_snapshot"));
+                let count:i64=sqlx::query_scalar("SELECT count(*) FROM fills WHERE leg_id=$1").bind(id).fetch_one(&store.pool).await?;
+                assert_eq!(count,if side==OrderSide::Buy {0} else {1});
+            }
+            store.pool.close().await;
+            Ok(())
+        }.await;
+        let cleanup = sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&admin)
+            .await;
+        admin.close().await;
+        cleanup.unwrap();
+        exercised.unwrap();
     }
 
     #[test]

@@ -494,9 +494,37 @@ impl Store {
         evidence: &Value,
         response: &Value,
     ) -> Result<()> {
+        self.record_submission_with_fill(leg_id, status, order_id, evidence, response, None)
+            .await
+    }
+
+    /// matched 响应是整单聚合成交；直接更新腿账务，不与已观察到的 trades 累加。
+    pub(crate) async fn record_submission_with_fill(
+        &self,
+        leg_id: i64,
+        status: &str,
+        order_id: Option<&str>,
+        evidence: &Value,
+        response: &Value,
+        matched_fill: Option<(Decimal, Decimal, Decimal)>,
+    ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         let (parent_id, parent_open) = lock_leg_parent(&mut tx, leg_id).await?;
         let current = read_locked_leg(&mut tx, leg_id).await?;
+        if let Some((shares, price, fee)) = matched_fill {
+            if current.platform != POLYMARKET
+                || status != "matched"
+                || response.get("success").and_then(Value::as_bool) != Some(true)
+                || response.get("status").and_then(Value::as_str) != Some("matched")
+                || order_id.is_none_or(str::is_empty)
+                || shares <= Decimal::ZERO
+                || price <= Decimal::ZERO
+                || price > Decimal::ONE
+                || fee < Decimal::ZERO
+            {
+                return Err(Error::msg("invalid matched submission fill"));
+            }
+        }
         sqlx::query(
             "UPDATE signed_envelopes SET submit_response = $2 WHERE id =
              (SELECT id FROM signed_envelopes WHERE leg_id = $1 ORDER BY id DESC LIMIT 1)",
@@ -568,16 +596,31 @@ impl Store {
         {
             info["submission"] = evidence.clone();
         }
+        if matched_fill.is_some() {
+            info["fee_sources"] = serde_json::json!(["estimated"]);
+            info["waiting_reason"] = Value::Null;
+        }
         sqlx::query(
             "UPDATE legs SET status = $2, third_order_id = COALESCE($3,third_order_id),
                  last_order_info = $4, updated_at = clock_timestamp(),
-                 actual_shares = CASE WHEN $2 IN ('cancelled','failed') THEN 0 ELSE actual_shares END,
-                 actual_price = CASE WHEN $2 IN ('cancelled','failed') THEN 0 ELSE actual_price END,
-                 actual_fee = CASE WHEN $2 IN ('cancelled','failed') THEN 0 ELSE actual_fee END
+                 actual_shares = CASE WHEN $2 IN ('cancelled','failed') THEN 0 ELSE COALESCE($5,actual_shares) END,
+                 actual_price = CASE WHEN $2 IN ('cancelled','failed') THEN 0 ELSE COALESCE($6,actual_price) END,
+                 actual_fee = CASE WHEN $2 IN ('cancelled','failed') THEN 0 ELSE COALESCE($7,actual_fee) END
              WHERE id = $1",
-        ).bind(leg_id).bind(next_status).bind(order_id).bind(info).execute(&mut *tx).await?;
+        ).bind(leg_id).bind(next_status).bind(order_id).bind(info)
+            .bind(matched_fill.map(|fill| fill.0))
+            .bind(matched_fill.map(|fill| fill.1))
+            .bind(matched_fill.map(|fill| fill.2))
+            .execute(&mut *tx).await?;
         refresh_parent_in_tx(&mut tx, parent_id).await?;
         tx.commit().await?;
+        if let Some((shares, price, fee)) = matched_fill {
+            tracing::info!(
+                service = "polymarket", operation = "submit_fill", endpoint = "/order",
+                leg_id, order_id, response_status = "matched", %shares, %price, %fee,
+                fee_source = "estimated", "matched submission accounted without trade polling"
+            );
+        }
         Ok(())
     }
 
