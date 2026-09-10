@@ -787,6 +787,8 @@ impl PolymarketVenue {
     ) -> Result<FillPage> {
         let (cursor, mut seen, mut trade_ids) =
             trade_page_cursor(progress, funder, token_id, order_id, after, before)?;
+        // after 为排他下界，请求回看 10 秒以覆盖同秒成交；不改变持久化窗口和分页身份。
+        let request_after = (after - 10).max(0);
         let account = self.ensure_account(funder).await?;
         let started = Instant::now();
         let raw = self
@@ -797,7 +799,7 @@ impl PolymarketVenue {
                 &[
                     ("asset_id", token_id),
                     ("next_cursor", &cursor),
-                    ("after", &after.to_string()),
+                    ("after", &request_after.to_string()),
                     ("before", &before.to_string()),
                 ],
                 None,
@@ -854,6 +856,7 @@ impl PolymarketVenue {
                 token_id,
                 order_id,
                 after,
+                request_after,
                 before,
                 fills = page.fills.len(),
                 complete = page.complete,
@@ -867,6 +870,7 @@ impl PolymarketVenue {
                 token_id,
                 order_id,
                 after,
+                request_after,
                 before,
                 reason = %err,
                 elapsed_ms = started.elapsed().as_millis() as u64,
@@ -3703,7 +3707,7 @@ pub(crate) mod tests {
         let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
         assert_eq!(query.get("asset_id").map(String::as_str), Some("yes"));
         assert_eq!(query.get("next_cursor").map(String::as_str), Some(cursor));
-        assert_eq!(query["after"], TRADES_TEST_AFTER.to_string());
+        assert_eq!(query["after"], (TRADES_TEST_AFTER - 10).to_string());
         assert_eq!(query["before"], TRADES_TEST_BEFORE.to_string());
     }
 
@@ -4218,6 +4222,31 @@ pub(crate) mod tests {
         assert_eq!(fills[0].trade_id, "complete");
         for request in server.await.unwrap() {
             assert_trade_request(&request, "MA==");
+        }
+    }
+
+    #[tokio::test]
+    async fn trade_request_lookback_preserves_window_and_clamps_at_epoch() {
+        for after in [0, 5, TRADES_TEST_AFTER] {
+            let mut trade = trade_fixture("same-second");
+            trade["match_time"] = json!(after.to_string());
+            let (venue, server) = poll_stub(vec![
+                (200, json!({"data": [trade], "next_cursor": "LTE="})),
+            ])
+            .await;
+            let page = venue
+                .poll_trade_page("test-funder", "yes", "taker-1", after, after + 300, &Value::Null)
+                .await
+                .unwrap();
+            assert_eq!(page.fills[0].trade_id, "same-second");
+            assert_eq!(page.progress["after"], json!(after));
+            assert_eq!(page.progress["before"], json!(after + 300));
+            let requests = server.await.unwrap();
+            let target = requests[0].split_whitespace().nth(1).unwrap();
+            let url = url::Url::parse(&format!("http://localhost{target}")).unwrap();
+            let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
+            assert_eq!(query["after"], (after - 10).max(0).to_string());
+            assert_eq!(query["before"], (after + 300).to_string());
         }
     }
 
