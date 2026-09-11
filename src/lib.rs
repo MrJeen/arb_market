@@ -10,6 +10,7 @@ pub mod notify;
 pub mod platforms;
 pub mod reconcile;
 pub mod settlement;
+pub mod settlement_fees;
 pub mod signing;
 pub mod stats;
 pub mod store;
@@ -67,6 +68,7 @@ pub async fn run() -> anyhow::Result<()> {
         notify,
         stats,
         position_scan_cursor: Mutex::new(0),
+        actuals_scan_cursor: Mutex::new(0),
         settlement_scan_cursor: Mutex::new(0),
         last_settlement_sweep: Mutex::new(None),
         reported_stale_unknown: Mutex::new(Default::default()),

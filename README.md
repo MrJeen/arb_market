@@ -97,15 +97,31 @@ common 数据库提供给本服务的统一事件视为已经完成业务筛选�
 
 时间门禁的排查优先看每分钟 `minute stats`：`settlement_skipped_before_end` 统计未到期跳过次数，`settlement_end_date_missing` 统计时间缺失而继续查询的次数；配合原有 `settlement_scan`、`settlement_pending_scan` 判断处理路径。这些均是检查次数，不是去重订单数或 HTTP 请求数，提交前复查也会计数。需要逐订单排查时，启用 `market_arb::exec` 的 DEBUG 可见 `settlement time gate evaluated`，包含 `order_id`、`end_date`、`checked_at` 和 `decision`（`skip_before_end`、`query_due`、`query_missing_end_date`）。日志过滤器在加载 `.env` 前初始化，应通过进程启动环境或 systemd 覆盖配置设置 `RUST_LOG`，仅修改 `.env` 不会调整日志级别。
 
-任一平台先确认结算时，订单进入 `settlement_pending`：该订单立即停止止盈、再平衡和所有新交易，只保留两平台结算查询。两平台 payout 都可信后才核算 `actual_cost`、`actual_rev`、`actual_profit` 并转为 `settled`；不会用单平台结果推算另一侧，也不会自动卖出另一平台持仓。当前金额仍是“真实成交净现金流＋剩余毛兑付”，尚未核实的Outcome结算费不以估算伪装实扣；新结算证据和通知明确标记未扣该费用，因此 `actual_profit` 不是已证明的最终净到账。未结算的actual汇总同样保留既有每对毛锁定兑付口径，不因估算政策重写历史记录。
+任一平台先确认结算时，订单停止止盈、再平衡和所有新交易；两平台 payout 以及 Outcome 实际结算费证据未齐时保持 `settlement_pending`。Outcome 使用官方 `userFillsByTime` 中 `dir=Settlement` 的 `sz/px/fee/feeToken/tid` 核实实扣，并核对钱包/token 的真实买卖成交、转移记录和结算数量。缺费用不是零费用，零兑付也须明确零费证据；已确认无剩余 Outcome 仓位则记 `not_applicable`，不查询无关结算费。不会用单平台结果推算另一侧，也不会自动卖出另一平台持仓。
+
+同钱包/token 的所有相关订单（包括历史 settled）共同参与剩余股数核对，按份额分配真实结算费；确定性尾差保证分配总额等于官方实扣。同组事件和分配独立保存，不改写普通交易 fills。费用核实后 `actual_rev` 为原结算收入减分配费用，`actual_profit` 同额扣减，保留现有成交成本/均价精度口径；证据标记 `settlement_fee_status=verified`、`profit_basis=net_payout_less_trade_costs`。查询窗口不完整、外部持仓或归属不明均继续等待，不使用估算值顶替实扣。未结算 actual 汇总仍保留既有毛锁定兑付口径。
+
+历史 unknown/旧版毛收益订单不自动重写。使用 `cargo run --bin settlement-audit -- --order-id ID` 只读对账（`APP_POSTGRES_URI` 由进程环境注入，不加载环境文件、不运行迁移、不初始化签名）。报告包含实费、旧值、新值与 `report_fingerprint`；审阅并明确确认后，才可附加 `--apply --confirm-report FINGERPRINT` 应用。写入前重查证据、参与者与旧金额，指纹变化拒绝应用；保留 `actual_cost` 和原 `settled_at`，记录更正审计。历史证据缺失时不得强制套用当前费率。服务启动迁移会新增结算组/事件/分配表并放宽实际收入、利润列的数值精度；不会自动补扣历史费用。
 
 `settlement_pending` 走独立的扫描游标和批量，默认每 `SETTLEMENT_PENDING_SCAN_INTERVAL_SECS`（60 秒）清扫一次、每次至多 `SETTLEMENT_PENDING_SCAN_BATCH` 条，不再占用 `POSITION_SCAN_BATCH` 给活跃订单的配额，因此 pending 积压不会拉长止盈响应。清扫在同一个循环内串行执行，同一订单不会被两条路径并发处理。pending 没有超时自动最终化，长期缺失对手方 payout 时会持续驻留并每轮重试。
 
 套利、补齐对冲和开放持仓账务中的每对 `$1` 估值，依赖跨平台事件定义与结算规则一致；“二元市场”本身不保证这一点。common 的配对规则及真实市场的分数、平局、取消／退款语义仍需独立核验。最终账务按各平台实际 payout 核算，不代表估值前提已被验证，也不消除跨平台判决分歧风险。
 
-Outcome 兑付落在 `(0,1)` 时会打 `warn` 并计入 `outcome_fractional_settlement`，用于发现上述估值前提失效。该指标按**观测次数**计数而非去重订单数：结算确认后当轮扫描只会计一次，但订单最终化前的后续清扫会重复计数。计数不改变入账口径，也不会拦截交易——分数结算仍按实际 payout 核算。Polymarket 侧按 winner 构造，恒为 0/1，不参与该判定。
+Outcome 兑付落在 `(0,1)` 时会打 `warn` 并计入 `outcome_fractional_settlement`，用于发现上述估值前提失效。该指标按**观测次数**计数而非去重订单数：结算确认后当轮扫描只会计一次，但订单最终化前的后续清扫会重复计数。计数不改变入账口径，也不会拦截交易——分数结算仍按实际 payout 核算。Polymarket 也支持按 price 分数兑付，但不参与这个 Outcome 专用指标。
 
 最终核算返回错误时，`settlement_finalize_fail` 记录该分类失败并输出订单、市场和错误上下文；上层仍计入 `exec_err`，两项不能相加作为失败总数。失败日志不保证事务一定未提交，重试仍依赖既有最终核算幂等性。
+
+### 独立市场证据与最终化
+
+`0011_platform_settlement_results.sql` 新增 `order_platform_settlement_results`，按订单/平台保存版本化市场身份、查询 endpoint、精确 payout 和首次成功观测时间。同身份同 payout 重试幂等，冲突拒绝覆盖。PM 继续使用 CLOB `markets/{condition_id}` 的明确单 winner，严格匹配响应 condition 和唯一 token；恰好一个 winner 仅作为终态门槛，所有 token 均按自身 price 的 Decimal 值兑付（包括 0.5/0.5、0.3/0.7），完整二元向量须在 [0,1] 且精确合计 1，不自动归一化。closed/价格本身不证明结算，无明确单 winner 的退款/平局仍待确认。Outcome 使用 `settledOutcome` 的分数和持久化 side token 映射。市场证据不是账户到账证明，观测时间不是官方结算时间。
+
+PM 新来源为 `clob_market_price`，`evidence_version=1` 仍只表示封装结构；保存、缓存及最终化均重放来源响应，拒绝未知来源/版本。未最终化订单的旧 `clob_market_winner` 缓存视为 miss，继续停止交易并重新取证；合法新响应在父单锁内原子升级，`previous_evidence` 保留旧 source/payouts/evidence/observed_at，新观测时间更新而 pending 首次时间不变。已 settled 历史金额和证据不自动修改，无需新增迁移。部署必须先停止/排空旧结算 worker 再启用新版；不能直接回滚到不识别新语义的旧执行器。
+
+两个查询分支分别提交证据；成功分支不等慢侧网络返回。Outcome 自身结果确认即开始账户事件采集，未核实成交/活跃 claim 不阻止原始采集，但阻止证明、费用封存与最终入账。分页固定窗口终点，未封存的完整窗口（包括已有部分事件）下轮扩大重扫；进度和诊断更新比较旧进度，过期请求不能覆盖新页。sealed 组不重新扫描。
+
+首次结果与 pending 转移同事务，保留活跃 claim；pending 禁止新腿和初次发送，但允许在途成交对账。pending 清扫可释放已收尾 claim，释放不恢复 watching。数据库最终化从已保存的两个平台结果读取 payout，要求所有腿实际数量/价格/费用齐全且无 claim，再在同一事务保存费用应用、整单金额和 `settlement_result.platform_amounts`（平台成本、卖出净回款、剩余毛兑付、实结算费、净收入、利润）。已发往交易所的请求不能撤回，最终化等待其稳定收尾。
+
+验证：`cargo test --lib --quiet`、`cargo test --test settlement_fees --quiet`、`cargo check --bins`。显式 DB 测试用进程 `APP_POSTGRES_URI` 连接本地测试库，运行 `cargo test --test settlement_fees -- --ignored`；仅创建/迁移/清理唯一私有 schema，缺配置会失败而非假通过。`state_machine` 普通 fixture 也使用唯一私有 schema；旧最终化用例已补明确的市场/成交/零实费测试证据。历史审计 apply、部署和业务迁移须另行授权。
 
 ## Polymarket 余额缓存
 

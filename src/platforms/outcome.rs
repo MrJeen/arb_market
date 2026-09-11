@@ -19,6 +19,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
 pub mod fees;
+pub mod settlement;
 pub use fees::OutcomeFeeSnapshot;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock as StdRwLock;
@@ -310,26 +311,36 @@ impl OutcomeVenue {
         &self,
         market_id: &str,
     ) -> Result<crate::settlement::OutcomeSettlement> {
+        Ok(self.settlement_with_evidence(market_id).await?.0)
+    }
+
+    pub async fn settlement_with_evidence(
+        &self,
+        market_id: &str,
+    ) -> Result<(crate::settlement::OutcomeSettlement, Value)> {
         let outcome_id = parse_settlement_market_id(market_id)?;
         let started = Instant::now();
         let value: Value = self
-            .http
-            .post(&self.info_url)
-            .json(&json!({"type": "settledOutcome", "outcome": outcome_id}))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
+            .query_info(
+                "settledOutcome",
+                market_id,
+                &json!({"type":"settledOutcome","outcome":outcome_id}),
+            )
             .await?;
-        let status = crate::settlement::parse_outcome_settlement(outcome_id, &value)?;
-        tracing::info!(
+        let status = crate::settlement::parse_outcome_settlement(outcome_id, &value).map_err(|error| {
+            tracing::warn!(service="outcome",api="settledOutcome",outcome_id,elapsed_ms=started.elapsed().as_millis() as u64,error=%error,"invalid settlement response"); error
+        })?;
+        tracing::debug!(
             service = "outcome",
             outcome_id,
             settlement_state = status.kind(),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "settlement queried"
         );
-        Ok(status)
+        Ok((
+            status,
+            json!({"request_outcome":outcome_id,"outcome":value.get("outcome"),"settleFraction":value.get("settleFraction").or_else(|| value.get("settle_fraction"))}),
+        ))
     }
 
     pub async fn rest_book(&self, coin: &str) -> Result<(Vec<Level>, Vec<Level>, i64)> {
@@ -529,6 +540,15 @@ impl OutcomeVenue {
             .into_iter()
             .filter(|fill| coin.is_none_or(|want| fill.coin.as_deref() == Some(want)))
             .collect())
+    }
+
+    /// Public, unsigned info endpoint identity for read-only settlement audits.
+    pub fn info_endpoint(&self) -> &str {
+        &self.info_url
+    }
+
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.http
     }
 
     pub async fn poll_fill_page(
@@ -917,6 +937,9 @@ pub fn parse_order_status(raw: Value, _query_id: &str) -> OrderPoll {
 }
 
 fn parse_user_fill(item: &Value) -> Result<TradeFill> {
+    if item.get("dir").and_then(Value::as_str) == Some("Settlement") {
+        return Err(Error::msg("settlement event is not an order trade"));
+    }
     let trade_id =
         numeric_id(item.get("tid")).ok_or_else(|| Error::msg("outcome fill missing valid tid"))?;
     let order_id =
@@ -1024,7 +1047,10 @@ fn apply_fill_page(
             ));
         }
         // 没有 coin 时无法排除相关成交；相关坏记录必须报错，不能变成“完整的空结果”。
-        let fill = if time >= state.submitted_at_ms && coin == state.token_id {
+        let fill = if time >= state.submitted_at_ms
+            && coin == state.token_id
+            && item.get("dir").and_then(Value::as_str) != Some("Settlement")
+        {
             Some(parse_user_fill(item)?)
         } else {
             None

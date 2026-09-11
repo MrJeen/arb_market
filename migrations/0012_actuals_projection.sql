@@ -1,0 +1,1 @@
+ALTER TABLE arb_orders ADD COLUMN actuals_projection JSONB NOT NULL DEFAULT '{"version":1,"status":"unknown","basis":"legacy_unknown","stale":true,"reason":"legacy projection requires refresh"}'::jsonb;

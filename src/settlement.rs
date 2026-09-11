@@ -73,12 +73,15 @@ pub fn parse_polymarket_settlement(value: &Value) -> Result<SettlementStatus> {
         let token_id = token
             .get("token_id")
             .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
+            .filter(|id| !id.trim().is_empty())
             .ok_or_else(|| Error::msg("polymarket market token missing token_id"))?;
         let winner = token
             .get("winner")
             .and_then(Value::as_bool)
             .ok_or_else(|| Error::msg("polymarket market token missing winner"))?;
+        if parsed.iter().any(|(id, _)| id == token_id) {
+            return Err(Error::msg("polymarket duplicate settlement token"));
+        }
         winner_count += usize::from(winner);
         parsed.push((token_id.to_string(), winner));
     }
@@ -87,13 +90,25 @@ pub fn parse_polymarket_settlement(value: &Value) -> Result<SettlementStatus> {
         return Err(Error::msg("polymarket market has multiple winners"));
     }
     if winner_count == 1 {
-        let payouts = parsed
+        if parsed.len() != 2 {
+            return Err(Error::msg("settled polymarket market must have two tokens"));
+        }
+        // winner 只证明终态；每个 token 的兑付必须来自原始 price。
+        let payouts: Vec<SettlementPayout> = parsed
             .into_iter()
-            .map(|(token_id, winner)| SettlementPayout {
-                token_id,
-                payout: if winner { Decimal::ONE } else { Decimal::ZERO },
+            .zip(tokens)
+            .map(|((token_id, _), token)| {
+                let payout = token
+                    .get("price")
+                    .and_then(parse_decimal)
+                    .filter(|p| (Decimal::ZERO..=Decimal::ONE).contains(p))
+                    .ok_or_else(|| Error::msg("invalid or missing polymarket settlement price"))?;
+                Ok(SettlementPayout { token_id, payout })
             })
-            .collect();
+            .collect::<Result<_>>()?;
+        if payouts[0].payout + payouts[1].payout != Decimal::ONE {
+            return Err(Error::msg("polymarket settlement prices must sum to one"));
+        }
         return Ok(SettlementStatus::Settled { payouts });
     }
 
@@ -110,6 +125,15 @@ pub fn parse_polymarket_settlement(value: &Value) -> Result<SettlementStatus> {
 pub fn parse_outcome_settlement(outcome_id: u64, value: &Value) -> Result<OutcomeSettlement> {
     if value.is_null() {
         return Ok(OutcomeSettlement::Unsettled);
+    }
+    if let Some(identity) = value.get("outcome").filter(|v| !v.is_null()) {
+        if identity
+            .as_u64()
+            .or_else(|| identity.as_str().and_then(|s| s.parse().ok()))
+            != Some(outcome_id)
+        {
+            return Err(Error::msg("outcome settlement response identity mismatch"));
+        }
     }
     let fraction = value
         .get("settleFraction")
@@ -158,8 +182,8 @@ mod tests {
             "accepting_orders": false,
             "enable_order_book": false,
             "tokens": [
-                {"token_id": "yes", "outcome": "Yes", "winner": true},
-                {"token_id": "no", "outcome": "No", "winner": false}
+                {"token_id": "yes", "outcome": "Yes", "winner": true, "price": "1"},
+                {"token_id": "no", "outcome": "No", "winner": false, "price": "0"}
             ]
         }))
         .unwrap();
@@ -181,12 +205,75 @@ mod tests {
     }
 
     #[test]
+    fn polymarket_prices_are_exact_and_independent_of_winner() {
+        for (a, b) in [
+            (json!("0.5"), json!(0.5)),
+            (json!("0.3"), json!("0.7")),
+            (json!("0"), json!("1")),
+        ] {
+            let response = json!({"tokens":[{"token_id":"a","winner":true,"price":a},{"token_id":"b","winner":false,"price":b}]});
+            let SettlementStatus::Settled { payouts } =
+                parse_polymarket_settlement(&response).unwrap()
+            else {
+                panic!("expected settlement")
+            };
+            assert_eq!(payouts[0].payout, parse_decimal(&a).unwrap());
+            assert_eq!(payouts[1].payout, parse_decimal(&b).unwrap());
+            for bad in [
+                Value::Null,
+                json!("NaN"),
+                json!(true),
+                json!("-0.1"),
+                json!("1.1"),
+                json!("0.123"),
+            ] {
+                let mut invalid = response.clone();
+                invalid["tokens"][0]["price"] = bad;
+                assert!(parse_polymarket_settlement(&invalid).is_err());
+            }
+            let mut missing = response.clone();
+            missing["tokens"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("price");
+            assert!(parse_polymarket_settlement(&missing).is_err());
+            for id in ["a", " "] {
+                let mut invalid = response.clone();
+                invalid["tokens"][1]["token_id"] = json!(id);
+                assert!(parse_polymarket_settlement(&invalid).is_err());
+            }
+            let mut no_winner = response.clone();
+            no_winner["tokens"][0]["winner"] = json!(false);
+            assert_eq!(
+                parse_polymarket_settlement(&no_winner).unwrap(),
+                SettlementStatus::Unavailable
+            );
+            let mut multiple = response;
+            multiple["tokens"][1]["winner"] = json!(true);
+            assert!(parse_polymarket_settlement(&multiple).is_err());
+        }
+    }
+
+    #[test]
+    fn polymarket_numeric_price_preserves_decimal_precision() {
+        let response: Value = serde_json::from_str(r#"{"tokens":[{"token_id":"a","winner":true,"price":0.3000000000000000000000000001},{"token_id":"b","winner":false,"price":0.6999999999999999999999999999}]}"#).unwrap();
+        let SettlementStatus::Settled { payouts } = parse_polymarket_settlement(&response).unwrap()
+        else {
+            panic!("expected settled")
+        };
+        assert_eq!(
+            payouts[0].payout,
+            "0.3000000000000000000000000001".parse::<Decimal>().unwrap()
+        );
+    }
+
+    #[test]
     fn polymarket_requires_all_trading_flags() {
         let open = json!({
             "closed": false,
             "accepting_orders": true,
             "enable_order_book": true,
-            "tokens": [{"token_id": "yes", "winner": false}]
+            "tokens": [{"token_id": "yes", "winner": false, "price": "0"}]
         });
         assert_eq!(
             parse_polymarket_settlement(&open).unwrap(),
@@ -208,7 +295,7 @@ mod tests {
             "closed": true,
             "accepting_orders": false,
             "enable_order_book": false,
-            "tokens": [{"token_id": "yes", "winner": false}]
+            "tokens": [{"token_id": "yes", "winner": false, "price": "0"}]
         }))
         .unwrap();
         assert_eq!(status, SettlementStatus::Unavailable);
@@ -223,8 +310,8 @@ mod tests {
         .is_err());
         assert!(parse_polymarket_settlement(&json!({
             "tokens": [
-                {"token_id": "yes", "winner": true},
-                {"token_id": "no", "winner": true}
+                {"token_id": "yes", "winner": true, "price": "1"},
+                {"token_id": "no", "winner": true, "price": "1"}
             ]
         }))
         .is_err());

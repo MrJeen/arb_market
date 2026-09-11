@@ -16,6 +16,10 @@ path = "src/main.rs"
 name = "place-test"
 path = "src/bin/place_test.rs"
 
+[[bin]]
+name = "settlement-audit"
+path = "src/bin/settlement_audit.rs"
+
 [dependencies]
 alloy-primitives = { version = "1.0", features = ["serde"] }
 alloy-signer = "1.0"
@@ -38,7 +42,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rmp = "0.8"
 rust_decimal = { version = "1.36", features = ["serde-with-str"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "migrate", "chrono", "uuid", "rust_decimal", "json"] }
 thiserror = "2"

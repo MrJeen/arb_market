@@ -48,6 +48,7 @@ pub struct Engine {
     pub notify: Option<NatsNotifier>,
     pub stats: Arc<MinuteStats>,
     pub position_scan_cursor: Mutex<i64>,
+    pub actuals_scan_cursor: Mutex<i64>,
     pub settlement_scan_cursor: Mutex<i64>,
     pub last_settlement_sweep: Mutex<Option<Instant>>,
     /// 已告警过的超时 unknown 腿；超时腿留在库里持续重试，告警只推一次。
@@ -160,7 +161,15 @@ impl Engine {
             return Ok(true);
         }
         if self.cfg.max_realized_loss > Decimal::ZERO {
-            let pnl = self.store.sum_actual_profit().await?;
+            let (pnl, unknown) = self.store.sum_actual_profit().await?;
+            if unknown > 0 {
+                tracing::warn!(
+                    topic,
+                    unknown,
+                    "loss gate blocked by incomplete actuals projection"
+                );
+                return Ok(true);
+            }
             if pnl < Decimal::ZERO && -pnl >= self.cfg.max_realized_loss {
                 tracing::warn!(
                     topic,
@@ -1228,6 +1237,15 @@ impl Engine {
     }
 
     pub async fn hedge_once(&self) -> Result<()> {
+        let actuals_after = *self.actuals_scan_cursor.lock().await;
+        match self
+            .store
+            .refresh_actuals_batch(actuals_after, self.cfg.position_scan_batch as i64)
+            .await
+        {
+            Ok(cursor) => *self.actuals_scan_cursor.lock().await = cursor,
+            Err(error) => tracing::warn!(error=%error, "actuals projection scan failed"),
+        }
         let after_id = *self.position_scan_cursor.lock().await;
         let watching = self
             .store
@@ -1280,6 +1298,7 @@ impl Engine {
     async fn hedge_order_once(&self, order: &ArbOrderRow) -> Result<()> {
         if settlement_only_scan(&order.position_status) {
             self.stats.settlement_pending_scan();
+            self.finish_terminal_lifecycle_action(order).await?;
             let Some(identity) = self.settlement_identity_for_order(order).await? else {
                 return Ok(());
             };
@@ -1586,7 +1605,7 @@ impl Engine {
         // Keep the claim until actuals are durable: a transient refresh failure must remain
         // retryable on the next scan and must not lose the completion notification.
         let take_profit_actuals = if action == "take_profit" && has_positive_fill {
-            Some(self.store.refresh_order_actuals(order.id).await?)
+            self.store.refresh_order_actuals(order.id).await?.actuals()
         } else {
             None
         };
@@ -1614,7 +1633,7 @@ impl Engine {
                     });
                 }
             } else {
-                tracing::info!(order_id = order.id, claim_id = %claim_id, "take profit completed without fills; notification skipped");
+                tracing::info!(order_id = order.id, claim_id = %claim_id, "take profit completed without priced fills; notification skipped");
             }
         }
         tracing::info!(order_id = order.id, action, claim_id = %claim_id, "position action released");
@@ -1741,11 +1760,78 @@ impl Engine {
         self.stats.settlement_scan();
         let polymarket_market_id = identity.require(POLYMARKET)?;
         let outcome_market_id = identity.require(OUTCOME)?;
-        let (pm, outcome) = tokio::join!(
-            self.pm.settlement(polymarket_market_id),
-            self.outcome.settlement(outcome_market_id)
-        );
-        // Polymarket 侧按 winner 构造，恒为 0/1；只有 Outcome 的 HIP-4 分数会打破 $1 假设。
+        // Each branch commits before joining: a slow peer cannot delay durable stop or fee collection.
+        let pm_future = async {
+            let endpoint = self.pm.settlement_endpoint();
+            if let Some(payouts) = self
+                .store
+                .platform_settlement_result(order_id, POLYMARKET, polymarket_market_id, endpoint)
+                .await?
+            {
+                return Ok::<_, Error>(SettlementStatus::Settled { payouts });
+            }
+            let (status, response) = self
+                .pm
+                .settlement_with_evidence(polymarket_market_id)
+                .await?;
+            if let SettlementStatus::Settled { payouts } = &status {
+                self.store
+                    .save_platform_settlement_result(
+                        order_id,
+                        POLYMARKET,
+                        polymarket_market_id,
+                        endpoint,
+                        payouts,
+                        &response,
+                    )
+                    .await?;
+            }
+            Ok(status)
+        };
+        let outcome_future = async {
+            let endpoint = self.outcome.info_endpoint();
+            let status = if let Some(payouts) = self
+                .store
+                .platform_settlement_result(order_id, OUTCOME, outcome_market_id, endpoint)
+                .await?
+            {
+                OutcomeSettlement::Settled { payouts }
+            } else {
+                let (status, response) = self
+                    .outcome
+                    .settlement_with_evidence(outcome_market_id)
+                    .await?;
+                if let OutcomeSettlement::Settled { payouts } = &status {
+                    self.store
+                        .save_platform_settlement_result(
+                            order_id,
+                            OUTCOME,
+                            outcome_market_id,
+                            endpoint,
+                            payouts,
+                            &response,
+                        )
+                        .await?;
+                }
+                status
+            };
+            let ready = if let OutcomeSettlement::Settled { payouts } = &status {
+                let map = payouts
+                    .iter()
+                    .map(|p| ((OUTCOME.to_string(), p.token_id.clone()), p.payout))
+                    .collect();
+                self.prepare_outcome_settlement_fees(order_id, &map).await
+            } else {
+                Ok(false)
+            };
+            Ok::<_, Error>((status, ready))
+        };
+        let (pm, outcome_result) = tokio::join!(pm_future, outcome_future);
+        let (outcome, fee_ready) = match outcome_result {
+            Ok((status, ready)) => (Ok(status), ready),
+            Err(error) => (Err(error), Ok(false)),
+        };
+        // PM 也可按 price 分数兑付；本指标只观测 Outcome，不覆盖所有跨平台估值偏差。
         // 计数口径是观测次数而非去重订单数：结算确认后本轮扫描只会走到这里一次，
         // 但订单最终化前的后续轮次会重复计数。
         if let Ok(status @ OutcomeSettlement::Settled { payouts }) = &outcome {
@@ -1759,7 +1845,11 @@ impl Engine {
                 );
             }
         }
-        let (access, settled_source) = settlement_decision(pm.as_ref(), outcome.as_ref());
+        let (mut access, settled_source) = settlement_decision(pm.as_ref(), outcome.as_ref());
+        // Durable state unavailable is not permission to trade, including reduce-only.
+        if pm.is_err() || outcome.is_err() {
+            access = SettlementAccess::Stop;
+        }
         if let Some(source) = settled_source {
             let evidence = json!({
                 "polymarket": settlement_result_evidence(&pm),
@@ -1769,37 +1859,42 @@ impl Engine {
             });
             // One confirmed venue is enough to stop trading, but both payouts are required before
             // terminal state and actuals are made durable. Until then the order is retried.
-            if let (
-                Ok(SettlementStatus::Settled {
-                    payouts: pm_payouts,
-                }),
-                Ok(OutcomeSettlement::Settled {
-                    payouts: outcome_payouts,
-                }),
-            ) = (&pm, &outcome)
+            if let (Ok(SettlementStatus::Settled { .. }), Ok(OutcomeSettlement::Settled { .. })) =
+                (&pm, &outcome)
             {
-                let mut payouts = HashMap::new();
-                for payout in pm_payouts {
-                    payouts.insert(
-                        (POLYMARKET.to_string(), payout.token_id.clone()),
-                        payout.payout,
-                    );
-                }
-                for payout in outcome_payouts {
-                    payouts.insert(
-                        (OUTCOME.to_string(), payout.token_id.clone()),
-                        payout.payout,
-                    );
+                // 市场结果不是到账证据；实扣费用未核实前仍保持停止交易。
+                if !matches!(fee_ready, Ok(true)) {
+                    let reason = match fee_ready {
+                        Ok(false) => "settlement fee evidence scanning".to_string(),
+                        Err(err) => err.to_string(),
+                        Ok(true) => unreachable!(),
+                    };
+                    let pending = self
+                        .store
+                        .mark_settlement_pending(order_id, source, &evidence)
+                        .await?;
+                    if matches!(pending, Some((_, true))) {
+                        self.stats.settlement_pending_entered();
+                        tracing::warn!(
+                            service = "outcome",
+                            order_id,
+                            reason,
+                            "settlement fee pending; all trading stopped"
+                        );
+                    } else {
+                        tracing::debug!(
+                            service = "outcome",
+                            order_id,
+                            reason,
+                            "settlement fee verification pending"
+                        );
+                    }
+                    return Ok(SettlementAccess::Stop);
                 }
                 let started = Instant::now();
                 let result = self
                     .store
-                    .finalize_position_settlement(
-                        order_id,
-                        "polymarket+outcome",
-                        &evidence,
-                        &payouts,
-                    )
+                    .finalize_position_settlement(order_id, "polymarket+outcome", &evidence)
                     .await;
                 if let Some((_, _, actual_profit)) = handle_settlement_finalization_result(
                     result,
@@ -1813,7 +1908,7 @@ impl Engine {
                         notify.publish_settlement(SettlementNotice {
                             order_id,
                             title: title.to_string(),
-                            status: "settled (polymarket+outcome); 未扣未核实的 Outcome 结算费"
+                            status: "settled (polymarket+outcome); 已核实 Outcome 结算费，收益已扣实费（无剩余仓位则无需结算费）"
                                 .to_string(),
                             actual_profit: Some(actual_profit),
                         });
@@ -1888,6 +1983,49 @@ impl Engine {
             );
         }
         Ok(access)
+    }
+
+    async fn prepare_outcome_settlement_fees(
+        &self,
+        order_id: i64,
+        payouts: &HashMap<(String, String), Decimal>,
+    ) -> Result<bool> {
+        let endpoint = self.outcome.info_endpoint();
+        let keys = match self
+            .store
+            .settlement_fee_keys_for_order(order_id, endpoint)
+            .await
+        {
+            Ok(keys) => keys,
+            Err(_) => {
+                self.store
+                    .settlement_collection_keys(order_id, endpoint)
+                    .await?
+            }
+        };
+        let mut ready = true;
+        for key in keys {
+            let payout = payouts
+                .get(&(OUTCOME.to_string(), key.token.clone()))
+                .copied()
+                .ok_or_else(|| Error::msg("missing Outcome settlement payout"))?;
+            match crate::settlement_fees::prepare_online(
+                &self.store,
+                self.outcome.http_client(),
+                endpoint,
+                &key,
+                payout,
+            )
+            .await
+            {
+                Ok(done) => ready &= done,
+                Err(error) => {
+                    ready = false;
+                    tracing::warn!(service="outcome",order_id,token_id=%key.token,error=%error,"settlement fee group remains pending");
+                }
+            }
+        }
+        Ok(ready)
     }
 
     async fn confirm_take_profit(
@@ -2350,9 +2488,15 @@ impl Engine {
 
     async fn complete_rebalance(&self, order_id: i64) -> Result<()> {
         // 先落最终实际值；失败时保留 pending/actived，下一轮仍可重试并避免漏通知。
-        let (actual_cost, _actual_rev, actual_profit) =
-            self.store.refresh_order_actuals(order_id).await?;
+        let projection = self.store.refresh_order_actuals(order_id).await?;
         self.store.mark_rebalance(order_id, "completed").await?;
+        let Some((actual_cost, _actual_rev, actual_profit)) = projection.actuals() else {
+            tracing::warn!(
+                order_id,
+                "rebalance completed with unknown actuals; notification skipped"
+            );
+            return Ok(());
+        };
         tracing::info!(
             order_id,
             actual_profit = %actual_profit,
@@ -3573,6 +3717,7 @@ mod tests {
             notify: None,
             stats: Arc::new(MinuteStats::new()),
             position_scan_cursor: Mutex::new(0),
+            actuals_scan_cursor: Mutex::new(0),
             settlement_scan_cursor: Mutex::new(0),
             last_settlement_sweep: Mutex::new(None),
             reported_stale_unknown: Mutex::new(HashSet::new()),
@@ -4259,8 +4404,9 @@ mod tests {
             }
         });
 
-        // 本测试不访问数据库；未结算响应无需任何持仓状态写入。
+        // Without the authoritative database, due scans fail closed before HTTP.
         let pool = PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(30))
             .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
             .unwrap();
         let cfg = admission_test_config(&base);
@@ -4282,6 +4428,7 @@ mod tests {
             notify: None,
             stats: Arc::new(MinuteStats::new()),
             position_scan_cursor: Mutex::new(0),
+            actuals_scan_cursor: Mutex::new(0),
             settlement_scan_cursor: Mutex::new(0),
             last_settlement_sweep: Mutex::new(None),
             reported_stale_unknown: Mutex::new(HashSet::new()),
@@ -4310,7 +4457,7 @@ mod tests {
                     .settlement_gate_after_end(1, "test", &identity, end_date)
                     .await
                     .unwrap(),
-                SettlementAccess::All
+                SettlementAccess::Stop
             );
             let queried = engine.stats.snapshot_and_reset();
             assert_eq!(queried.settlement_scan, 1);
@@ -4323,7 +4470,7 @@ mod tests {
         // pending 使用的原 gate 不经过时间门禁，仍查询两个平台。
         assert_eq!(
             engine.settlement_gate(1, "test", &identity).await.unwrap(),
-            SettlementAccess::All
+            SettlementAccess::Stop
         );
         let pending = engine.stats.snapshot_and_reset();
         assert_eq!(pending.settlement_scan, 1);
@@ -4332,21 +4479,135 @@ mod tests {
         stop_tx.send(()).unwrap();
         server.await.unwrap();
         let requests = requests.lock().await;
-        assert_eq!(requests.len(), 6);
-        assert_eq!(
-            requests
-                .iter()
-                .filter(|r| r.starts_with("GET /markets/"))
-                .count(),
-            3
-        );
-        assert_eq!(
-            requests
-                .iter()
-                .filter(|r| r.starts_with("POST /info "))
-                .count(),
-            3
-        );
+        assert!(requests.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires process APP_POSTGRES_URI; private schema only"]
+    async fn outcome_evidence_and_scan_commit_before_slow_pm_returns() {
+        use crate::platforms::polymarket::tests::execution_test_venue;
+        use sqlx::postgres::PgPoolOptions;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let uri =
+            std::env::var("APP_POSTGRES_URI").expect("BLOCKED: process APP_POSTGRES_URI required");
+        let schema = format!("independent_gate_{}", uuid::Uuid::new_v4().simple());
+        let path = schema.clone();
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .after_connect(move |c, _| {
+                let path = path.clone();
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('search_path',$1,false)")
+                        .bind(path)
+                        .execute(c)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&uri)
+            .await
+            .unwrap();
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let store = Store { pool: pool.clone() };
+        store.migrate().await.unwrap();
+        let order_id:i64=sqlx::query_scalar("INSERT INTO arb_orders(event_id,unified_index,status) VALUES($1,0,'completed') RETURNING id").bind(uuid::Uuid::new_v4()).fetch_one(&pool).await.unwrap();
+        sqlx::query("INSERT INTO arb_order_market_identities VALUES($1,'polymarket','test-condition'),($1,'outcome','1211')").bind(order_id).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO legs(order_id,platform,token_id,label,side,intent,wallet_address,status,submitted_at) VALUES($1,'outcome','#12110','yes','BUY','arb_buy','0x1111111111111111111111111111111111111111','actived',NOW())").bind(order_id).execute(&pool).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (scan_tx, mut scan_rx) = mpsc::channel(2);
+        let release_server = release.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let release = release_server.clone();
+                let scan_tx = scan_tx.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = socket.read(&mut buf).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&buf[..n]);
+                        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let header = String::from_utf8_lossy(&bytes[..end]);
+                            let len = header
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .and_then(|v| v.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            if bytes.len() >= end + 4 + len {
+                                break;
+                            }
+                        }
+                    }
+                    let raw = String::from_utf8_lossy(&bytes);
+                    let body = if raw.starts_with("GET ") {
+                        release.notified().await;
+                        json!({"condition_id":"test-condition","tokens":[{"token_id":"pm-yes","winner":false},{"token_id":"pm-no","winner":false}],"closed":true})
+                    } else if raw.contains("settledOutcome") {
+                        json!({"settleFraction":"1"})
+                    } else {
+                        scan_tx.send(()).await.unwrap();
+                        json!([])
+                    };
+                    let body = body.to_string();
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket.write_all(reply.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        let cfg = admission_test_config(&base);
+        let outcome = OutcomeVenue::connect(&cfg).unwrap();
+        let (pm, _) = execution_test_venue(base).await;
+        let (pm_sub_tx, _) = mpsc::channel(1);
+        let (out_sub_tx, _) = mpsc::channel(1);
+        let engine = Engine {
+            cfg,
+            store: store.clone(),
+            common: pool.clone(),
+            books: Arc::new(Mutex::new(BookStore::default())),
+            dirty: Arc::new(Mutex::new(DirtyCoalescer::default())),
+            topics: Arc::new(RwLock::new(HashMap::new())),
+            pm,
+            outcome,
+            pm_sub_tx,
+            out_sub_tx,
+            notify: None,
+            stats: Arc::new(MinuteStats::new()),
+            position_scan_cursor: Mutex::new(0),
+            actuals_scan_cursor: Mutex::new(0),
+            settlement_scan_cursor: Mutex::new(0),
+            last_settlement_sweep: Mutex::new(None),
+            reported_stale_unknown: Mutex::new(HashSet::new()),
+        };
+        let mut identity = MarketIdentity::new(POLYMARKET, "test-condition").unwrap();
+        identity.insert(OUTCOME, "1211").unwrap();
+        let gate = engine.settlement_gate(order_id, "fixture", &identity);
+        tokio::pin!(gate);
+        tokio::select! { _=&mut gate=>panic!("gate returned before slow PM released"), result=tokio::time::timeout(Duration::from_secs(5),scan_rx.recv())=>assert!(result.unwrap().is_some()) }
+        let state:(String,i64)=sqlx::query_as("SELECT position_status,(SELECT count(*) FROM order_platform_settlement_results WHERE order_id=$1 AND platform='outcome') FROM arb_orders WHERE id=$1").bind(order_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(state, ("settlement_pending".into(), 1));
+        release.notify_one();
+        assert_eq!(gate.await.unwrap(), SettlementAccess::Stop);
+        server.abort();
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
     }
 
     #[tokio::test]
@@ -4478,6 +4739,7 @@ mod tests {
                 notify: None,
                 stats: Arc::new(MinuteStats::new()),
                 position_scan_cursor: Mutex::new(0),
+                actuals_scan_cursor: Mutex::new(0),
                 settlement_scan_cursor: Mutex::new(0),
                 last_settlement_sweep: Mutex::new(None),
                 reported_stale_unknown: Mutex::new(HashSet::new()),
@@ -5081,7 +5343,7 @@ mod tests {
                 dirty: Arc::new(Mutex::new(DirtyCoalescer::default())),
                 topics: Arc::new(RwLock::new(HashMap::new())), pm, outcome,
                 pm_sub_tx, out_sub_tx, notify: None, stats: Arc::new(MinuteStats::new()),
-                position_scan_cursor: Mutex::new(0), settlement_scan_cursor: Mutex::new(0),
+                position_scan_cursor: Mutex::new(0), actuals_scan_cursor: Mutex::new(0), settlement_scan_cursor: Mutex::new(0),
                 last_settlement_sweep: Mutex::new(None), reported_stale_unknown: Mutex::new(HashSet::new()),
             };
             let missing = engine.pm_reconciliation_fee_snapshot(&leg).await?;

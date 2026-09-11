@@ -24,6 +24,7 @@ const POSTGRES_REQUIRED: &str = "requires APP_POSTGRES_URI; run manually against
 struct Fixture {
     store: Store,
     order_id: i64,
+    schema: String,
 }
 
 impl Fixture {
@@ -32,24 +33,40 @@ impl Fixture {
             .expect("set APP_POSTGRES_URI before running ignored PostgreSQL tests");
         assert!(!uri.trim().is_empty(), "APP_POSTGRES_URI must not be empty");
 
-        let store = Store::connect(&uri).await?;
+        let schema = format!("state_machine_test_{}", Uuid::new_v4().simple());
+        let connection_schema = schema.clone();
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .after_connect(move |connection, _| {
+                let schema = connection_schema.clone();
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('search_path',$1,false)")
+                        .bind(schema)
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&uri)
+            .await?;
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&pool)
+            .await?;
+        let store = Store { pool };
         store.migrate().await?;
-
         let order_id = insert_completed_order(&store.pool).await?;
-        Ok(Self { store, order_id })
+        Ok(Self {
+            store,
+            order_id,
+            schema,
+        })
     }
 
     async fn cleanup(&self) -> Result<()> {
-        let mut tx = self.store.pool.begin().await?;
-        sqlx::query("DELETE FROM legs WHERE order_id = $1")
-            .bind(self.order_id)
-            .execute(&mut *tx)
+        sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
+            .execute(&self.store.pool)
             .await?;
-        sqlx::query("DELETE FROM arb_orders WHERE id = $1")
-            .bind(self.order_id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
+        self.store.pool.close().await;
         Ok(())
     }
 }
@@ -63,6 +80,86 @@ async fn insert_completed_order(pool: &PgPool) -> Result<i64> {
     .bind(Uuid::new_v4())
     .fetch_one(pool)
     .await?)
+}
+
+// Legacy state-machine examples now seed the same durable evidence required online.
+async fn seed_settlement_results(
+    store: &Store,
+    id: i64,
+    payouts: &HashMap<(String, String), Decimal>,
+) -> Result<()> {
+    use market_arb::settlement::SettlementPayout;
+    use market_arb::store::settlement_fees::{FeeEvent, GroupKey};
+    for (platform, market, tokens) in [
+        ("polymarket", "fixture-condition", ["pm-yes", "pm-no"]),
+        ("outcome", "516", ["#5160", "#5161"]),
+    ] {
+        sqlx::query("INSERT INTO arb_order_market_identities(order_id,platform,market_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING").bind(id).bind(platform).bind(market).execute(&store.pool).await?;
+        let first = payouts
+            .get(&(platform.into(), tokens[0].into()))
+            .copied()
+            .unwrap_or_else(|| {
+                Decimal::ONE
+                    - payouts
+                        .get(&(platform.into(), tokens[1].into()))
+                        .copied()
+                        .unwrap_or(Decimal::ZERO)
+            });
+        let vector = [
+            SettlementPayout {
+                token_id: tokens[0].into(),
+                payout: first,
+            },
+            SettlementPayout {
+                token_id: tokens[1].into(),
+                payout: Decimal::ONE - first,
+            },
+        ];
+        let response = if platform == "polymarket" {
+            json!({"condition_id":market,"tokens":[{"token_id":tokens[0],"winner":true,"price":first.to_string()},{"token_id":tokens[1],"winner":false,"price":(Decimal::ONE-first).to_string()}]})
+        } else {
+            json!({"request_outcome":516,"settleFraction":first.to_string()})
+        };
+        store
+            .save_platform_settlement_result(id, platform, market, "fixture", &vector, &response)
+            .await?;
+    }
+    // These fixtures explicitly model fully verified trades and a zero actual settlement fee.
+    sqlx::query("UPDATE legs SET wallet_address='fixture-wallet',submitted_at=COALESCE(submitted_at,NOW()),third_order_id=id::text WHERE order_id=$1 AND platform='outcome'").bind(id).execute(&store.pool).await?;
+    sqlx::query("INSERT INTO fills(leg_id,third_order_id,trade_id,shares,price,fee,raw) SELECT id,id::text,id::text,actual_shares,actual_price,actual_fee,'{}'::jsonb FROM legs WHERE order_id=$1 AND platform='outcome' AND actual_shares>0 ON CONFLICT DO NOTHING").bind(id).execute(&store.pool).await?;
+    for key in store.settlement_fee_keys_for_order(id, "fixture").await? {
+        let snapshot = store.prepare_settlement_fee_group(&key).await?;
+        let qty: Decimal = snapshot
+            .legs
+            .iter()
+            .map(|r| {
+                if r.leg.side == "SELL" {
+                    -r.actual_shares.unwrap()
+                } else {
+                    r.actual_shares.unwrap()
+                }
+            })
+            .sum();
+        let payout = *payouts.get(&("outcome".into(), key.token.clone())).unwrap();
+        let events = [FeeEvent {
+            tid: format!("fixture-{id}-{}", key.token),
+            quantity: qty,
+            payout,
+            fee: Decimal::ZERO,
+            fee_token: "USDC".into(),
+            evidence: json!({"fixture":true}),
+        }];
+        let _: &GroupKey = &key;
+        store
+            .commit_settlement_fee_group(
+                &snapshot,
+                payout,
+                &events,
+                &json!({"ownership_verified":true,"transfers_checked":true}),
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 async fn order_snapshot(pool: &PgPool, order_id: i64) -> Result<Value> {
@@ -398,6 +495,10 @@ async fn outcome_final_probe_is_fresh_and_retains_observed_fills_atomically() {
         ensure!(fill_snapshots(&store.pool,leg_id).await?.len()==1);
         ensure!(order_snapshot(&store.pool,order_id).await?["status"]=="completed");
         ensure!(store.open_legs().await?.is_empty());
+        let projection:Value=sqlx::query_scalar("SELECT actuals_projection FROM arb_orders WHERE id=$1").bind(order_id).fetch_one(&store.pool).await?;
+        ensure!(projection["status"]=="unknown" && projection["stale"]==true);
+        ensure!(store.refresh_order_actuals(order_id).await?.actuals().is_none());
+        ensure!(store.sum_actual_profit().await?.1==1);
         Ok(())
     }.await;
     fixture
@@ -2824,13 +2925,13 @@ async fn settlement_pending_is_durable_blocks_claim_and_can_finalize() {
                 Decimal::new(5, 1),
             ),
         ]);
+        seed_settlement_results(&fixture.store, fixture.order_id, &payouts).await?;
         let finalized = fixture
             .store
             .finalize_position_settlement(
                 fixture.order_id,
                 "polymarket+outcome",
                 &json!({"both": "settled"}),
-                &payouts,
             )
             .await?;
         let after: (String, Option<chrono::DateTime<chrono::Utc>>, Option<Value>) = sqlx::query_as(
@@ -2915,13 +3016,13 @@ async fn settlement_finalization_is_atomic_and_idempotent() {
             ),
             (("outcome".to_string(), "#5161".to_string()), Decimal::ONE),
         ]);
+        seed_settlement_results(&fixture.store, fixture.order_id, &payouts).await?;
         let first = fixture
             .store
             .finalize_position_settlement(
                 fixture.order_id,
                 "polymarket+outcome",
                 &json!({"both": "settled"}),
-                &payouts,
             )
             .await?;
         let second = fixture
@@ -2930,7 +3031,6 @@ async fn settlement_finalization_is_atomic_and_idempotent() {
                 fixture.order_id,
                 "polymarket+outcome",
                 &json!({"both": "settled"}),
-                &payouts,
             )
             .await?;
         let row = sqlx::query(
@@ -3020,14 +3120,9 @@ async fn settlement_finalization_errors_preserve_state_and_can_retry() {
                         fixture.order_id,
                         "polymarket+outcome",
                         &final_evidence,
-                        &payouts,
                     )
                     .await;
-                let expected_error = if negative {
-                    "negative settled position for outcome:#5160"
-                } else {
-                    "missing settlement payout for outcome:#5160"
-                };
+                let expected_error = "both durable platform results required";
                 ensure!(
                     matches!(&rejected, Err(err) if err.to_string().contains(expected_error)),
                     "expected {expected_error}, got {rejected:?}"
@@ -3046,13 +3141,13 @@ async fn settlement_finalization_errors_preserve_state_and_can_retry() {
                 } else {
                     payouts.insert(payout_key, Decimal::new(5, 1));
                 }
+                seed_settlement_results(&fixture.store, fixture.order_id, &payouts).await?;
                 let finalized = fixture
                     .store
                     .finalize_position_settlement(
                         fixture.order_id,
                         "polymarket+outcome",
                         &final_evidence,
-                        &payouts,
                     )
                     .await?;
                 let after = order_snapshot(&fixture.store.pool, fixture.order_id).await?;
@@ -3062,7 +3157,6 @@ async fn settlement_finalization_errors_preserve_state_and_can_retry() {
                         fixture.order_id,
                         "polymarket+outcome",
                         &json!({"retry": "must not replace evidence"}),
-                        &payouts,
                     )
                     .await?;
                 let after_repeat = order_snapshot(&fixture.store.pool, fixture.order_id).await?;
@@ -3235,15 +3329,12 @@ async fn closing_after_rebalance_sell_refreshes_actuals_and_completes_rebalance(
         .bind(fixture.order_id)
         .execute(&fixture.store.pool)
         .await?;
-        fixture
-            .store
-            .update_actuals(
-                fixture.order_id,
-                Decimal::from(4),
-                Decimal::ZERO,
-                Decimal::from(-4),
-            )
-            .await?;
+        sqlx::query(
+            "UPDATE arb_orders SET actual_cost=4,actual_rev=0,actual_profit=-4 WHERE id=$1",
+        )
+        .bind(fixture.order_id)
+        .execute(&fixture.store.pool)
+        .await?;
         fixture
             .store
             .mark_rebalance(fixture.order_id, "actived")

@@ -422,31 +422,60 @@ impl PolymarketVenue {
         Ok(units / Decimal::from(1_000_000))
     }
 
+    pub fn settlement_endpoint(&self) -> &str {
+        &self.base
+    }
+
     pub async fn settlement(
         &self,
         condition_id: &str,
     ) -> Result<crate::settlement::SettlementStatus> {
+        Ok(self.settlement_with_evidence(condition_id).await?.0)
+    }
+
+    pub async fn settlement_with_evidence(
+        &self,
+        condition_id: &str,
+    ) -> Result<(crate::settlement::SettlementStatus, Value)> {
         if condition_id.is_empty() {
             return Err(Error::msg("missing polymarket condition_id"));
         }
         let started = Instant::now();
+        let transport_error = |error: reqwest::Error| {
+            tracing::warn!(service="polymarket",api="markets",condition_id,http_status=?error.status().map(|s|s.as_u16()),elapsed_ms=started.elapsed().as_millis() as u64,error=%error.without_url(),"settlement query failed");
+            Error::msg("polymarket settlement HTTP/response failure")
+        };
         let value: Value = self
             .http
             .get(format!("{}/markets/{condition_id}", self.base))
             .send()
-            .await?
-            .error_for_status()?
+            .await
+            .map_err(&transport_error)?
+            .error_for_status()
+            .map_err(&transport_error)?
             .json()
-            .await?;
-        let status = crate::settlement::parse_polymarket_settlement(&value)?;
-        tracing::info!(
+            .await
+            .map_err(&transport_error)?;
+        if value.get("condition_id").and_then(Value::as_str) != Some(condition_id) {
+            return Err(Error::msg(
+                "polymarket settlement condition identity mismatch or missing",
+            ));
+        }
+        let status = crate::settlement::parse_polymarket_settlement(&value).map_err(|error| {
+            tracing::warn!(service="polymarket",api="markets",condition_id,elapsed_ms=started.elapsed().as_millis() as u64,error=%error,"invalid settlement response"); error
+        })?;
+        tracing::debug!(
             service = "polymarket",
             condition_id,
             settlement_state = status.kind(),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "settlement queried"
         );
-        Ok(status)
+        let tokens: Vec<Value> = value["tokens"].as_array().unwrap().iter().map(|t| json!({"token_id":t.get("token_id"),"winner":t.get("winner"),"price":t.get("price"),"outcome":t.get("outcome")})).collect();
+        Ok((
+            status,
+            json!({"condition_id":value.get("condition_id"),"tokens":tokens,"closed":value.get("closed"),"accepting_orders":value.get("accepting_orders"),"enable_order_book":value.get("enable_order_book")}),
+        ))
     }
 
     /// 保存当前市场费率快照，不宣称该费率是历史成交时的实扣费率。
