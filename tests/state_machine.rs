@@ -639,7 +639,8 @@ async fn reconciliation_pm_empty_missing_scan_preserves_other_venue_position() {
                     if shares.is_zero() && price.is_zero() && fee.is_zero()));
             let terminal = leg_snapshot(&store.pool, pm.id).await?;
             ensure!(terminal["status"] == "failed" && terminal["last_order_info"]["waiting_reason"].is_null());
-            ensure!(terminal["last_order_info"]["fill_evidence"]["pm_scan"]["trade_ids"] == json!([]));
+            ensure!(terminal["last_order_info"]["fill_progress"]["trade_ids"] == json!([]));
+            ensure!(terminal["last_order_info"].get("fill_evidence").is_none());
             let parent = order_snapshot(&store.pool, parent_id).await?;
             ensure!(parent["status"] == "completed" && parent["actual_cost"] == json!(3.6));
             let positions = store.positions_for_order(parent_id).await?;
@@ -744,7 +745,7 @@ async fn reconciliation_pm_missing_order_pages_reload_with_fixed_window_and_exac
             ensure!(terminal["actual_fee"] == json!(if all_failed { 0.0 } else { 0.02 }));
             ensure!(terminal["submitted_at"] == leg_before["submitted_at"]);
             ensure!(terminal["last_order_info"]["fill_progress"] == complete_progress);
-            ensure!(terminal["last_order_info"]["fill_evidence"]["pm_scan"] == complete_progress);
+            ensure!(terminal["last_order_info"].get("fill_evidence").is_none());
             ensure!(fills.len() == 2 && fills.iter().all(|fill| fill["third_order_id"] == oid));
             ensure!(fills[0]["raw"]["reconciliation_v1"]["finality"] == if all_failed { "failed" } else { "confirmed" });
             ensure!(fills[1]["raw"]["reconciliation_v1"]["finality"] == "failed");
@@ -865,9 +866,8 @@ async fn reconciliation_pm_known_execution_survives_weaker_polls_missing_orders_
                     ensure!(saved["actual_shares"].is_null() && saved["actual_fee"].is_null());
                     ensure!(saved["last_order_info"]["pm_order_constraints"] == constraints);
                     ensure!(
-                        saved["last_order_info"]["fill_evidence"]["pm_order_constraints"]
-                            == constraints,
-                        "caller None was persisted instead of lock-derived evidence"
+                        saved["last_order_info"].get("fill_evidence").is_none(),
+                        "fill_evidence layer should be omitted"
                     );
                     ensure!(order_snapshot(&store.pool, order_id).await? == parent_before);
                     ensure!(fill_snapshots(&store.pool, id).await?.len() == 1);
@@ -1609,7 +1609,7 @@ async fn reconciliation_pm_hash_fills_lock_identity_and_reject_inconsistent_scan
             let current = reconciliation_open_leg(store, current.id).await?;
             ensure!(current.third_order_id == current.client_order_id);
             let info = current.last_order_info.as_ref().unwrap();
-            ensure!(info["fill_progress"].is_object() && info["fill_evidence"].is_object());
+            ensure!(info["fill_progress"].is_object() && info.get("fill_evidence").is_none());
             ensure!(info["pm_order_constraints"]["order_id"] == current.client_order_id.as_deref().unwrap());
             ensure!(info["pm_order_constraints"]["associated_trade_ids"] == json!([]));
             ensure!(info["pm_order_constraints"]["matched_shares_lower_bound"] == serde_json::to_value(Decimal::ZERO)?);
@@ -1643,7 +1643,7 @@ async fn reconciliation_pm_hash_fills_lock_identity_and_reject_inconsistent_scan
             let info = recovered.last_order_info.as_ref().unwrap();
             ensure!(
                 info.get("fill_progress") == Some(&Value::Null)
-                    && info.get("fill_evidence") == Some(&Value::Null),
+                    && info.get("fill_evidence").is_none_or(Value::is_null),
                 "identity recovery retained the old hash scan"
             );
             if via_ack {
@@ -1918,7 +1918,7 @@ async fn reconciliation_pm_stale_and_parent_sql_failure_roll_back_constraint_gro
         let info = &terminal["last_order_info"];
         ensure!(info["pm_order_constraints"]["associated_trade_ids"] == json!(["a","b"]));
         ensure!(info["pm_order_constraints"]["matched_shares_lower_bound"] == serde_json::to_value(Decimal::from(10))?);
-        ensure!(info["fill_evidence"]["pm_order_constraints"] == info["pm_order_constraints"]);
+        ensure!(info.get("fill_evidence").is_none());
         ensure!(info["fill_progress"] == progress && info["order_poll"] == leg_before["last_order_info"]["order_poll"]);
         ensure!(terminal["submitted_at"] == leg_before["submitted_at"]);
         ensure!(fill_snapshots(&store.pool, id).await?.len() == 2);

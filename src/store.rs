@@ -581,7 +581,9 @@ impl Store {
         {
             // 尚无成交时允许恢复远端 oid，但旧候选订单的窗口进度不能沿用。
             info["fill_progress"] = Value::Null;
-            info["fill_evidence"] = Value::Null;
+            if let Some(obj) = info.as_object_mut() {
+                obj.remove("fill_evidence");
+            }
         }
         if let Some(constraints) = known_constraints {
             info["pm_order_constraints"] =
@@ -699,8 +701,10 @@ impl Store {
                 .is_some_and(|(known, incoming)| known != incoming)
         {
             info["fill_progress"] = Value::Null;
-            info["fill_evidence"] = Value::Null;
             info["pm_order_constraints"] = Value::Null;
+            if let Some(obj) = info.as_object_mut() {
+                obj.remove("fill_evidence");
+            }
         }
         if current.platform == POLYMARKET {
             if let Some(oid) = poll
@@ -920,7 +924,12 @@ impl Store {
             info["pm_order_constraints"] = serde_json::to_value(constraints)?;
         }
         info["fill_progress"] = progress.clone();
-        info["fill_evidence"] = serde_json::to_value(&effective)?;
+        if info.get("order_poll").is_none() || info["order_poll"].is_null() {
+            info["order_poll"] = serde_json::to_value(&effective.poll)?;
+        }
+        if let Some(obj) = info.as_object_mut() {
+            obj.remove("fill_evidence");
+        }
         match &resolution {
             LegResolution::Pending(reason) => {
                 info["waiting_reason"] = serde_json::json!(reason);
