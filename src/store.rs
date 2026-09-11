@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub mod actuals;
+mod lifecycle_risk;
 pub mod settlement_fees;
 pub mod settlement_results;
 
@@ -764,6 +765,10 @@ impl Store {
             info["outcome_terminal_observed_at_ms"] =
                 serde_json::json!(chrono::Utc::now().timestamp_millis());
         }
+        let before = leg_actuals_evidence(&mut tx, leg.id).await?;
+        let safe = lifecycle_risk::poll_safe(poll);
+        info["risk_execution_safe"] =
+            json!(safe && info.get("risk_execution_safe").is_none_or(|v| v == true));
         info["order_poll"] = serde_json::to_value(poll)?;
         sqlx::query(
             "UPDATE legs SET third_order_id = COALESCE($2,third_order_id),
@@ -777,7 +782,7 @@ impl Store {
         .execute(&mut *tx)
         .await?;
         let updated = read_locked_leg(&mut tx, leg.id).await?;
-        if current.status != updated.status {
+        if before != leg_actuals_evidence(&mut tx, leg.id).await? {
             refresh_parent_in_tx(&mut tx, current.order_id, resolver, true).await?;
         }
         tx.commit().await?;
@@ -974,6 +979,9 @@ impl Store {
         if let Some(constraints) = &effective.pm_order_constraints {
             info["pm_order_constraints"] = serde_json::to_value(constraints)?;
         }
+        let safe = lifecycle_risk::reconciliation_safe(&current.platform, &fills, &effective);
+        info["risk_execution_safe"] =
+            json!(safe && info.get("risk_execution_safe").is_none_or(|v| v == true));
         info["fill_progress"] = progress.clone();
         if info.get("order_poll").is_none() || info["order_poll"].is_null() {
             info["order_poll"] = serde_json::to_value(&effective.poll)?;
@@ -1162,10 +1170,17 @@ impl Store {
     pub async fn try_claim_lifecycle(&self, order_id: i64, action: &str) -> Result<Option<Uuid>> {
         validate_lifecycle_action(action)?;
         let claim_id = Uuid::new_v4();
+        let mut tx = self.pool.begin().await?;
+        settlement_fees::lock_writes(&mut tx).await?;
+        // Lock parent in a separate statement before taking the child snapshot.
+        sqlx::query("SELECT id FROM arb_orders WHERE id=$1 FOR UPDATE")
+            .bind(order_id)
+            .execute(&mut *tx)
+            .await?;
         let claimed: Option<Uuid> = sqlx::query_scalar(
             "UPDATE arb_orders
              SET lifecycle_action = $2, lifecycle_claim_id = $3,
-                 lifecycle_claimed_at = NOW(), updated_at = NOW()
+                 lifecycle_claimed_at = clock_timestamp(), updated_at = NOW()
              WHERE id = $1
                AND position_status = 'watching'
                AND lifecycle_action IS NULL
@@ -1177,8 +1192,24 @@ impl Store {
         .bind(order_id)
         .bind(action)
         .bind(claim_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        if claimed.is_some() {
+            let (cost, rev, profit, evidence, at): (Option<Decimal>, Option<Decimal>, Option<Decimal>, Value, chrono::DateTime<chrono::Utc>) = sqlx::query_as("SELECT actual_cost,actual_rev,actual_profit,actuals_projection,lifecycle_claimed_at FROM arb_orders WHERE id=$1")
+                .bind(order_id).fetch_one(&mut *tx).await?;
+            let legs = risk_legs_in_tx(&mut tx, order_id).await?;
+            let baseline = lifecycle_risk::Baseline::capture(
+                claim_id,
+                action,
+                at,
+                (cost, rev, profit),
+                evidence,
+                legs,
+            );
+            sqlx::query("UPDATE arb_orders SET actuals_projection=(actuals_projection-'lifecycle_risk') || CASE WHEN $2::jsonb IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('lifecycle_risk',$2::jsonb) END WHERE id=$1")
+                .bind(order_id).bind(baseline.map(serde_json::to_value).transpose()?).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
         Ok(claimed)
     }
 
@@ -1208,7 +1239,8 @@ impl Store {
         let result = sqlx::query(
             "UPDATE arb_orders
              SET position_status = CASE WHEN settlement_pending_since IS NOT NULL THEN 'settlement_pending' ELSE 'watching' END, lifecycle_action = NULL,
-                 lifecycle_claim_id = NULL, lifecycle_claimed_at = NULL, updated_at = NOW()
+                 lifecycle_claim_id = NULL, lifecycle_claimed_at = NULL,
+                 actuals_projection=actuals_projection-'lifecycle_risk', updated_at = NOW()
              WHERE id = $1 AND settled_at IS NULL
                AND lifecycle_action = $2 AND lifecycle_claim_id = $3",
         )
@@ -1727,13 +1759,72 @@ impl Store {
     }
 
     pub async fn sum_actual_profit(&self) -> Result<(Decimal, i64)> {
-        Ok(sqlx::query_as(r#"SELECT COALESCE(SUM(actual_profit),0),COUNT(*) FILTER (
-            WHERE settled_at IS NULL AND position_status NOT IN ('settled','closed') AND (
-                COALESCE(actuals_projection->>'status','unknown') NOT IN ('estimated','not_applicable')
-                OR actuals_projection->'version' IS DISTINCT FROM '1'::jsonb
-                OR actuals_projection->'stale' IS DISTINCT FROM 'false'::jsonb
-            )) FROM arb_orders"#)
-            .fetch_one(&self.pool).await?)
+        self.sum_actual_profit_with_timeouts(Duration::ZERO, Duration::ZERO)
+            .await
+    }
+
+    pub async fn sum_actual_profit_with_timeouts(
+        &self,
+        pending: Duration,
+        submitted: Duration,
+    ) -> Result<(Decimal, i64)> {
+        // One statement/snapshot. Only active target claims with incomplete valuations
+        // leave PostgreSQL; no topic-time leg scans or unsafe JSON numeric casts.
+        let (mut sum, mut unknown, candidates, now): (Decimal, i64, Value, chrono::DateTime<chrono::Utc>) = sqlx::query_as(r#"
+            WITH classified AS MATERIALIZED (
+                SELECT *, settled_at IS NULL AND position_status NOT IN ('settled','closed') AND (
+                    COALESCE(actuals_projection->>'status','unknown') NOT IN ('estimated','not_applicable')
+                    OR actuals_projection->'version' IS DISTINCT FROM '1'::jsonb
+                    OR actuals_projection->'stale' IS DISTINCT FROM 'false'::jsonb
+                ) AS unresolved FROM arb_orders
+            ), selected AS (
+                SELECT *, unresolved AND position_status='watching'
+                    AND lifecycle_action IN ('take_profit','rebalance')
+                    AND lifecycle_claim_id IS NOT NULL AND lifecycle_claimed_at IS NOT NULL
+                    AND actuals_projection->>'status'='unknown' AS candidate FROM classified
+            )
+            SELECT COALESCE(SUM(actual_profit) FILTER(WHERE NOT COALESCE(candidate,false)),0),
+                COUNT(*) FILTER(WHERE unresolved AND NOT COALESCE(candidate,false)),
+                COALESCE(jsonb_agg(jsonb_build_object('claim_id',lifecycle_claim_id,
+                    'action',lifecycle_action,'claimed_at',lifecycle_claimed_at,'current_profit',actual_profit::text,
+                    'baseline',actuals_projection->'lifecycle_risk')) FILTER(WHERE candidate),'[]'::jsonb),
+                statement_timestamp() FROM selected"#).fetch_one(&self.pool).await?;
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Candidate {
+            claim_id: Uuid,
+            action: String,
+            claimed_at: chrono::DateTime<chrono::Utc>,
+            baseline: Value,
+            current_profit: Option<Decimal>,
+        }
+        for value in candidates
+            .as_array()
+            .ok_or_else(|| Error::msg("invalid risk candidate aggregate"))?
+        {
+            let candidate = serde_json::from_value::<Candidate>(value.clone())?;
+            let profit = Some(&candidate).and_then(|c| {
+                lifecycle_risk::parse(&c.baseline)?.profit_at(
+                    c.claim_id,
+                    &c.action,
+                    c.claimed_at,
+                    now,
+                    pending,
+                    submitted,
+                )
+            });
+            if let Some(profit) = profit {
+                sum = sum
+                    .checked_add(profit)
+                    .ok_or_else(|| Error::msg("risk profit sum overflow"))?;
+            } else {
+                unknown += 1;
+                sum = sum
+                    .checked_add(candidate.current_profit.unwrap_or(Decimal::ZERO))
+                    .ok_or_else(|| Error::msg("risk profit sum overflow"))?;
+            }
+        }
+        Ok((sum, unknown))
     }
 
     pub async fn count_stale_unknown_legs(&self, timeout: Duration) -> Result<i64> {
@@ -1912,7 +2003,7 @@ async fn leg_actuals_evidence(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     leg_id: i64,
 ) -> Result<Value> {
-    Ok(sqlx::query_scalar("SELECT jsonb_build_array(status,actual_shares,actual_price,actual_fee,submitted_at,last_order_info->'fee_estimate') FROM legs WHERE id=$1")
+    Ok(sqlx::query_scalar("SELECT jsonb_build_array(status,actual_shares,actual_price,actual_fee,submitted_at,created_at,lifecycle_claim_id,intent,platform,token_id,label,side,wallet_address,funder_address,req_shares,req_price,req_fee,last_order_info->'fee_estimate',COALESCE(last_order_info->'risk_execution_safe','true'::jsonb)) FROM legs WHERE id=$1")
         .bind(leg_id).fetch_one(&mut **tx).await?)
 }
 
@@ -1928,6 +2019,31 @@ async fn read_locked_leg(
     .bind(leg_id)
     .fetch_one(&mut **tx)
     .await?)
+}
+
+async fn risk_legs_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    order_id: i64,
+) -> Result<Vec<lifecycle_risk::Leg>> {
+    let rows: Vec<Value> = sqlx::query_scalar(r#"SELECT jsonb_build_object(
+        'valuation',jsonb_build_object('id',l.id,'status',l.status,'side',l.side,'platform',l.platform,
+            'label',l.label,'token_id',l.token_id,'wallet_address',l.wallet_address,
+            'submitted_at',l.submitted_at,'last_order_info',CASE WHEN l.last_order_info IS NULL THEN NULL
+                WHEN jsonb_typeof(l.last_order_info)='object' THEN CASE WHEN l.last_order_info ? 'fee_estimate' THEN jsonb_build_object('fee_estimate',l.last_order_info->'fee_estimate') ELSE '{}'::jsonb END
+                ELSE l.last_order_info END,
+            'actual_shares',l.actual_shares::text,'actual_price',l.actual_price::text,'actual_fee',l.actual_fee::text),
+        'claim_id',l.lifecycle_claim_id,'intent',l.intent,'created_at',l.created_at,'funder',l.funder_address,
+        'req_shares',COALESCE(l.req_shares,-1)::text,'req_price',COALESCE(l.req_price,-1)::text,'req_fee',COALESCE(l.req_fee,-1)::text,
+        'execution_safe',COALESCE(l.last_order_info->'risk_execution_safe','true'::jsonb)='true'::jsonb,
+        'observations',COALESCE((SELECT jsonb_agg(jsonb_build_object('trade_id',f.trade_id,'order_id',f.third_order_id,
+            'shares',f.shares,'price',f.price,'fee',f.fee,'fee_rate_bps',f.fee_rate_bps,
+            'finality',f.raw->'reconciliation_v1'->'finality','accounting',f.raw->'accounting') ORDER BY f.id)
+            FROM fills f WHERE f.leg_id=l.id),'[]'::jsonb))
+        FROM legs l WHERE l.order_id=$1 ORDER BY l.id"#)
+        .bind(order_id).fetch_all(&mut **tx).await?;
+    rows.into_iter()
+        .map(|value| serde_json::from_value(value).map_err(Into::into))
+        .collect()
 }
 
 async fn project_in_tx_with_fallback(
@@ -1968,8 +2084,24 @@ async fn project_in_tx_with_fallback(
         .collect();
     let projection = actuals::project_with_fallback(&rows, &fallback, chrono::Utc::now());
     let amounts = projection.actuals();
+    let mut evidence = projection.evidence();
+    if let Some(mut baseline) = lifecycle_risk::parse(&previous["lifecycle_risk"]) {
+        let (claim, action, at): (Option<Uuid>, Option<String>, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as("SELECT lifecycle_claim_id,lifecycle_action,lifecycle_claimed_at FROM arb_orders WHERE id=$1")
+            .bind(order_id).fetch_one(&mut **tx).await?;
+        let was_eligible = baseline.eligible();
+        baseline.refresh(
+            claim,
+            action.as_deref(),
+            at,
+            &risk_legs_in_tx(tx, order_id).await?,
+        );
+        if was_eligible != baseline.eligible() {
+            tracing::info!(order_id, action, claim_id=?claim, eligible=baseline.eligible(), "lifecycle temporary risk eligibility changed");
+        }
+        evidence["lifecycle_risk"] = serde_json::to_value(baseline)?;
+    }
     sqlx::query("UPDATE arb_orders SET actuals_projection=$2,actual_cost=COALESCE($3,actual_cost),actual_rev=COALESCE($4,actual_rev),actual_profit=COALESCE($5,actual_profit),updated_at=NOW() WHERE id=$1")
-        .bind(order_id).bind(projection.evidence()).bind(amounts.map(|a|a.0)).bind(amounts.map(|a|a.1)).bind(amounts.map(|a|a.2)).execute(&mut **tx).await?;
+        .bind(order_id).bind(evidence).bind(amounts.map(|a|a.0)).bind(amounts.map(|a|a.1)).bind(amounts.map(|a|a.2)).execute(&mut **tx).await?;
     if let actuals::Projection::Unknown { reason } = &projection {
         if actuals::unknown_changed(&previous, reason) {
             tracing::warn!(

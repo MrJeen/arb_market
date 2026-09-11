@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, str::FromStr};
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, sqlx::FromRow)]
 pub struct ProjectionLeg {
     pub id: i64,
     pub status: String,
@@ -82,6 +82,32 @@ fn snapshot(leg: &ProjectionLeg) -> Option<(Decimal, Decimal, Value)> {
         leg.last_order_info.as_ref()?.get("fee_estimate")?,
         &leg.token_id,
     )
+}
+
+pub(super) fn valid_existing_snapshot(leg: &ProjectionLeg) -> bool {
+    leg.platform != OUTCOME
+        || match &leg.last_order_info {
+            None => true,
+            Some(Value::Object(info)) => info
+                .get("fee_estimate")
+                .is_none_or(|value| parse_snapshot(value, &leg.token_id).is_some()),
+            _ => false,
+        }
+}
+
+pub(super) fn valid_pending_snapshot(leg: &ProjectionLeg) -> bool {
+    if leg.platform != OUTCOME {
+        return true;
+    }
+    leg.wallet_address
+        .as_ref()
+        .is_some_and(|w| !w.trim().is_empty())
+        && leg
+            .last_order_info
+            .as_ref()
+            .and_then(|v| v.get("fee_estimate"))
+            .and_then(|v| parse_snapshot(v, &leg.token_id))
+            .is_some()
 }
 
 fn parse_snapshot(v: &Value, token: &str) -> Option<(Decimal, Decimal, Value)> {

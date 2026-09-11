@@ -281,6 +281,57 @@ impl Fixture {
     }
 }
 
+#[tokio::test]
+#[ignore = "requires process APP_POSTGRES_URI; private schema only"]
+async fn lifecycle_risk_claim_sum_timeout_and_notification() -> Result<()> {
+    use market_arb::store::NewLeg;
+    use std::time::Duration;
+    let f = Fixture::new().await?.unwrap();
+    let exercised: Result<()> = async {
+        let s = &f.store;
+        let id:i64=sqlx::query_scalar("INSERT INTO arb_orders(event_id,unified_index,status) VALUES($1,0,'completed') RETURNING id").bind(Uuid::new_v4()).fetch_one(&s.pool).await?;
+        sqlx::query("INSERT INTO legs(order_id,platform,token_id,label,side,intent,funder_address,status,req_shares,req_price,req_fee,actual_shares,actual_price,actual_fee,submitted_at) VALUES($1,'polymarket','token','yes','BUY','arb_buy','funder','completed',10,0.5,0,10,0.5,0,NOW())").bind(id).execute(&s.pool).await?;
+        let before=s.refresh_order_actuals(id).await?.actuals().unwrap();
+        let (a,b)=tokio::join!(s.try_claim_lifecycle(id,"rebalance"),s.try_claim_lifecycle(id,"take_profit"));
+        let (a,b)=(a?,b?);ensure!(a.is_some()!=b.is_some());
+        let (claim,action)=if let Some(a)=a {(a,"rebalance")} else {(b.unwrap(),"take_profit")};
+        let new=NewLeg{platform:"polymarket",token_id:"token",label:"yes",side:"SELL",intent:action,funder:Some("funder"),wallet:None,service:None,req_price:dec("0.5"),req_shares:dec("1"),req_fee:Decimal::ZERO,client_order_id:None,fee_estimate:None};
+        let legs=s.insert_legs_atomic(&|_,_|None,id,action,claim,&[new]).await?;
+        sqlx::query("UPDATE arb_orders SET actual_cost=20,actual_rev=3,actual_profit=-17 WHERE id=$1").bind(id).execute(&s.pool).await?;
+        let risk=s.sum_actual_profit_with_timeouts(Duration::from_secs(300),Duration::from_secs(300)).await?;
+        ensure!(risk==(before.2,0));
+        ensure!(s.sum_actual_profit_with_timeouts(Duration::ZERO,Duration::ZERO).await?==(dec("-17"),1));
+        let evidence:Value=sqlx::query_scalar("SELECT actuals_projection FROM arb_orders WHERE id=$1").bind(id).fetch_one(&s.pool).await?;
+        ensure!(evidence["status"]=="unknown");
+        ensure!(!s.release_lifecycle(id,action,Uuid::new_v4()).await?);
+        ensure!(s.sum_actual_profit_with_timeouts(Duration::from_secs(300),Duration::from_secs(300)).await?==risk);
+        // Candidate JSON corruption must fail closed without a SQL cast or panic.
+        for bad in [json!(null),json!([]),json!({"version":"wrong"}),json!(true)] {
+            let mut corrupt=evidence.clone();corrupt["lifecycle_risk"]=bad;
+            sqlx::query("UPDATE arb_orders SET actuals_projection=$2 WHERE id=$1").bind(id).bind(corrupt).execute(&s.pool).await?;
+            ensure!(s.sum_actual_profit_with_timeouts(Duration::from_secs(300),Duration::from_secs(300)).await?.1==1);
+        }
+        sqlx::query("UPDATE arb_orders SET actuals_projection=$2 WHERE id=$1").bind(id).bind(&evidence).execute(&s.pool).await?;
+        let (released,amounts)=s.release_lifecycle_with_actuals(id,action,claim).await?;ensure!(released && amounts.is_none());
+        let stored:Value=sqlx::query_scalar("SELECT actuals_projection FROM arb_orders WHERE id=$1").bind(id).fetch_one(&s.pool).await?;ensure!(stored.get("lifecycle_risk").is_none());
+        ensure!(s.sum_actual_profit_with_timeouts(Duration::from_secs(300),Duration::from_secs(300)).await?==(dec("-17"),1));
+        let next=s.try_claim_lifecycle(id,action).await?.unwrap();
+        ensure!(s.sum_actual_profit_with_timeouts(Duration::from_secs(300),Duration::from_secs(300)).await?.1==1);
+        s.abort_unsubmitted_legs(&|_,_|None,&legs,"test cleanup").await?;
+        ensure!(s.release_lifecycle(id,action,next).await?);
+        // actual_cost has scale 8 while rev/profit retain the full product precision.
+        sqlx::query("UPDATE legs SET actual_shares=1.12345678,actual_price=0.12345678 WHERE order_id=$1 AND intent='arb_buy'").bind(id).execute(&s.pool).await?;
+        let precise=s.refresh_order_actuals(id).await?.actuals().unwrap();
+        ensure!(s.sum_actual_profit().await?==(precise.2,0));
+        let claim=s.try_claim_lifecycle(id,action).await?.unwrap();
+        ensure!(s.sum_actual_profit().await?==(precise.2,0));
+        ensure!(s.release_lifecycle(id,action,claim).await?);
+        Ok(())
+    }.await;
+    f.cleanup().await?;
+    exercised
+}
+
 async fn insert_order(store: &Store, quantity: Decimal) -> Result<i64> {
     let id: i64 = sqlx::query_scalar("INSERT INTO arb_orders(event_id,unified_index,status) VALUES($1,0,'completed') RETURNING id")
         .bind(Uuid::new_v4()).fetch_one(&store.pool).await?;
@@ -730,7 +781,7 @@ async fn claims_nonterminal_legs_and_changed_snapshots_block_group_commit() -> R
 fn event_actuals_have_no_periodic_or_wall_clock_expiry_path() {
     let store = include_str!("../src/store.rs");
     let query = store
-        .split("pub async fn sum_actual_profit")
+        .split("pub async fn sum_actual_profit_with_timeouts")
         .nth(1)
         .unwrap()
         .split("pub async fn count_stale_unknown_legs")

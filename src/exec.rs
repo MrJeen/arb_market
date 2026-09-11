@@ -160,7 +160,13 @@ impl Engine {
             return Ok(true);
         }
         if self.cfg.max_realized_loss > Decimal::ZERO {
-            let (pnl, unknown) = self.store.sum_actual_profit().await?;
+            let (pnl, unknown) = self
+                .store
+                .sum_actual_profit_with_timeouts(
+                    self.cfg.pending_leg_timeout,
+                    self.cfg.unknown_leg_timeout,
+                )
+                .await?;
             if unknown > 0 {
                 tracing::warn!(
                     topic,
