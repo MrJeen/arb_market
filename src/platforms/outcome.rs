@@ -225,6 +225,32 @@ impl OutcomeVenue {
             .get(outcome_id)
     }
 
+    /// Local cache only: historical wallets must not borrow the configured account's rates.
+    pub fn latest_actuals_fee(
+        &self,
+        wallet: &str,
+        token: &str,
+    ) -> Option<crate::store::actuals::LatestFee> {
+        if !self
+            .account_address()?
+            .trim()
+            .eq_ignore_ascii_case(wallet.trim())
+        {
+            return None;
+        }
+        let (outcome_id, side) = parse_side_coin(token)?;
+        if crate::domain::side_coin(outcome_id, side) != token {
+            return None;
+        }
+        let snapshot = self.fee_snapshot(outcome_id).ok()?;
+        Some(crate::store::actuals::LatestFee {
+            wallet: wallet.trim().to_ascii_lowercase(),
+            token: token.to_owned(),
+            valid_until: snapshot.valid_until()?,
+            snapshot: snapshot.estimate_json(),
+        })
+    }
+
     pub async fn refresh_fees(&self) -> Result<()> {
         self.fee_refreshing
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1389,6 +1415,26 @@ mod tests {
             assert_eq!(pair[0], json!({"type":"userFees","user":"0xtest"}));
             assert_eq!(pair[1], json!({"type":"outcomeMeta"}));
         }
+    }
+
+    #[test]
+    fn actuals_cache_resolver_rejects_foreign_wallet_and_noncanonical_token() {
+        let mut venue = test_venue();
+        venue.account = Some("0xTeSt".into());
+        assert!(venue.latest_actuals_fee("0xtest", "#5160").is_none());
+        venue.install_test_fee_snapshot(516, Decimal::ZERO, Decimal::ZERO);
+        assert!(venue.latest_actuals_fee(" 0xTEST ", "#5160").is_some());
+        for (wallet, token) in [
+            ("other", "#5160"),
+            ("0xtest", "#5170"),
+            ("0xtest", "+5160"),
+            ("0xtest", "#05160"),
+            ("0xtest", "#5162"),
+        ] {
+            assert!(venue.latest_actuals_fee(wallet, token).is_none());
+        }
+        venue.expire_test_fee_snapshot(516);
+        assert!(venue.latest_actuals_fee("0xtest", "#5160").is_none());
     }
 
     #[tokio::test]

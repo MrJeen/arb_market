@@ -152,6 +152,7 @@ impl Store {
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_actived_order_with_legs(
         &self,
+        resolver: &actuals::FeeResolver<'_>,
         key: TopicKey,
         market_identity: &MarketIdentity,
         title: &str,
@@ -291,7 +292,7 @@ impl Store {
             leg_ids.push(leg_id);
         }
         if !leg_ids.is_empty() {
-            project_in_tx(&mut tx, id).await?;
+            project_in_tx_with_fallback(&mut tx, id, resolver).await?;
         }
         tx.commit().await?;
         Ok((id, leg_ids))
@@ -375,6 +376,7 @@ impl Store {
     /// concurrent release/reclaim from crossing the ownership check and inserts.
     pub async fn insert_legs_atomic(
         &self,
+        resolver: &actuals::FeeResolver<'_>,
         order_id: i64,
         expected_action: &str,
         claim_id: Uuid,
@@ -431,7 +433,7 @@ impl Store {
             ids.push(id);
         }
         if !ids.is_empty() {
-            project_in_tx(&mut tx, order_id).await?;
+            project_in_tx_with_fallback(&mut tx, order_id, resolver).await?;
         }
         tx.commit().await?;
         Ok(ids)
@@ -439,12 +441,14 @@ impl Store {
 
     pub async fn insert_leg_for_claim(
         &self,
+        resolver: &actuals::FeeResolver<'_>,
         order_id: i64,
         expected_action: &str,
         claim_id: Uuid,
         leg: &NewLeg<'_>,
     ) -> Result<i64> {
         self.insert_legs_atomic(
+            resolver,
             order_id,
             expected_action,
             claim_id,
@@ -458,6 +462,7 @@ impl Store {
 
     pub async fn insert_envelope(
         &self,
+        resolver: &actuals::FeeResolver<'_>,
         leg_id: i64,
         order_hash: &str,
         envelope: &Value,
@@ -498,6 +503,7 @@ impl Store {
         .bind(client_id)
         .execute(&mut *tx)
         .await?;
+        refresh_parent_in_tx(&mut tx, current.order_id, resolver, true).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -505,19 +511,23 @@ impl Store {
     /// 网络提交的迟到响应只能增加审计证据，不能撤销已确认的成交。
     pub async fn record_submission(
         &self,
+        resolver: &actuals::FeeResolver<'_>,
         leg_id: i64,
         status: &str,
         order_id: Option<&str>,
         evidence: &Value,
         response: &Value,
     ) -> Result<()> {
-        self.record_submission_with_fill(leg_id, status, order_id, evidence, response, None)
-            .await
+        self.record_submission_with_fill(
+            resolver, leg_id, status, order_id, evidence, response, None,
+        )
+        .await
     }
 
     /// matched 响应是整单聚合成交；直接更新腿账务，不与已观察到的 trades 累加。
     pub(crate) async fn record_submission_with_fill(
         &self,
+        resolver: &actuals::FeeResolver<'_>,
         leg_id: i64,
         status: &str,
         order_id: Option<&str>,
@@ -528,6 +538,7 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         let (parent_id, parent_open) = lock_leg_parent(&mut tx, leg_id).await?;
         let current = read_locked_leg(&mut tx, leg_id).await?;
+        let before = leg_actuals_evidence(&mut tx, leg_id).await?;
         if let Some((shares, price, fee)) = matched_fill {
             if current.platform != POLYMARKET
                 || status != "matched"
@@ -631,7 +642,8 @@ impl Store {
             .bind(matched_fill.map(|fill| fill.1))
             .bind(matched_fill.map(|fill| fill.2))
             .execute(&mut *tx).await?;
-        refresh_parent_in_tx(&mut tx, parent_id).await?;
+        let changed = before != leg_actuals_evidence(&mut tx, leg_id).await?;
+        refresh_parent_in_tx(&mut tx, parent_id, resolver, changed).await?;
         tx.commit().await?;
         if let Some((shares, price, fee)) = matched_fill {
             tracing::info!(
@@ -646,6 +658,7 @@ impl Store {
     /// 查单恢复身份先落库；后续 HTTP 失败不会丢掉 oid。返回新快照用作回填的并发令牌。
     pub async fn record_order_poll(
         &self,
+        resolver: &actuals::FeeResolver<'_>,
         leg: &LegRow,
         poll: &OrderPoll,
     ) -> Result<Option<LegRow>> {
@@ -764,6 +777,9 @@ impl Store {
         .execute(&mut *tx)
         .await?;
         let updated = read_locked_leg(&mut tx, leg.id).await?;
+        if current.status != updated.status {
+            refresh_parent_in_tx(&mut tx, current.order_id, resolver, true).await?;
+        }
         tx.commit().await?;
         Ok(Some(updated))
     }
@@ -828,6 +844,7 @@ impl Store {
     /// 明细、分页进度、腿最终账务和父单完成在同一事务提交。
     pub async fn record_reconciliation(
         &self,
+        resolver: &actuals::FeeResolver<'_>,
         leg: &LegRow,
         observations: &[TradeFill],
         evidence: &FillEvidence,
@@ -836,6 +853,7 @@ impl Store {
         let mut tx = self.pool.begin().await?;
         let (parent_id, parent_open) = lock_leg_parent(&mut tx, leg.id).await?;
         let current = read_locked_leg(&mut tx, leg.id).await?;
+        let before = leg_actuals_evidence(&mut tx, leg.id).await?;
         if !parent_open || !leg_open(&current.status) || current.updated_at != leg.updated_at {
             tx.rollback().await?;
             return Ok(LegResolution::Pending("stale_leg_snapshot"));
@@ -872,6 +890,7 @@ impl Store {
                 }
             }
         }
+        let mut observations_changed = false;
         for incoming in observations {
             if incoming.trade_id.is_empty()
                 || incoming.trade_id.starts_with("ack:")
@@ -904,6 +923,21 @@ impl Store {
                 None
             };
             let raw = serde_json::json!({"reconciliation_v1": merged,"accounting":accounting});
+            // Trade raw payloads may contain changing diagnostics. Only execution and
+            // normalized accounting evidence can invalidate the event valuation.
+            observations_changed |= existing.as_ref().is_none_or(|old| {
+                [
+                    "shares",
+                    "price",
+                    "fee",
+                    "fee_rate_bps",
+                    "fee_token",
+                    "finality",
+                ]
+                .iter()
+                .any(|key| old["reconciliation_v1"][key] != raw["reconciliation_v1"][key])
+                    || old["accounting"] != raw["accounting"]
+            });
             sqlx::query(
                 "INSERT INTO fills(leg_id,third_order_id,trade_id,shares,price,fee,fee_rate_bps,raw)
                  VALUES($1,$2,$3,$4,$5,$6,$7,$8)
@@ -979,14 +1013,16 @@ impl Store {
                 .bind(info)
                 .execute(&mut *tx)
                 .await?;
-                refresh_parent_in_tx(&mut tx, parent_id).await?;
             }
         }
+        let changed =
+            observations_changed || before != leg_actuals_evidence(&mut tx, leg.id).await?;
+        refresh_parent_in_tx(&mut tx, parent_id, resolver, changed).await?;
         tx.commit().await?;
         Ok(resolution)
     }
 
-    pub async fn complete_orders(&self) -> Result<()> {
+    pub async fn complete_orders(&self, resolver: &actuals::FeeResolver<'_>) -> Result<()> {
         let ids: Vec<i64> =
             sqlx::query_scalar("SELECT id FROM arb_orders WHERE status='actived' ORDER BY id")
                 .fetch_all(&self.pool)
@@ -998,7 +1034,7 @@ impl Store {
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
-            refresh_parent_in_tx(&mut tx, id).await?;
+            refresh_parent_in_tx(&mut tx, id, resolver, false).await?;
             tx.commit().await?;
         }
         Ok(())
@@ -1105,17 +1141,21 @@ impl Store {
         Ok(positions)
     }
 
-    pub async fn mark_rebalance(&self, order_id: i64, status: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE arb_orders SET rebalance_status = $2, updated_at = NOW(),
-                    rebalanced_at = CASE WHEN $2 = 'completed' THEN NOW() ELSE rebalanced_at END
-             WHERE id = $1",
-        )
-        .bind(order_id)
-        .bind(status)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+    pub async fn mark_rebalance(
+        &self,
+        order_id: i64,
+        status: &str,
+    ) -> Result<Option<actuals::Projection>> {
+        let mut tx = self.pool.begin().await?;
+        let changed = sqlx::query("UPDATE arb_orders SET rebalance_status=$2,updated_at=NOW(),rebalanced_at=CASE WHEN $2='completed' THEN NOW() ELSE rebalanced_at END WHERE id=$1 AND settled_at IS NULL AND position_status='watching' AND rebalance_status IS DISTINCT FROM $2")
+            .bind(order_id).bind(status).execute(&mut *tx).await?.rows_affected() == 1;
+        let projection = if changed {
+            Some(stored_actuals_in_tx(&mut tx, order_id).await?)
+        } else {
+            None
+        };
+        tx.commit().await?;
+        Ok(projection)
     }
 
     /// Atomically reserves a lifecycle action across concurrent workers.
@@ -1150,7 +1190,21 @@ impl Store {
         action: &str,
         claim_id: Uuid,
     ) -> Result<bool> {
+        Ok(self
+            .release_lifecycle_with_actuals(order_id, action, claim_id)
+            .await?
+            .0)
+    }
+
+    /// Completion and notification evidence share the successful ownership transaction.
+    pub async fn release_lifecycle_with_actuals(
+        &self,
+        order_id: i64,
+        action: &str,
+        claim_id: Uuid,
+    ) -> Result<(bool, Option<(Decimal, Decimal, Decimal)>)> {
         validate_lifecycle_action(action)?;
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE arb_orders
              SET position_status = CASE WHEN settlement_pending_since IS NOT NULL THEN 'settlement_pending' ELSE 'watching' END, lifecycle_action = NULL,
@@ -1161,9 +1215,16 @@ impl Store {
         .bind(order_id)
         .bind(action)
         .bind(claim_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected() == 1)
+        let released = result.rows_affected() == 1;
+        let amounts = if released {
+            stored_actuals_in_tx(&mut tx, order_id).await?.actuals()
+        } else {
+            None
+        };
+        tx.commit().await?;
+        Ok((released, amounts))
     }
 
     /// Stops all lifecycle trading after the first venue confirms settlement.
@@ -1559,35 +1620,60 @@ impl Store {
     }
 
     /// 最终准入失效只终止本次尚未签名/发送的腿，不能改变已有提交证据。
-    pub async fn abort_unsubmitted_legs(&self, leg_ids: &[i64], reason: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE legs SET status = 'failed', updated_at = clock_timestamp(),
-                    last_order_info = COALESCE(last_order_info, '{}'::jsonb)
-                        || jsonb_build_object('reason', $2::text)
-             WHERE id = ANY($1) AND status = 'pending' AND submitted_at IS NULL
-               AND NOT EXISTS (SELECT 1 FROM signed_envelopes e WHERE e.leg_id = legs.id)",
-        )
-        .bind(leg_ids)
-        .bind(reason)
-        .execute(&self.pool)
-        .await?;
+    pub async fn abort_unsubmitted_legs(
+        &self,
+        resolver: &actuals::FeeResolver<'_>,
+        leg_ids: &[i64],
+        reason: &str,
+    ) -> Result<()> {
+        // Preserve group cancellation atomicity and acquire parent locks in a stable order.
+        let mut tx = self.pool.begin().await?;
+        let ids: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM legs WHERE id=ANY($1) ORDER BY order_id,id")
+                .bind(leg_ids)
+                .fetch_all(&mut *tx)
+                .await?;
+        let mut changed_parents = std::collections::BTreeSet::new();
+        for leg_id in ids {
+            let (parent_id, open) = lock_leg_parent(&mut tx, leg_id).await?;
+            if open {
+                let changed = sqlx::query("UPDATE legs SET status='failed', actual_shares=0,actual_price=0,actual_fee=0,updated_at=clock_timestamp(),last_order_info=COALESCE(last_order_info,'{}'::jsonb)||jsonb_build_object('reason',$2::text) WHERE id=$1 AND status='pending' AND submitted_at IS NULL AND NOT EXISTS(SELECT 1 FROM signed_envelopes WHERE leg_id=$1)")
+                    .bind(leg_id).bind(reason).execute(&mut *tx).await?.rows_affected() == 1;
+                if changed {
+                    changed_parents.insert(parent_id);
+                }
+            }
+        }
+        for parent_id in changed_parents {
+            refresh_parent_in_tx(&mut tx, parent_id, resolver, true).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
-    pub async fn fail_stale_pending_unsubmitted(&self, timeout: Duration) -> Result<u64> {
+    pub async fn fail_stale_pending_unsubmitted(
+        &self,
+        resolver: &actuals::FeeResolver<'_>,
+        timeout: Duration,
+    ) -> Result<u64> {
         let secs = timeout.as_secs() as i64;
-        let result = sqlx::query(
-            "UPDATE legs SET status = 'failed', updated_at = NOW(),
-                    last_order_info = COALESCE(last_order_info, '{}'::jsonb)
-                        || jsonb_build_object('reason','pending_timeout_unsubmitted')
-             WHERE status = 'pending'
-               AND submitted_at IS NULL
-               AND created_at < NOW() - make_interval(secs => $1)",
-        )
-        .bind(secs)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM legs WHERE status='pending' AND submitted_at IS NULL AND created_at < NOW()-make_interval(secs=>$1) ORDER BY order_id,id")
+            .bind(secs).fetch_all(&self.pool).await?;
+        let mut count = 0;
+        for id in ids {
+            let mut tx = self.pool.begin().await?;
+            let (parent_id, open) = lock_leg_parent(&mut tx, id).await?;
+            if open {
+                let changed = sqlx::query("UPDATE legs SET status='failed',actual_shares=0,actual_price=0,actual_fee=0,updated_at=clock_timestamp(),last_order_info=COALESCE(last_order_info,'{}'::jsonb)||jsonb_build_object('reason','pending_timeout_unsubmitted') WHERE id=$1 AND status='pending' AND submitted_at IS NULL AND created_at < NOW()-make_interval(secs=>$2) AND NOT EXISTS(SELECT 1 FROM signed_envelopes WHERE leg_id=$1)")
+                    .bind(id).bind(secs).execute(&mut *tx).await?.rows_affected();
+                if changed == 1 {
+                    refresh_parent_in_tx(&mut tx, parent_id, resolver, true).await?;
+                    count += 1;
+                }
+            }
+            tx.commit().await?;
+        }
+        Ok(count)
     }
 
     /// 提交不明和已受理但未确认的腿均按首次提交时间告警。
@@ -1607,17 +1693,27 @@ impl Store {
         Ok(rows)
     }
 
-    pub async fn promote_submitted_pending_to_unknown(&self) -> Result<u64> {
-        let result = sqlx::query(
-            "UPDATE legs SET status = 'unknown', updated_at = NOW(),
-                    last_order_info = COALESCE(last_order_info, '{}'::jsonb)
-                        || jsonb_build_object('reason','pending_after_submit')
-             WHERE status = 'pending'
-               AND submitted_at IS NOT NULL",
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
+    pub async fn promote_submitted_pending_to_unknown(
+        &self,
+        resolver: &actuals::FeeResolver<'_>,
+    ) -> Result<u64> {
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM legs WHERE status='pending' AND submitted_at IS NOT NULL ORDER BY order_id,id")
+            .fetch_all(&self.pool).await?;
+        let mut count = 0;
+        for id in ids {
+            let mut tx = self.pool.begin().await?;
+            let (parent_id, open) = lock_leg_parent(&mut tx, id).await?;
+            if open {
+                let changed = sqlx::query("UPDATE legs SET status='unknown',updated_at=clock_timestamp(),last_order_info=COALESCE(last_order_info,'{}'::jsonb)||jsonb_build_object('reason','pending_after_submit') WHERE id=$1 AND status='pending' AND submitted_at IS NOT NULL")
+                    .bind(id).execute(&mut *tx).await?.rows_affected();
+                if changed == 1 {
+                    refresh_parent_in_tx(&mut tx, parent_id, resolver, true).await?;
+                    count += 1;
+                }
+            }
+            tx.commit().await?;
+        }
+        Ok(count)
     }
 
     pub async fn count_active_orders(&self) -> Result<i64> {
@@ -1631,7 +1727,12 @@ impl Store {
     }
 
     pub async fn sum_actual_profit(&self) -> Result<(Decimal, i64)> {
-        Ok(sqlx::query_as("SELECT COALESCE(SUM(actual_profit),0),COUNT(*) FILTER (WHERE settled_at IS NULL AND position_status NOT IN ('settled','closed') AND (COALESCE(actuals_projection->>'status','unknown') NOT IN ('estimated','not_applicable') OR actuals_projection->'version' IS DISTINCT FROM '1'::jsonb OR actuals_projection->'stale' IS DISTINCT FROM 'false'::jsonb)) FROM arb_orders")
+        Ok(sqlx::query_as(r#"SELECT COALESCE(SUM(actual_profit),0),COUNT(*) FILTER (
+            WHERE settled_at IS NULL AND position_status NOT IN ('settled','closed') AND (
+                COALESCE(actuals_projection->>'status','unknown') NOT IN ('estimated','not_applicable')
+                OR actuals_projection->'version' IS DISTINCT FROM '1'::jsonb
+                OR actuals_projection->'stale' IS DISTINCT FROM 'false'::jsonb
+            )) FROM arb_orders"#)
             .fetch_one(&self.pool).await?)
     }
 
@@ -1685,26 +1786,24 @@ impl Store {
     }
 
     pub async fn refresh_order_actuals(&self, order_id: i64) -> Result<actuals::Projection> {
+        self.refresh_order_actuals_with_fallback(order_id, &|_, _| None)
+            .await
+    }
+
+    pub async fn refresh_order_actuals_with_fallback(
+        &self,
+        order_id: i64,
+        resolver: &actuals::FeeResolver<'_>,
+    ) -> Result<actuals::Projection> {
         let mut tx = self.pool.begin().await?;
         settlement_fees::lock_writes(&mut tx).await?;
         sqlx::query("SELECT id FROM arb_orders WHERE id=$1 FOR UPDATE")
             .bind(order_id)
             .execute(&mut *tx)
             .await?;
-        let projection = project_in_tx(&mut tx, order_id).await?;
+        let projection = project_in_tx_with_fallback(&mut tx, order_id, resolver).await?;
         tx.commit().await?;
         Ok(projection)
-    }
-
-    pub async fn refresh_actuals_batch(&self, after_id: i64, limit: i64) -> Result<i64> {
-        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM arb_orders WHERE id>$1 AND settled_at IS NULL AND position_status IN ('watching','settlement_pending') ORDER BY id LIMIT $2")
-            .bind(after_id).bind(limit.max(1)).fetch_all(&self.pool).await?;
-        for id in &ids {
-            if let Err(error) = self.refresh_order_actuals(*id).await {
-                tracing::warn!(order_id=id, error=%error, "actuals lazy refresh failed");
-            }
-        }
-        Ok(ids.last().copied().unwrap_or(0))
     }
 }
 
@@ -1753,15 +1852,20 @@ async fn lock_leg_parent(
     .bind(leg_id)
     .fetch_one(&mut **tx)
     .await?;
-    if !row.2 && matches!(row.1.as_str(), "watching" | "settlement_pending") {
-        sqlx::query("UPDATE arb_orders SET actuals_projection=jsonb_build_object('version',1,'status','unknown','basis','trade_update','stale',true,'reason','trade evidence changing','computed_at',NOW()) WHERE id=$1")
-            .bind(row.0).execute(&mut **tx).await?;
-    }
     // Pending stops new submissions, not reconciliation of already durable legs.
     Ok((
         row.0,
         !row.2 && matches!(row.1.as_str(), "watching" | "settlement_pending"),
     ))
+}
+
+// Compare only valuation inputs under the parent lock, never diagnostic/progress JSON.
+async fn leg_actuals_evidence(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    leg_id: i64,
+) -> Result<Value> {
+    Ok(sqlx::query_scalar("SELECT jsonb_build_array(status,actual_shares,actual_price,actual_fee,submitted_at,last_order_info->'fee_estimate') FROM legs WHERE id=$1")
+        .bind(leg_id).fetch_one(&mut **tx).await?)
 }
 
 async fn read_locked_leg(
@@ -1778,9 +1882,10 @@ async fn read_locked_leg(
     .await?)
 }
 
-async fn project_in_tx(
+async fn project_in_tx_with_fallback(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     order_id: i64,
+    resolver: &actuals::FeeResolver<'_>,
 ) -> Result<actuals::Projection> {
     let eligible: bool = sqlx::query_scalar("SELECT settled_at IS NULL AND position_status IN ('watching','settlement_pending') FROM arb_orders WHERE id=$1")
         .bind(order_id).fetch_one(&mut **tx).await?;
@@ -1796,7 +1901,24 @@ async fn project_in_tx(
             .bind(order_id)
             .fetch_one(&mut **tx)
             .await?;
-    let projection = actuals::project(&rows);
+    // The locked rows are authoritative. Resolve each identity at most once, using
+    // short synchronous cache reads only; projection receives immutable observations.
+    let identities: std::collections::BTreeSet<_> = rows
+        .iter()
+        .filter(|leg| {
+            leg.platform == OUTCOME && leg.actual_shares.is_some_and(|q| q > Decimal::ZERO)
+        })
+        .filter_map(|leg| {
+            leg.wallet_address
+                .as_ref()
+                .map(|wallet| (wallet.trim().to_ascii_lowercase(), leg.token_id.clone()))
+        })
+        .collect();
+    let fallback: actuals::FallbackContext = identities
+        .into_iter()
+        .filter_map(|(wallet, token)| resolver(&wallet, &token).map(|fee| ((wallet, token), fee)))
+        .collect();
+    let projection = actuals::project_with_fallback(&rows, &fallback, chrono::Utc::now());
     let amounts = projection.actuals();
     sqlx::query("UPDATE arb_orders SET actuals_projection=$2,actual_cost=COALESCE($3,actual_cost),actual_rev=COALESCE($4,actual_rev),actual_profit=COALESCE($5,actual_profit),updated_at=NOW() WHERE id=$1")
         .bind(order_id).bind(projection.evidence()).bind(amounts.map(|a|a.0)).bind(amounts.map(|a|a.1)).bind(amounts.map(|a|a.2)).execute(&mut **tx).await?;
@@ -1810,20 +1932,68 @@ async fn project_in_tx(
         } else {
             tracing::debug!(order_id, reason, "actuals projection still unknown");
         }
+    } else {
+        let evidence = projection.evidence();
+        let source = evidence["source_kind"].as_str().unwrap_or("frozen");
+        let deadline = evidence["fallback_valid_until"].as_i64();
+        if previous["status"] == "unknown" || previous["source_kind"] != evidence["source_kind"] {
+            tracing::info!(
+                order_id,
+                source_kind = source,
+                valid_until = deadline,
+                "actuals projection source enabled or recovered"
+            );
+        } else {
+            tracing::debug!(
+                order_id,
+                source_kind = source,
+                valid_until = deadline,
+                "actuals projection refreshed"
+            );
+        }
     }
     Ok(projection)
+}
+
+async fn stored_actuals_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    order_id: i64,
+) -> Result<actuals::Projection> {
+    let (cost, rev, profit, evidence): (Option<Decimal>, Option<Decimal>, Option<Decimal>, Value) = sqlx::query_as("SELECT actual_cost,actual_rev,actual_profit,actuals_projection FROM arb_orders WHERE id=$1")
+        .bind(order_id).fetch_one(&mut **tx).await?;
+    if evidence["version"] == 1
+        && evidence["stale"] == false
+        && matches!(
+            evidence["status"].as_str(),
+            Some("estimated" | "not_applicable" | "final")
+        )
+    {
+        if let (Some(cost), Some(rev), Some(profit)) = (cost, rev, profit) {
+            return Ok(actuals::Projection::Ready {
+                actuals: (cost, rev, profit),
+                evidence,
+            });
+        }
+    }
+    Ok(actuals::Projection::Unknown {
+        reason: "stored actuals unavailable".into(),
+    })
 }
 
 async fn refresh_parent_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     order_id: i64,
+    resolver: &actuals::FeeResolver<'_>,
+    changed: bool,
 ) -> Result<()> {
-    project_in_tx(tx, order_id).await?;
     // Completion follows terminal execution evidence, not availability of frozen estimates.
-    sqlx::query("UPDATE arb_orders SET status=CASE WHEN EXISTS(SELECT 1 FROM legs WHERE order_id=$1 AND actual_shares>0) THEN 'completed' ELSE 'cancelled' END,completed_at=NOW(),updated_at=NOW() WHERE id=$1 AND status='actived' AND settled_at IS NULL AND position_status IN ('watching','settlement_pending') AND EXISTS(SELECT 1 FROM legs WHERE order_id=$1) AND NOT EXISTS(SELECT 1 FROM legs WHERE order_id=$1 AND status NOT IN ('matched','completed','failed','cancelled'))")
+    let completed = sqlx::query("UPDATE arb_orders SET status=CASE WHEN EXISTS(SELECT 1 FROM legs WHERE order_id=$1 AND actual_shares>0) THEN 'completed' ELSE 'cancelled' END,completed_at=NOW(),updated_at=NOW() WHERE id=$1 AND status='actived' AND settled_at IS NULL AND position_status IN ('watching','settlement_pending') AND EXISTS(SELECT 1 FROM legs WHERE order_id=$1) AND NOT EXISTS(SELECT 1 FROM legs WHERE order_id=$1 AND status NOT IN ('matched','completed','failed','cancelled'))")
+        .bind(order_id).execute(&mut **tx).await?.rows_affected() == 1;
+    sqlx::query("UPDATE arb_orders SET rebalance_status='completed',rebalanced_at=COALESCE(rebalanced_at,NOW()) WHERE id=$1 AND rebalance_status IS DISTINCT FROM 'completed' AND status='cancelled' AND settled_at IS NULL AND position_status IN ('watching','settlement_pending') AND NOT EXISTS(SELECT 1 FROM legs WHERE order_id=$1 AND (status NOT IN ('matched','completed','cancelled','failed') OR actual_shares IS NULL OR actual_shares<>0))")
         .bind(order_id).execute(&mut **tx).await?;
-    sqlx::query("UPDATE arb_orders SET rebalance_status='completed',rebalanced_at=COALESCE(rebalanced_at,NOW()) WHERE id=$1 AND status='cancelled' AND settled_at IS NULL AND position_status IN ('watching','settlement_pending') AND NOT EXISTS(SELECT 1 FROM legs WHERE order_id=$1 AND (status NOT IN ('matched','completed','cancelled','failed') OR actual_shares IS NULL OR actual_shares<>0))")
-        .bind(order_id).execute(&mut **tx).await?;
+    if changed || completed {
+        project_in_tx_with_fallback(tx, order_id, resolver).await?;
+    }
     Ok(())
 }
 

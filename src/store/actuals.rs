@@ -55,8 +55,36 @@ pub(super) fn unknown_changed(previous: &Value, reason: &str) -> bool {
         || previous.get("reason").and_then(Value::as_str) != Some(reason)
 }
 
+/// Immutable, identity-bound cache evidence; never written back to a historical leg.
+#[derive(Debug, Clone)]
+pub struct LatestFee {
+    pub wallet: String,
+    pub token: String,
+    pub snapshot: Value,
+    pub valid_until: DateTime<Utc>,
+}
+
+pub type FallbackContext = BTreeMap<(String, String), LatestFee>;
+pub type FeeResolver<'a> = dyn Fn(&str, &str) -> Option<LatestFee> + Send + Sync + 'a;
+
+fn missing_snapshot(leg: &ProjectionLeg) -> bool {
+    leg.submitted_at.is_some()
+        && match &leg.last_order_info {
+            None => true,
+            Some(Value::Object(info)) => !info.contains_key("fee_estimate"),
+            _ => false,
+        }
+}
+
 fn snapshot(leg: &ProjectionLeg) -> Option<(Decimal, Decimal, Value)> {
-    let v = leg.last_order_info.as_ref()?.get("fee_estimate")?;
+    leg.submitted_at?;
+    parse_snapshot(
+        leg.last_order_info.as_ref()?.get("fee_estimate")?,
+        &leg.token_id,
+    )
+}
+
+fn parse_snapshot(v: &Value, token: &str) -> Option<(Decimal, Decimal, Value)> {
     if v.get("version")?.as_u64()? != 1
         || v.get("fee_model")?.as_str()? != "out_usdc_taker_close_v1"
     {
@@ -64,7 +92,7 @@ fn snapshot(leg: &ProjectionLeg) -> Option<(Decimal, Decimal, Value)> {
     }
     let outcome = v.get("outcome_id")?.as_str()?.parse::<u64>().ok()?;
     let tokens = [side_coin(outcome, 0), side_coin(outcome, 1)];
-    if !tokens.contains(&leg.token_id) || v.get("token_ids")? != &json!(tokens) {
+    if !tokens.iter().any(|candidate| candidate == token) || v.get("token_ids")? != &json!(tokens) {
         return None;
     }
     let rate = |key| {
@@ -80,18 +108,30 @@ fn snapshot(leg: &ProjectionLeg) -> Option<(Decimal, Decimal, Value)> {
     for key in ["user_fees_fetched_at", "outcome_meta_fetched_at"] {
         DateTime::parse_from_rfc3339(v.get(key)?.as_str()?).ok()?;
     }
-    leg.submitted_at?;
     Some((taker, builder, v.clone()))
 }
 
 pub fn project(legs: &[ProjectionLeg]) -> Projection {
-    match calculate(legs) {
+    project_with_fallback(legs, &FallbackContext::new(), Utc::now())
+}
+
+/// Pure projection: all cache observations and the calculation time are explicit.
+pub fn project_with_fallback(
+    legs: &[ProjectionLeg],
+    fallback: &FallbackContext,
+    now: DateTime<Utc>,
+) -> Projection {
+    match calculate(legs, fallback, now) {
         Ok((actuals, evidence)) => Projection::Ready { actuals, evidence },
         Err(reason) => Projection::Unknown { reason },
     }
 }
 
-fn calculate(legs: &[ProjectionLeg]) -> Result<((Decimal, Decimal, Decimal), Value), String> {
+fn calculate(
+    legs: &[ProjectionLeg],
+    fallback: &FallbackContext,
+    now: DateTime<Utc>,
+) -> Result<((Decimal, Decimal, Decimal), Value), String> {
     let mut rows = Vec::new();
     let mut groups: BTreeMap<(String, String), (Decimal, Vec<&ProjectionLeg>)> = BTreeMap::new();
     for leg in legs {
@@ -128,6 +168,7 @@ fn calculate(legs: &[ProjectionLeg]) -> Result<((Decimal, Decimal, Decimal), Val
                 .as_ref()
                 .filter(|s| !s.trim().is_empty())
                 .ok_or_else(invalid)?
+                .trim()
                 .to_ascii_lowercase();
             let entry = groups.entry((wallet, leg.token_id.clone())).or_default();
             entry.0 += if leg.side == "SELL" { -qty } else { qty };
@@ -137,6 +178,7 @@ fn calculate(legs: &[ProjectionLeg]) -> Result<((Decimal, Decimal, Decimal), Val
     let (cost, gross, _) = compute_actuals(&rows);
     let mut reserve = Decimal::ZERO;
     let mut evidence = Vec::new();
+    let mut fallback_valid_until: Option<DateTime<Utc>> = None;
     for ((wallet, token), (qty, candidates)) in groups {
         if qty < Decimal::ZERO {
             return Err(format!("negative Outcome position for {wallet}/{token}"));
@@ -144,11 +186,46 @@ fn calculate(legs: &[ProjectionLeg]) -> Result<((Decimal, Decimal, Decimal), Val
         if qty.is_zero() {
             continue;
         }
-        let (leg, taker, builder, source) = candidates
-            .into_iter()
-            .filter_map(|leg| snapshot(leg).map(|(t, b, s)| (leg, t, b, s)))
-            .max_by_key(|(leg, ..)| (leg.submitted_at, leg.id))
-            .ok_or_else(|| format!("missing valid frozen fee snapshot for {wallet}/{token}"))?;
+        let frozen = candidates
+            .iter()
+            .filter_map(|leg| snapshot(leg).map(|(t, b, s)| (*leg, t, b, s)))
+            .max_by_key(|(leg, ..)| (leg.submitted_at, leg.id));
+        let (taker, builder, mut source) = if let Some((leg, t, b, snapshot)) = frozen {
+            (
+                t,
+                b,
+                json!({"source_kind":"frozen","source_leg_id":leg.id,"source_submitted_at":leg.submitted_at,"source_snapshot":snapshot}),
+            )
+        } else {
+            // A corrupt candidate must never be disguised as missing historical evidence.
+            if !candidates.iter().all(|leg| missing_snapshot(leg)) {
+                return Err(format!(
+                    "invalid or unsubmitted fee snapshot for {wallet}/{token}"
+                ));
+            }
+            let latest = fallback
+                .get(&(wallet.clone(), token.clone()))
+                .filter(|v| {
+                    v.wallet.trim().eq_ignore_ascii_case(&wallet)
+                        && v.token == token
+                        && v.valid_until > now
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "latest fee unavailable, expired or identity mismatch for {wallet}/{token}"
+                    )
+                })?;
+            let (t, b, snapshot) = parse_snapshot(&latest.snapshot, &token)
+                .ok_or_else(|| format!("invalid latest fee snapshot for {wallet}/{token}"))?;
+            fallback_valid_until = Some(
+                fallback_valid_until.map_or(latest.valid_until, |old| old.min(latest.valid_until)),
+            );
+            (
+                t,
+                b,
+                json!({"source_kind":"latest_valid_fallback","valid_until":latest.valid_until.timestamp(),"source_snapshot":snapshot}),
+            )
+        };
         // Sell at payout=1 includes the original builder rate, not settlement_builder_rate.
         qty.checked_mul(taker.checked_add(builder).ok_or("rate overflow")?)
             .ok_or("reserve overflow")?;
@@ -162,13 +239,14 @@ fn calculate(legs: &[ProjectionLeg]) -> Result<((Decimal, Decimal, Decimal), Val
             },
         );
         reserve = reserve.checked_add(fee).ok_or("reserve sum overflow")?;
-        evidence.push(json!({"wallet":wallet,"token":token,"quantity":qty,"taker_rate":taker,"builder_rate":builder,"estimated_fee":fee,"source_leg_id":leg.id,"source_submitted_at":leg.submitted_at,"source_snapshot":source}));
+        source.as_object_mut().unwrap().extend(json!({"wallet":wallet,"token":token,"quantity":qty,"taker_rate":taker,"builder_rate":builder,"estimated_fee":fee}).as_object().unwrap().clone());
+        evidence.push(source);
     }
     let rev = gross.checked_sub(reserve).ok_or("revenue overflow")?;
     let profit = rev.checked_sub(cost).ok_or("profit overflow")?;
     Ok((
         (cost, rev, profit),
-        json!({"version":1,"status":if evidence.is_empty(){"not_applicable"}else{"estimated"},"basis":if legs.is_empty(){"empty"}else{"frozen_outcome_sell_payout_one"},"stale":false,"estimated_fee":reserve,"payout_assumption":"1","groups":evidence,"computed_at":Utc::now()}),
+        json!({"version":1,"status":if evidence.is_empty(){"not_applicable"}else{"estimated"},"basis":if legs.is_empty(){"empty"}else if fallback_valid_until.is_some(){"outcome_sell_payout_one"}else{"frozen_outcome_sell_payout_one"},"stale":false,"estimated_fee":reserve,"payout_assumption":"1","groups":evidence,"source_kind":if fallback_valid_until.is_some(){"latest_valid_fallback"}else{"frozen"},"fallback_valid_until":fallback_valid_until.map(|time|time.timestamp()),"computed_at":now}),
     ))
 }
 
@@ -300,6 +378,143 @@ mod tests {
         newer.last_order_info.as_mut().unwrap()["fee_estimate"]["version"] = json!(2);
         assert_eq!(fee(&[newer, older]), d("0.04932"));
     }
+    fn fallback(now: DateTime<Utc>) -> FallbackContext {
+        let frozen = leg(1, "BUY", "30");
+        BTreeMap::from([(
+            ("wallet-a".into(), "#5160".into()),
+            LatestFee {
+                wallet: "wallet-a".into(),
+                token: "#5160".into(),
+                snapshot: frozen.last_order_info.unwrap()["fee_estimate"].clone(),
+                valid_until: now + chrono::Duration::seconds(100),
+            },
+        )])
+    }
+
+    #[test]
+    fn fallback_only_missing_submitted_evidence_and_never_mutates_legs() {
+        let now = Utc::now();
+        let context = fallback(now);
+        for info in [None, Some(json!({})), Some(json!({"other":"evidence"}))] {
+            let mut buy = leg(1, "BUY", "30");
+            buy.last_order_info = info.clone();
+            let result = project_with_fallback(&[buy.clone()], &context, now);
+            assert!(result.actuals().is_some());
+            assert_eq!(
+                result.evidence()["groups"][0]["source_kind"],
+                "latest_valid_fallback"
+            );
+            assert!(result.evidence()["groups"][0]
+                .get("source_leg_id")
+                .is_none());
+            assert!(result.evidence()["fallback_valid_until"].is_i64());
+            assert_eq!(buy.last_order_info, info);
+            assert!(project(&[buy.clone()]).actuals().is_none());
+            buy.submitted_at = None;
+            assert!(project_with_fallback(&[buy], &context, now)
+                .actuals()
+                .is_none());
+        }
+        for info in [
+            json!(null),
+            json!([]),
+            json!("bad"),
+            json!({"fee_estimate":null}),
+            json!({"fee_estimate":{}}),
+        ] {
+            let mut buy = leg(1, "BUY", "30");
+            buy.last_order_info = Some(info);
+            assert!(project_with_fallback(&[buy], &context, now)
+                .actuals()
+                .is_none());
+        }
+        let mut bad = leg(2, "BUY", "3");
+        bad.last_order_info = Some(json!({"fee_estimate":null}));
+        let frozen = leg(1, "BUY", "30");
+        let result = project_with_fallback(&[frozen, bad], &context, now);
+        assert_eq!(result.evidence()["source_kind"], "frozen");
+    }
+
+    #[test]
+    fn fallback_identity_expiry_and_mixed_groups() {
+        let now = Utc::now();
+        let mut buy = leg(1, "BUY", "30");
+        buy.last_order_info = None;
+        let mut context = fallback(now);
+        assert!(project_with_fallback(&[buy.clone()], &BTreeMap::new(), now)
+            .actuals()
+            .is_none());
+        let key = ("wallet-a".into(), "#5160".into());
+        for field in ["wallet", "token", "expiry", "rules"] {
+            let mut invalid = context.clone();
+            let value = invalid.get_mut(&key).unwrap();
+            match field {
+                "wallet" => value.wallet = "wallet-b".into(),
+                "token" => value.token = "#5161".into(),
+                "expiry" => value.valid_until = now,
+                _ => value.snapshot["fee_model"] = json!("unsupported"),
+            }
+            assert!(project_with_fallback(&[buy.clone()], &invalid, now)
+                .actuals()
+                .is_none());
+        }
+        let mut other = leg(2, "BUY", "10");
+        other.token_id = "#5161".into();
+        let mixed = project_with_fallback(&[buy.clone(), other.clone()], &context, now);
+        assert_eq!(
+            mixed.evidence()["groups"][0]["source_kind"],
+            "latest_valid_fallback"
+        );
+        assert_eq!(mixed.evidence()["groups"][1]["source_kind"], "frozen");
+        other.last_order_info = None;
+        assert!(
+            project_with_fallback(&[buy.clone(), other.clone()], &context, now)
+                .actuals()
+                .is_none()
+        );
+        let mut second = context[&key].clone();
+        second.token = "#5161".into();
+        second.valid_until = now + chrono::Duration::seconds(20);
+        context.insert(("wallet-a".into(), "#5161".into()), second);
+        assert_eq!(
+            project_with_fallback(&[buy, other], &context, now).evidence()["fallback_valid_until"],
+            json!((now + chrono::Duration::seconds(20)).timestamp())
+        );
+    }
+
+    #[test]
+    fn fallback_rates_recompute_remaining_reserve_without_accumulation() {
+        let now = Utc::now();
+        let mut context = fallback(now);
+        let mut buy = leg(1, "BUY", "30");
+        buy.last_order_info = None;
+        let mut sell = leg(2, "SELL", "15");
+        sell.last_order_info = None;
+        let rows = [buy.clone(), sell.clone()];
+        let first = project_with_fallback(&rows, &context, now);
+        assert_eq!(
+            serde_json::from_value::<Decimal>(first.evidence()["estimated_fee"].clone()).unwrap(),
+            d("0.02466")
+        );
+        assert_eq!(
+            first.actuals(),
+            project_with_fallback(&rows, &context, now).actuals()
+        );
+        context.values_mut().next().unwrap().snapshot["taker_rate"] = json!("0.002");
+        assert_eq!(
+            serde_json::from_value::<Decimal>(
+                project_with_fallback(&rows, &context, now).evidence()["estimated_fee"].clone()
+            )
+            .unwrap(),
+            d("0.0345")
+        );
+        sell.actual_shares = Some(d("30"));
+        assert_eq!(
+            project_with_fallback(&[buy, sell], &BTreeMap::new(), now).evidence()["status"],
+            "not_applicable"
+        );
+    }
+
     #[test]
     fn unknown_warning_only_on_status_or_reason_change() {
         let old = json!({"status":"unknown","reason":"missing snapshot"});

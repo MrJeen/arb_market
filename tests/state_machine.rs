@@ -249,7 +249,7 @@ async fn reconciliation_pm_calculated_fee_retains_snapshot_without_fabricating_r
         evidence.poll.associated_trades = vec!["fee-trade".into()];
         evidence.poll.raw = json!({"associate_trades":["fee-trade"]});
         let current = store
-            .record_order_poll(&legs[0], &evidence.poll)
+            .record_order_poll(&|_, _| None, &legs[0], &evidence.poll)
             .await?
             .ok_or_else(|| anyhow::anyhow!("fee fixture lookup rejected"))?;
         let mut fill = reconciliation_trade("pm-fee-oid", "fee-trade", 10, Decimal::ZERO);
@@ -262,7 +262,7 @@ async fn reconciliation_pm_calculated_fee_retains_snapshot_without_fabricating_r
             "rounding":"midpoint_away_from_zero_5dp"
         }});
         let result = store
-            .record_reconciliation(&current, &[fill], &evidence, &json!({}))
+            .record_reconciliation(&|_, _| None, &current, &[fill], &evidence, &json!({}))
             .await?;
         ensure!(matches!(result,LegResolution::Terminal{fee,..} if fee==Decimal::new(168,3)));
         let stored = fill_snapshots(&store.pool, current.id).await?;
@@ -308,6 +308,7 @@ async fn submitted_reconciliation_order(
         .collect();
     let (order_id, ids) = store
         .insert_actived_order_with_legs(
+            &|_, _| None,
             TopicKey::new(Uuid::new_v4(), 0),
             &identity,
             "reconciliation integration test",
@@ -330,6 +331,7 @@ async fn submitted_reconciliation_order(
         };
         store
             .insert_envelope(
+                &|_, _| None,
                 *id,
                 &client_id,
                 &json!({"cloid": client_id}),
@@ -464,7 +466,7 @@ async fn outcome_final_probe_is_fresh_and_retains_observed_fills_atomically() {
         evidence.poll.original_shares=Some(Decimal::from(10));
         evidence.poll.remaining_shares=Some(Decimal::from(4));
         let current=reconciliation_open_leg(store,leg_id).await?;
-        let current=store.record_order_poll(&current,&evidence.poll).await?.unwrap();
+        let current=store.record_order_poll(&|_, _| None, &current,&evidence.poll).await?.unwrap();
         let info=current.last_order_info.as_ref().unwrap();
         let observed=info["outcome_terminal_observed_at_ms"].as_u64().unwrap();
         let start=current.submitted_at.unwrap().timestamp_millis().saturating_sub(30_000).max(0) as u64;
@@ -478,7 +480,7 @@ async fn outcome_final_probe_is_fresh_and_retains_observed_fills_atomically() {
         // 旧布尔覆盖证明不能授权零成交/部分成交终态，但 probe 真成交仍必须被保存。
         evidence.page_complete=true;
         evidence.history_complete=true;
-        let pending=store.record_reconciliation(&current,&[fill.clone()],&evidence,&before).await?;
+        let pending=store.record_reconciliation(&|_, _| None, &current,&[fill.clone()],&evidence,&before).await?;
         ensure!(matches!(pending,LegResolution::Pending(_)));
         ensure!(fill_snapshots(&store.pool,leg_id).await?.len()==1);
         ensure!(order_snapshot(&store.pool,order_id).await?["status"]=="actived");
@@ -490,7 +492,7 @@ async fn outcome_final_probe_is_fresh_and_retains_observed_fills_atomically() {
         evidence.outcome_scan=Some(serde_json::from_value(complete.clone())?);
         let restored:FillEvidence=serde_json::from_value(serde_json::to_value(&evidence)?)?;
         ensure!(restored.outcome_scan.is_none(), "persisted evidence cannot restore fresh coverage");
-        let result=store.record_reconciliation(&current,&[fill],&evidence,&complete).await?;
+        let result=store.record_reconciliation(&|_, _| None, &current,&[fill],&evidence,&complete).await?;
         ensure!(matches!(result,LegResolution::Terminal{status:"matched",shares,..} if shares==Decimal::from(6)));
         ensure!(fill_snapshots(&store.pool,leg_id).await?.len()==1);
         ensure!(order_snapshot(&store.pool,order_id).await?["status"]=="completed");
@@ -520,6 +522,7 @@ async fn reconciliation_ack_waits_for_real_outcome_fills_and_actual_fees() {
         for leg in &legs {
             store
                 .record_submission(
+                    &|_, _| None,
                     leg.id,
                     "actived",
                     Some(&format!("oid-{}", leg.id)),
@@ -535,7 +538,7 @@ async fn reconciliation_ack_waits_for_real_outcome_fills_and_actual_fees() {
                 "ACK must not create a fill"
             );
         }
-        store.complete_orders().await?;
+        store.complete_orders(&|_, _| None).await?;
         ensure!(store.open_legs().await?.len() == 2);
         ensure!(order_snapshot(&store.pool, order_id).await?["status"] == "actived");
 
@@ -558,7 +561,7 @@ async fn reconciliation_ack_waits_for_real_outcome_fills_and_actual_fees() {
             }
             let current = reconciliation_open_leg(store, leg.id).await?;
             let mut current = store
-                .record_order_poll(&current, &evidence.poll)
+                .record_order_poll(&|_, _| None, &current, &evidence.poll)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("fresh order poll rejected"))?;
             let fee = if index == 0 {
@@ -575,6 +578,7 @@ async fn reconciliation_ack_waits_for_real_outcome_fills_and_actual_fees() {
                 fill.fee_rate_bps = Some(Decimal::from(500));
                 let missing_fee = store
                     .record_reconciliation(
+                        &|_, _| None,
                         &current,
                         &[fill.clone()],
                         &evidence,
@@ -589,7 +593,13 @@ async fn reconciliation_ack_waits_for_real_outcome_fills_and_actual_fees() {
                 fill.price = Decimal::new(55, 2);
             }
             let resolved = store
-                .record_reconciliation(&current, &[fill], &evidence, &json!({"complete":true}))
+                .record_reconciliation(
+                    &|_, _| None,
+                    &current,
+                    &[fill],
+                    &evidence,
+                    &json!({"complete":true}),
+                )
                 .await?;
             ensure!(matches!(resolved, LegResolution::Terminal {
                 status: "matched", shares, fee: actual_fee, ref fee_sources, ..
@@ -614,7 +624,7 @@ async fn reconciliation_ack_waits_for_real_outcome_fills_and_actual_fees() {
         ensure!(fills.len() == 2 && fills[0]["trade_id"] == "ack:legacy");
         let terminal = leg_snapshot(&store.pool, legs[0].id).await?;
         ensure!(terminal["actual_shares"] == json!(10.0) && terminal["actual_fee"] == json!(0.17));
-        store.complete_orders().await?;
+        store.complete_orders(&|_, _| None).await?;
         ensure!(order_snapshot(&store.pool, order_id).await? == parent);
         Ok(())
     }
@@ -635,13 +645,13 @@ async fn reconciliation_pm_accumulates_pages_and_only_accounts_confirmed_trades(
         store.migrate().await?;
         let (order_id, legs) = submitted_reconciliation_order(store, &["polymarket"]).await?;
         let id = legs[0].id;
-        store.record_submission(id, "actived", Some("pm-oid"), &json!({"kind":"ack"}), &json!({"ack":true})).await?;
+        store.record_submission(&|_, _| None, id, "actived", Some("pm-oid"), &json!({"kind":"ack"}), &json!({"ack":true})).await?;
         let mut evidence = reconciliation_evidence("pm-oid", "matched");
         evidence.poll.associated_trades = vec!["a".into(), "b".into(), "c".into()];
         evidence.poll.raw = json!({"associate_trades":["a","b","c"]});
         evidence.page_complete = false;
         let current = reconciliation_open_leg(store, id).await?;
-        let current = store.record_order_poll(&current, &evidence.poll).await?
+        let current = store.record_order_poll(&|_, _| None, &current, &evidence.poll).await?
             .ok_or_else(|| anyhow::anyhow!("fresh PM poll rejected"))?;
         let mut a = reconciliation_trade("pm-oid", "a", 4, Decimal::new(2, 2));
         let mut b = reconciliation_trade("pm-oid", "b", 3, Decimal::from(99));
@@ -652,24 +662,24 @@ async fn reconciliation_pm_accumulates_pages_and_only_accounts_confirmed_trades(
         a.finality = FillFinality::Pending;
         b.finality = FillFinality::Pending;
         let pending_a = a.clone();
-        ensure!(matches!(store.record_reconciliation(&current, &[a.clone(), b.clone()], &evidence,
+        ensure!(matches!(store.record_reconciliation(&|_, _| None, &current, &[a.clone(), b.clone()], &evidence,
             &json!({"cursor":"page-2"})).await?, LegResolution::Pending(_)));
         ensure!(leg_snapshot(&store.pool, id).await?["actual_shares"].is_null());
         a.finality = FillFinality::Confirmed;
         let current = reconciliation_open_leg(store, id).await?;
         ensure!(current.last_order_info.as_ref().unwrap()["fill_progress"]["cursor"] == "page-2");
-        ensure!(matches!(store.record_reconciliation(&current, &[a.clone(), a.clone(), b.clone()], &evidence,
+        ensure!(matches!(store.record_reconciliation(&|_, _| None, &current, &[a.clone(), a.clone(), b.clone()], &evidence,
             &json!({"cursor":"page-3"})).await?, LegResolution::Pending(_)));
         ensure!(fill_snapshots(&store.pool, id).await?.len() == 2, "repeated page/trade must upsert once");
         c.finality = FillFinality::Failed;
         evidence.page_complete = true;
         let current = reconciliation_open_leg(store, id).await?;
-        ensure!(matches!(store.record_reconciliation(&current, &[c], &evidence,
+        ensure!(matches!(store.record_reconciliation(&|_, _| None, &current, &[c], &evidence,
             &json!({"complete":true})).await?, LegResolution::Pending(_)));
         ensure!(order_snapshot(&store.pool, order_id).await?["status"] == "actived");
         b.finality = FillFinality::Failed;
         let current = reconciliation_open_leg(store, id).await?;
-        let resolved = store.record_reconciliation(&current, &[b, pending_a], &evidence,
+        let resolved = store.record_reconciliation(&|_, _| None, &current, &[b, pending_a], &evidence,
             &json!({"complete":true})).await?;
         ensure!(matches!(resolved, LegResolution::Terminal {status:"matched", shares, fee, ..}
             if shares == Decimal::from(4) && fee == Decimal::new(2, 2)));
@@ -686,12 +696,12 @@ async fn reconciliation_pm_accumulates_pages_and_only_accounts_confirmed_trades(
         let mut evidence = reconciliation_evidence("pm-failed", "matched");
         evidence.poll.associated_trades = vec!["failed".into()];
         evidence.poll.raw = json!({"associate_trades":["failed"]});
-        let leg = store.record_order_poll(&failed_legs[0], &evidence.poll).await?
+        let leg = store.record_order_poll(&|_, _| None, &failed_legs[0], &evidence.poll).await?
             .ok_or_else(|| anyhow::anyhow!("all-failed poll rejected"))?;
         let mut fill = reconciliation_trade("pm-failed", "failed", 10, Decimal::from(99));
         fill.coin = Some(leg.token_id.clone());
         fill.finality = FillFinality::Failed;
-        ensure!(matches!(store.record_reconciliation(&leg, &[fill], &evidence, &json!({})).await?,
+        ensure!(matches!(store.record_reconciliation(&|_, _| None, &leg, &[fill], &evidence, &json!({})).await?,
             LegResolution::Terminal {status:"failed", shares, fee, ..} if shares.is_zero() && fee.is_zero()));
         let parent = order_snapshot(&store.pool, failed_parent).await?;
         ensure!(parent["status"] == "cancelled" && parent["actual_cost"] == json!(0.0));
@@ -716,26 +726,26 @@ async fn reconciliation_pm_empty_missing_scan_preserves_other_venue_position() {
         for source in ["http_404", "null_body"] {
             let (parent_id, legs) = submitted_reconciliation_order(store, &["polymarket", "outcome"]).await?;
             let pm = &legs[0];
-            store.record_submission(pm.id, "unknown", None, &json!({"kind":"unknown"}), &json!({})).await?;
+            store.record_submission(&|_, _| None, pm.id, "unknown", None, &json!({"kind":"unknown"}), &json!({})).await?;
             let mut out = reconciliation_evidence(&format!("out-{}", legs[1].id), "filled");
             out.expected_shares = Some(Decimal::from(9));
-            store.record_submission(legs[1].id, "actived", out.poll.order_id.as_deref(),
+            store.record_submission(&|_, _| None, legs[1].id, "actived", out.poll.order_id.as_deref(),
                 &json!({"kind":"ack", "expected_shares":"9"}), &json!({"ack":true})).await?;
             let current = reconciliation_open_leg(store, legs[1].id).await?;
-            let current = store.record_order_poll(&current, &out.poll).await?.unwrap();
+            let current = store.record_order_poll(&|_, _| None, &current, &out.poll).await?.unwrap();
             let fill = reconciliation_trade(out.poll.order_id.as_deref().unwrap(), "out-fill", 9, Decimal::ZERO);
-            ensure!(matches!(store.record_reconciliation(&current, &[fill], &out, &json!({})).await?,
+            ensure!(matches!(store.record_reconciliation(&|_, _| None, &current, &[fill], &out, &json!({})).await?,
                 LegResolution::Terminal {status:"matched", shares, ..} if shares == Decimal::from(9)));
             ensure!(order_snapshot(&store.pool, parent_id).await?["status"] == "actived");
             let current = reconciliation_open_leg(store, pm.id).await?;
             let incomplete = pm_missing_evidence(&current, source, "page-2", &[]);
-            let current = store.record_order_poll(&current, &incomplete.poll).await?.unwrap();
-            ensure!(matches!(store.record_reconciliation(&current, &[], &incomplete,
+            let current = store.record_order_poll(&|_, _| None, &current, &incomplete.poll).await?.unwrap();
+            ensure!(matches!(store.record_reconciliation(&|_, _| None, &current, &[], &incomplete,
                 &serde_json::to_value(incomplete.pm_scan.as_ref().unwrap())?).await?, LegResolution::Pending(_)));
             let current = reconciliation_open_leg(store, pm.id).await?;
             let complete = pm_missing_evidence(&current, source, "LTE=", &[]);
             let progress = serde_json::to_value(complete.pm_scan.as_ref().unwrap())?;
-            ensure!(matches!(store.record_reconciliation(&current, &[], &complete, &progress).await?,
+            ensure!(matches!(store.record_reconciliation(&|_, _| None, &current, &[], &complete, &progress).await?,
                 LegResolution::Terminal {status:"failed", shares, price, fee, ..}
                     if shares.is_zero() && price.is_zero() && fee.is_zero()));
             let terminal = leg_snapshot(&store.pool, pm.id).await?;
@@ -748,9 +758,9 @@ async fn reconciliation_pm_empty_missing_scan_preserves_other_venue_position() {
             ensure!(positions["outcome"]["no"] == Decimal::from(9));
             ensure!(positions["polymarket"]["yes"].is_zero());
             ensure!(!store.open_legs().await?.iter().any(|leg| leg.order_id == parent_id));
-            ensure!(store.record_order_poll(&current, &complete.poll).await?.is_none());
-            ensure!(matches!(store.record_reconciliation(&current, &[], &complete, &progress).await?, LegResolution::Pending(_)));
-            store.record_submission(pm.id, "actived", None, &json!({"kind":"unknown"}), &json!({"late":true})).await?;
+            ensure!(store.record_order_poll(&|_, _| None, &current, &complete.poll).await?.is_none());
+            ensure!(matches!(store.record_reconciliation(&|_, _| None, &current, &[], &complete, &progress).await?, LegResolution::Pending(_)));
+            store.record_submission(&|_, _| None, pm.id, "actived", None, &json!({"kind":"unknown"}), &json!({"late":true})).await?;
             ensure!(leg_snapshot(&store.pool, pm.id).await? == terminal);
             ensure!(order_snapshot(&store.pool, parent_id).await? == parent);
         }
@@ -779,14 +789,14 @@ async fn reconciliation_pm_missing_order_pages_reload_with_fixed_window_and_exac
             sqlx::query("UPDATE legs SET submitted_at=to_timestamp(1700000000), updated_at=clock_timestamp() WHERE id=$1")
                 .bind(id).execute(&store.pool).await?;
             let ack_oid = format!("pm-ack-{id}");
-            store.record_submission(id, if ack { "actived" } else { "unknown" },
+            store.record_submission(&|_, _| None, id, if ack { "actived" } else { "unknown" },
                 ack.then_some(ack_oid.as_str()), &json!({"kind": if ack { "ack" } else { "unknown" }}),
                 &json!({"test":true})).await?;
             let before = reconciliation_open_leg(store, id).await?;
             let first = pm_missing_evidence(&before, missing, "page-2", &["a"]);
             let oid = first.poll.order_id.as_deref().unwrap();
             ensure!(oid == if ack { ack_oid.as_str() } else { before.client_order_id.as_deref().unwrap() });
-            let current = store.record_order_poll(&before, &first.poll).await?
+            let current = store.record_order_poll(&|_, _| None, &before, &first.poll).await?
                 .ok_or_else(|| anyhow::anyhow!("missing {missing} poll rejected"))?;
             ensure!(current.third_order_id.as_deref() == Some(oid));
             ensure!(current.status == before.status && current.submitted_at == before.submitted_at);
@@ -794,7 +804,7 @@ async fn reconciliation_pm_missing_order_pages_reload_with_fixed_window_and_exac
             a.coin = Some(current.token_id.clone());
             a.finality = FillFinality::Pending;
             let first_progress = serde_json::to_value(first.pm_scan.as_ref().unwrap())?;
-            ensure!(matches!(store.record_reconciliation(&current, &[a.clone()], &first, &first_progress).await?,
+            ensure!(matches!(store.record_reconciliation(&|_, _| None, &current, &[a.clone()], &first, &first_progress).await?,
                 LegResolution::Pending(_)));
 
             // A new Store handle must resume entirely from the persisted scan, not local page state.
@@ -821,18 +831,18 @@ async fn reconciliation_pm_missing_order_pages_reload_with_fixed_window_and_exac
             let leg_before = leg_snapshot(&store.pool, id).await?;
             let fills_before = fill_snapshots(&store.pool, id).await?;
             let parent_before = order_snapshot(&store.pool, order_id).await?;
-            ensure!(reopened.record_reconciliation(&current, &final_fills, &complete, &complete_progress).await?
+            ensure!(reopened.record_reconciliation(&|_, _| None, &current, &final_fills, &complete, &complete_progress).await?
                 == LegResolution::Pending("stale_leg_snapshot"));
             ensure!(leg_snapshot(&store.pool, id).await? == leg_before, "stale page advanced cursor");
             ensure!(fill_snapshots(&store.pool, id).await? == fills_before);
             ensure!(order_snapshot(&store.pool, order_id).await? == parent_before);
 
-            let current = reopened.record_order_poll(&reloaded, &complete.poll).await?
+            let current = reopened.record_order_poll(&|_, _| None, &reloaded, &complete.poll).await?
                 .ok_or_else(|| anyhow::anyhow!("resumed missing poll rejected"))?;
             ensure!(current.submitted_at == before.submitted_at && current.status == before.status);
             ensure!(current.last_order_info.as_ref().unwrap()["fill_progress"] == first_progress,
                 "poll must neither reset the fixed after nor advance the scan");
-            let resolved = reopened.record_reconciliation(&current, &final_fills, &complete, &complete_progress).await?;
+            let resolved = reopened.record_reconciliation(&|_, _| None, &current, &final_fills, &complete, &complete_progress).await?;
             let (status, shares, price, fee, fee_sources) = if all_failed {
                 ("failed", Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, vec![])
             } else {
@@ -852,9 +862,9 @@ async fn reconciliation_pm_missing_order_pages_reload_with_fixed_window_and_exac
             ensure!(fills[1]["raw"]["reconciliation_v1"]["finality"] == "failed");
             ensure!(parent["status"] == if all_failed { "cancelled" } else { "completed" });
             ensure!(parent["actual_cost"] == json!(if all_failed { 0.0 } else { 1.62 }));
-            ensure!(reopened.record_reconciliation(&current, &final_fills, &complete, &complete_progress).await?
+            ensure!(reopened.record_reconciliation(&|_, _| None, &current, &final_fills, &complete, &complete_progress).await?
                 == LegResolution::Pending("stale_leg_snapshot"));
-            reopened.complete_orders().await?;
+            reopened.complete_orders(&|_, _| None, ).await?;
             ensure!(leg_snapshot(&store.pool, id).await? == terminal);
             ensure!(fill_snapshots(&store.pool, id).await? == fills);
             ensure!(order_snapshot(&store.pool, order_id).await? == parent, "terminal retry recounted fills");
@@ -891,7 +901,7 @@ async fn reconciliation_pm_known_execution_survives_weaker_polls_missing_orders_
                 };
                 evidence.poll.raw = json!({"associate_trades": evidence.poll.associated_trades});
                 let current = store
-                    .record_order_poll(&legs[0], &evidence.poll)
+                    .record_order_poll(&|_, _| None, &legs[0], &evidence.poll)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("known execution poll rejected"))?;
                 let constraints =
@@ -909,6 +919,7 @@ async fn reconciliation_pm_known_execution_survives_weaker_polls_missing_orders_
                     matches!(
                         store
                             .record_reconciliation(
+                                &|_, _| None,
                                 &current,
                                 &[a],
                                 &evidence,
@@ -926,13 +937,14 @@ async fn reconciliation_pm_known_execution_survives_weaker_polls_missing_orders_
                 evidence.poll.shares = Some(Decimal::from(6));
                 let current = reconciliation_open_leg(store, id).await?;
                 let current = store
-                    .record_order_poll(&current, &evidence.poll)
+                    .record_order_poll(&|_, _| None, &current, &evidence.poll)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("weaker normal poll rejected"))?;
                 ensure!(
                     matches!(
                         store
                             .record_reconciliation(
+                                &|_, _| None,
                                 &current,
                                 &[],
                                 &evidence,
@@ -950,14 +962,20 @@ async fn reconciliation_pm_known_execution_survives_weaker_polls_missing_orders_
                     let progress =
                         serde_json::to_value(missing_evidence.pm_scan.as_ref().unwrap())?;
                     let current = store
-                        .record_order_poll(&current, &missing_evidence.poll)
+                        .record_order_poll(&|_, _| None, &current, &missing_evidence.poll)
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("missing {missing} poll rejected"))?;
                     ensure!(missing_evidence.pm_order_constraints.is_none());
                     ensure!(
                         matches!(
                             store
-                                .record_reconciliation(&current, &[], &missing_evidence, &progress)
+                                .record_reconciliation(
+                                    &|_, _| None,
+                                    &current,
+                                    &[],
+                                    &missing_evidence,
+                                    &progress
+                                )
                                 .await?,
                             LegResolution::Pending(_)
                         ),
@@ -1003,6 +1021,7 @@ async fn reconciliation_pm_known_execution_survives_weaker_polls_missing_orders_
                     matches!(
                         reopened
                             .record_reconciliation(
+                                &|_, _| None,
                                 &reloaded,
                                 &[b],
                                 &incomplete,
@@ -1020,7 +1039,7 @@ async fn reconciliation_pm_known_execution_survives_weaker_polls_missing_orders_
                 let fee = Decimal::new(if b_failed { 2 } else { 5 }, 2);
                 ensure!(
                     reopened
-                        .record_reconciliation(&current, &[], &complete, &progress)
+                        .record_reconciliation(&|_, _| None, &current, &[], &complete, &progress)
                         .await?
                         == LegResolution::Terminal {
                             status: "matched",
@@ -1049,7 +1068,7 @@ async fn reconciliation_pm_known_execution_survives_weaker_polls_missing_orders_
                     fills[1]["raw"]["reconciliation_v1"]["finality"]
                         == if b_failed { "failed" } else { "confirmed" }
                 );
-                reopened.complete_orders().await?;
+                reopened.complete_orders(&|_, _| None).await?;
                 ensure!(order_snapshot(&store.pool, order_id).await? == parent);
                 ensure!(fill_snapshots(&store.pool, id).await? == fills);
             }
@@ -1077,7 +1096,7 @@ async fn reconciliation_pm_poll_constraints_only_accumulate_valid_same_order_evi
         poll.raw = json!({"associate_trades":["b","a","b"]});
         poll.original_shares = Some(Decimal::from(100));
         let mut current = store
-            .record_order_poll(&legs[0], &poll)
+            .record_order_poll(&|_, _| None, &legs[0], &poll)
             .await?
             .ok_or_else(|| anyhow::anyhow!("monotonic fixture poll rejected"))?;
         let mut expected = json!({
@@ -1132,7 +1151,7 @@ async fn reconciliation_pm_poll_constraints_only_accumulate_valid_same_order_evi
                 _ => {}
             }
             current = store
-                .record_order_poll(&current, &poll)
+                .record_order_poll(&|_, _| None, &current, &poll)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("{case} poll rejected"))?;
             ensure!(
@@ -1143,7 +1162,10 @@ async fn reconciliation_pm_poll_constraints_only_accumulate_valid_same_order_evi
         let before = leg_snapshot(&store.pool, current.id).await?;
         poll.found = true;
         poll.order_id = Some("other-order".into());
-        ensure!(store.record_order_poll(&current, &poll).await.is_err());
+        ensure!(store
+            .record_order_poll(&|_, _| None, &current, &poll)
+            .await
+            .is_err());
         ensure!(leg_snapshot(&store.pool, current.id).await? == before);
         ensure!(fill_snapshots(&store.pool, current.id).await?.is_empty());
         Ok(())
@@ -1173,6 +1195,7 @@ async fn reconciliation_pm_legacy_poll_constraints_restore_before_missing_lookup
                 let oid = format!("legacy-constraints-{id}");
                 store
                     .record_submission(
+                        &|_, _| None,
                         id,
                         "actived",
                         Some(&oid),
@@ -1210,7 +1233,7 @@ async fn reconciliation_pm_legacy_poll_constraints_restore_before_missing_lookup
                 let current = reconciliation_open_leg(store, id).await?;
                 let missing = pm_missing_evidence(&current, "http_404", "LTE=", &["a"]);
                 let current = store
-                    .record_order_poll(&current, &missing.poll)
+                    .record_order_poll(&|_, _| None, &current, &missing.poll)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("legacy {source}/{case} lookup rejected"))?;
                 let constraints =
@@ -1247,6 +1270,7 @@ async fn reconciliation_pm_legacy_poll_constraints_restore_before_missing_lookup
                         matches!(
                             store
                                 .record_reconciliation(
+                                    &|_, _| None,
                                     &current,
                                     &[a],
                                     &missing,
@@ -1307,7 +1331,7 @@ async fn reconciliation_pm_corrupt_typed_constraints_reject_all_writes_without_l
                 poll.shares = Some(Decimal::ZERO);
                 poll.raw = json!({"associate_trades":[]});
                 let current = store
-                    .record_order_poll(&legs[0], &poll)
+                    .record_order_poll(&|_, _| None, &legs[0], &poll)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("corrupt constraints setup rejected"))?;
                 let mut info = current.last_order_info.clone().unwrap();
@@ -1352,12 +1376,16 @@ async fn reconciliation_pm_corrupt_typed_constraints_reject_all_writes_without_l
                 .fetch_one(&store.pool)
                 .await?;
                 ensure!(
-                    store.record_order_poll(&current, &poll).await.is_err(),
+                    store
+                        .record_order_poll(&|_, _| None, &current, &poll)
+                        .await
+                        .is_err(),
                     "{nested}/{case} poll replaced corrupt typed evidence"
                 );
                 ensure!(
                     store
                         .record_submission(
+                            &|_, _| None,
                             id,
                             "actived",
                             Some(&oid),
@@ -1374,6 +1402,7 @@ async fn reconciliation_pm_corrupt_typed_constraints_reject_all_writes_without_l
                 ensure!(
                     store
                         .record_reconciliation(
+                            &|_, _| None,
                             &current,
                             &[fill],
                             &missing,
@@ -1420,7 +1449,7 @@ async fn reconciliation_pm_missing_order_does_not_finish_from_cached_confirmed_f
         let id = legs[0].id;
         let evidence = pm_missing_evidence(&legs[0], "null_body", "page-2", &["cached"]);
         let current = store
-            .record_order_poll(&legs[0], &evidence.poll)
+            .record_order_poll(&|_, _| None, &legs[0], &evidence.poll)
             .await?
             .ok_or_else(|| anyhow::anyhow!("cache fixture poll rejected"))?;
         let mut fill = reconciliation_trade(
@@ -1433,7 +1462,7 @@ async fn reconciliation_pm_missing_order_does_not_finish_from_cached_confirmed_f
         let progress = serde_json::to_value(evidence.pm_scan.as_ref().unwrap())?;
         ensure!(
             store
-                .record_reconciliation(&current, &[fill], &evidence, &progress)
+                .record_reconciliation(&|_, _| None, &current, &[fill], &evidence, &progress)
                 .await?
                 == LegResolution::Pending("trade_pages_incomplete")
         );
@@ -1460,7 +1489,7 @@ async fn reconciliation_pm_missing_order_does_not_finish_from_cached_confirmed_f
             }
             ensure!(
                 store
-                    .record_reconciliation(&current, &[], &complete, &progress)
+                    .record_reconciliation(&|_, _| None, &current, &[], &complete, &progress)
                     .await?
                     == LegResolution::Pending(reason),
                 "{case} reused unproven cached fills"
@@ -1479,7 +1508,7 @@ async fn reconciliation_pm_missing_order_does_not_finish_from_cached_confirmed_f
         let current = reconciliation_open_leg(store, id).await?;
         let complete = pm_missing_evidence(&current, "null_body", "LTE=", &["cached"]);
         ensure!(
-            matches!(store.record_reconciliation(&current, &[], &complete,
+            matches!(store.record_reconciliation(&|_, _| None, &current, &[], &complete,
             &serde_json::to_value(complete.pm_scan.as_ref().unwrap())?).await?,
             LegResolution::Terminal { status: "matched", shares, fee, .. }
                 if shares == Decimal::from(4) && fee == Decimal::new(2, 2))
@@ -1512,7 +1541,7 @@ async fn reconciliation_pm_known_execution_without_fills_locks_hash_at_both_reco
                 poll.associated_trades = if has_ids { vec!["known-but-unfetched".into()] } else { vec![] };
                 poll.raw = json!({"associate_trades":poll.associated_trades});
                 poll.shares = Some(if has_ids { Decimal::ZERO } else { Decimal::from(10) });
-                let current = store.record_order_poll(&legs[0], &poll).await?
+                let current = store.record_order_poll(&|_, _| None, &legs[0], &poll).await?
                     .ok_or_else(|| anyhow::anyhow!("known hash fixture rejected"))?;
                 if source != "typed" {
                     let info = if source == "order_poll" { json!({"order_poll":poll}) }
@@ -1527,7 +1556,7 @@ async fn reconciliation_pm_known_execution_without_fills_locks_hash_at_both_reco
                     .bind(id).fetch_one(&store.pool).await?;
                 ensure!(fill_snapshots(&store.pool, id).await?.is_empty());
                 ensure!(current.third_order_id == current.client_order_id);
-                ensure!(store.record_submission(id, "actived", Some("replacement-ack"),
+                ensure!(store.record_submission(&|_, _| None, id, "actived", Some("replacement-ack"),
                     &json!({"kind":"ack"}), &json!({"replacement":true})).await.is_err(),
                     "{source}/{has_ids} ACK ignored known execution without fills");
                 let envelope_after: Value = sqlx::query_scalar("SELECT to_jsonb(e) FROM signed_envelopes e WHERE leg_id=$1")
@@ -1538,7 +1567,7 @@ async fn reconciliation_pm_known_execution_without_fills_locks_hash_at_both_reco
                 replacement.raw = json!({"associate_trades":[]});
                 for found in [true, false] {
                     replacement.found = found;
-                    ensure!(store.record_order_poll(&current, &replacement).await.is_err(),
+                    ensure!(store.record_order_poll(&|_, _| None, &current, &replacement).await.is_err(),
                         "{source}/{has_ids}/{found} lookup replaced hash with known execution");
                     ensure!(leg_snapshot(&store.pool, id).await? == leg_before);
                     ensure!(fill_snapshots(&store.pool, id).await?.is_empty());
@@ -1566,7 +1595,7 @@ async fn reconciliation_pm_hash_fills_lock_identity_and_reject_inconsistent_scan
         let id = legs[0].id;
         let evidence = pm_missing_evidence(&legs[0], "http_404", "page-2", &["hash-fill"]);
         let current = store
-            .record_order_poll(&legs[0], &evidence.poll)
+            .record_order_poll(&|_, _| None, &legs[0], &evidence.poll)
             .await?
             .ok_or_else(|| anyhow::anyhow!("hash fixture poll rejected"))?;
         let mut fill = reconciliation_trade(
@@ -1579,7 +1608,7 @@ async fn reconciliation_pm_hash_fills_lock_identity_and_reject_inconsistent_scan
         fill.finality = FillFinality::Pending;
         ensure!(matches!(
             store
-                .record_reconciliation(
+                .record_reconciliation(&|_, _| None,
                     &current,
                     &[fill.clone()],
                     &evidence,
@@ -1599,7 +1628,7 @@ async fn reconciliation_pm_hash_fills_lock_identity_and_reject_inconsistent_scan
                 .fetch_one(&store.pool)
                 .await?;
         ensure!(store
-            .record_submission(
+            .record_submission(&|_, _| None,
                 id,
                 "actived",
                 Some("different-ack-oid"),
@@ -1625,7 +1654,7 @@ async fn reconciliation_pm_hash_fills_lock_identity_and_reject_inconsistent_scan
                 evidence.poll.clone()
             };
             poll.order_id = Some("different-poll-oid".into());
-            ensure!(store.record_order_poll(&current, &poll).await.is_err());
+            ensure!(store.record_order_poll(&|_, _| None, &current, &poll).await.is_err());
             ensure!(leg_snapshot(&store.pool, id).await? == leg_before);
         }
 
@@ -1668,7 +1697,7 @@ async fn reconciliation_pm_hash_fills_lock_identity_and_reject_inconsistent_scan
             }
             ensure!(
                 store
-                    .record_reconciliation(&current, &[incoming], &next, &progress)
+                    .record_reconciliation(&|_, _| None, &current, &[incoming], &next, &progress)
                     .await
                     .is_err(),
                 "inconsistent {case} unexpectedly accepted"
@@ -1689,16 +1718,16 @@ async fn reconciliation_pm_hash_fills_lock_identity_and_reject_inconsistent_scan
             let mut empty_poll = reconciliation_evidence(legs[0].client_order_id.as_deref().unwrap(), "live").poll;
             empty_poll.shares = Some(Decimal::ZERO);
             empty_poll.raw = json!({"associate_trades":[]});
-            let current = store.record_order_poll(&legs[0], &empty_poll).await?
+            let current = store.record_order_poll(&|_, _| None, &legs[0], &empty_poll).await?
                 .ok_or_else(|| anyhow::anyhow!("zero-execution hash poll rejected"))?;
             let evidence = pm_missing_evidence(&current, "http_404", "page-2", &[]);
             let current = store
-                .record_order_poll(&current, &evidence.poll)
+                .record_order_poll(&|_, _| None, &current, &evidence.poll)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("empty hash scan poll rejected"))?;
             ensure!(matches!(
                 store
-                    .record_reconciliation(
+                    .record_reconciliation(&|_, _| None,
                         &current,
                         &[],
                         &evidence,
@@ -1722,7 +1751,7 @@ async fn reconciliation_pm_hash_fills_lock_identity_and_reject_inconsistent_scan
             let submitted_at = leg_snapshot(&store.pool, current.id).await?["submitted_at"].clone();
             if via_ack {
                 store
-                    .record_submission(
+                    .record_submission(&|_, _| None,
                         current.id,
                         "actived",
                         Some(&oid),
@@ -1734,7 +1763,7 @@ async fn reconciliation_pm_hash_fills_lock_identity_and_reject_inconsistent_scan
                 let mut replacement = reconciliation_evidence(&oid, "live").poll;
                 replacement.shares = Some(Decimal::ZERO);
                 replacement.raw = json!({"associate_trades":[]});
-                ensure!(store.record_order_poll(&current, &replacement).await?.is_some());
+                ensure!(store.record_order_poll(&|_, _| None, &current, &replacement).await?.is_some());
             }
             let recovered = reconciliation_open_leg(store, current.id).await?;
             ensure!(recovered.third_order_id.as_deref() == Some(oid.as_str()));
@@ -1754,20 +1783,20 @@ async fn reconciliation_pm_hash_fills_lock_identity_and_reject_inconsistent_scan
                 ensure!(info["pm_order_constraints"]["associated_trade_ids"] == json!([]));
             }
             let missing = pm_missing_evidence(&recovered, "null_body", "LTE=", &[]);
-            let recovered = store.record_order_poll(&recovered, &missing.poll).await?
+            let recovered = store.record_order_poll(&|_, _| None, &recovered, &missing.poll).await?
                 .ok_or_else(|| anyhow::anyhow!("recovered missing poll rejected"))?;
             let constraints = &recovered.last_order_info.as_ref().unwrap()["pm_order_constraints"];
             ensure!(constraints["order_id"] == oid && constraints["associated_trade_ids"] == json!([]));
             ensure!(constraints["matched_shares_lower_bound"] == if via_ack { Value::Null } else { serde_json::to_value(Decimal::ZERO)? },
                 "old hash order_poll was restored under the recovered oid");
-            ensure!(matches!(store.record_reconciliation(&recovered, &[], &missing,
+            ensure!(matches!(store.record_reconciliation(&|_, _| None, &recovered, &[], &missing,
                 &serde_json::to_value(missing.pm_scan.as_ref().unwrap())?).await?,
                 LegResolution::Terminal {status:"failed", shares, price, fee, ..}
                     if shares.is_zero() && price.is_zero() && fee.is_zero()));
             ensure!(!store.open_legs().await?.iter().any(|leg| leg.id == recovered.id));
             let snapshot = leg_snapshot(&store.pool, recovered.id).await?;
             ensure!(snapshot["last_order_info"]["waiting_reason"].is_null());
-            ensure!(store.record_order_poll(&recovered, &missing.poll).await?.is_none());
+            ensure!(store.record_order_poll(&|_, _| None, &recovered, &missing.poll).await?.is_none());
             ensure!(fill_snapshots(&store.pool, current.id).await?.is_empty());
             let parent = order_snapshot(&store.pool, parent_id).await?;
             ensure!(parent["status"] == "cancelled" && parent["actual_cost"] == json!(0.0));
@@ -1795,19 +1824,28 @@ async fn reconciliation_rejects_stale_snapshots_and_audits_late_submission_respo
         let stale = &legs[0];
         let evidence = reconciliation_evidence("durable-oid", "filled");
         let current = store
-            .record_order_poll(stale, &evidence.poll)
+            .record_order_poll(&|_, _| None, stale, &evidence.poll)
             .await?
             .ok_or_else(|| anyhow::anyhow!("fresh poll rejected"))?;
         let before = leg_snapshot(&store.pool, stale.id).await?;
         ensure!(current.updated_at != stale.updated_at);
         let mut old_poll = evidence.poll.clone();
         old_poll.status = "open".into();
-        ensure!(store.record_order_poll(stale, &old_poll).await?.is_none());
+        ensure!(store
+            .record_order_poll(&|_, _| None, stale, &old_poll)
+            .await?
+            .is_none());
         let old_fill =
             reconciliation_trade("durable-oid", "old-observation", 10, Decimal::from(99));
         ensure!(
             store
-                .record_reconciliation(stale, &[old_fill], &evidence, &json!({"cursor":"old"}))
+                .record_reconciliation(
+                    &|_, _| None,
+                    stale,
+                    &[old_fill],
+                    &evidence,
+                    &json!({"cursor":"old"})
+                )
                 .await?
                 == LegResolution::Pending("stale_leg_snapshot")
         );
@@ -1816,7 +1854,13 @@ async fn reconciliation_rejects_stale_snapshots_and_audits_late_submission_respo
         let fill = reconciliation_trade("durable-oid", "confirmed", 10, Decimal::new(5, 2));
         ensure!(matches!(
             store
-                .record_reconciliation(&current, &[fill], &evidence, &json!({"complete":true}))
+                .record_reconciliation(
+                    &|_, _| None,
+                    &current,
+                    &[fill],
+                    &evidence,
+                    &json!({"complete":true})
+                )
                 .await?,
             LegResolution::Terminal {
                 status: "matched",
@@ -1835,6 +1879,7 @@ async fn reconciliation_rejects_stale_snapshots_and_audits_late_submission_respo
             let response = json!({"late":kind,"raw_response":"retained"});
             store
                 .record_submission(
+                    &|_, _| None,
                     stale.id,
                     status,
                     Some("durable-oid"),
@@ -1880,6 +1925,7 @@ async fn reconciliation_recovered_oid_is_durable_and_matches_same_round_fills_wi
         let id = legs[0].id;
         store
             .record_submission(
+                &|_, _| None,
                 id,
                 "unknown",
                 None,
@@ -1893,7 +1939,7 @@ async fn reconciliation_recovered_oid_is_durable_and_matches_same_round_fills_wi
         evidence.poll.client_order_id = before.client_order_id.clone();
         evidence.poll.coin = Some(before.token_id.clone());
         let recovered = store
-            .record_order_poll(&before, &evidence.poll)
+            .record_order_poll(&|_, _| None, &before, &evidence.poll)
             .await?
             .ok_or_else(|| anyhow::anyhow!("recovery poll rejected"))?;
         // A later fill HTTP failure cannot roll back the already committed order lookup.
@@ -1930,7 +1976,13 @@ async fn reconciliation_recovered_oid_is_durable_and_matches_same_round_fills_wi
         );
         ensure!(matches!(
             store
-                .record_reconciliation(&recovered, &matched, &evidence, &json!({"complete":true}))
+                .record_reconciliation(
+                    &|_, _| None,
+                    &recovered,
+                    &matched,
+                    &evidence,
+                    &json!({"complete":true})
+                )
                 .await?,
             LegResolution::Terminal {
                 status: "matched",
@@ -1963,16 +2015,16 @@ async fn reconciliation_pm_stale_and_parent_sql_failure_roll_back_constraint_gro
         evidence.poll.shares = Some(Decimal::from(6));
         evidence.poll.associated_trades = vec!["a".into()];
         evidence.poll.raw = json!({"associate_trades":["a"]});
-        let stale = store.record_order_poll(&legs[0], &evidence.poll).await?
+        let stale = store.record_order_poll(&|_, _| None, &legs[0], &evidence.poll).await?
             .ok_or_else(|| anyhow::anyhow!("atomic constraints fixture poll rejected"))?;
         let mut pending = reconciliation_trade(&oid, "a", 6, Decimal::new(2, 2));
         pending.coin = Some(stale.token_id.clone());
         pending.finality = FillFinality::Pending;
-        ensure!(matches!(store.record_reconciliation(&stale, &[pending], &evidence,
+        ensure!(matches!(store.record_reconciliation(&|_, _| None, &stale, &[pending], &evidence,
             &json!({"cursor":"page-2"})).await?, LegResolution::Pending(_)));
         let current = reconciliation_open_leg(store, id).await?;
         // This poll is committed separately and must survive either stale work or a later SQL failure.
-        let current = store.record_order_poll(&current, &evidence.poll).await?
+        let current = store.record_order_poll(&|_, _| None, &current, &evidence.poll).await?
             .ok_or_else(|| anyhow::anyhow!("separately committed poll rejected"))?;
         let leg_before = leg_snapshot(&store.pool, id).await?;
         let fills_before = fill_snapshots(&store.pool, id).await?;
@@ -1992,9 +2044,9 @@ async fn reconciliation_pm_stale_and_parent_sql_failure_roll_back_constraint_gro
         let fills = [a, b];
         let progress = json!({"complete":true,"cursor":"LTE="});
         ensure!(evidence.pm_order_constraints.is_none());
-        ensure!(store.record_reconciliation(&stale, &fills, &evidence, &progress).await?
+        ensure!(store.record_reconciliation(&|_, _| None, &stale, &fills, &evidence, &progress).await?
             == LegResolution::Pending("stale_leg_snapshot"));
-        ensure!(store.record_order_poll(&stale, &evidence.poll).await?.is_none());
+        ensure!(store.record_order_poll(&|_, _| None, &stale, &evidence.poll).await?.is_none());
         ensure!(leg_snapshot(&store.pool, id).await? == leg_before);
         ensure!(fill_snapshots(&store.pool, id).await? == fills_before);
         ensure!(order_snapshot(&store.pool, order_id).await? == parent_before);
@@ -2002,7 +2054,7 @@ async fn reconciliation_pm_stale_and_parent_sql_failure_roll_back_constraint_gro
         let constraint = "reconciliation_constraint_growth_fault";
         sqlx::query(&format!("ALTER TABLE arb_orders ADD CONSTRAINT {constraint} CHECK (id <> {order_id} OR actual_cost = 0)"))
             .execute(&store.pool).await?;
-        let rejected = store.record_reconciliation(&current, &fills, &evidence, &progress).await;
+        let rejected = store.record_reconciliation(&|_, _| None, &current, &fills, &evidence, &progress).await;
         ensure!(matches!(&rejected, Err(market_arb::error::Error::Sqlx(sqlx::Error::Database(err)))
             if err.code().as_deref() == Some("23514") && err.constraint() == Some(constraint)),
             "expected parent SQL failure after typed constraint growth, got {rejected:?}");
@@ -2012,7 +2064,7 @@ async fn reconciliation_pm_stale_and_parent_sql_failure_roll_back_constraint_gro
         ensure!(order_snapshot(&store.pool, order_id).await? == parent_before);
         sqlx::query(&format!("ALTER TABLE arb_orders DROP CONSTRAINT {constraint}"))
             .execute(&store.pool).await?;
-        ensure!(store.record_reconciliation(&current, &fills, &evidence, &progress).await? == LegResolution::Terminal {
+        ensure!(store.record_reconciliation(&|_, _| None, &current, &fills, &evidence, &progress).await? == LegResolution::Terminal {
             status:"matched", shares:Decimal::from(6), price:Decimal::new(4,1), fee:Decimal::new(2,2), fee_sources:vec!["actual"]
         });
         let terminal = leg_snapshot(&store.pool, id).await?;
@@ -2049,14 +2101,14 @@ async fn reconciliation_sql_failures_roll_back_fills_leg_and_parent_before_retry
             } else {
                 reconciliation_evidence(&format!("fault-oid-{id}"), "filled")
             };
-            let mut current = store.record_order_poll(&legs[0], &evidence.poll).await?
+            let mut current = store.record_order_poll(&|_, _| None, &legs[0], &evidence.poll).await?
                 .ok_or_else(|| anyhow::anyhow!("fault fixture poll rejected"))?;
             let mut fill = reconciliation_trade(evidence.poll.order_id.as_deref().unwrap(), "real", 10, Decimal::new(7, 2));
             fill.coin = Some(current.token_id.clone());
             let (evidence, progress) = if platform == "polymarket" {
                 let mut pending = fill.clone();
                 pending.finality = FillFinality::Pending;
-                ensure!(matches!(store.record_reconciliation(&current, &[pending], &evidence,
+                ensure!(matches!(store.record_reconciliation(&|_, _| None, &current, &[pending], &evidence,
                     &serde_json::to_value(evidence.pm_scan.as_ref().unwrap())?).await?, LegResolution::Pending(_)));
                 current = reconciliation_open_leg(store, id).await?;
                 let evidence = pm_missing_evidence(&current, "http_404", "LTE=", &["real"]);
@@ -2078,7 +2130,7 @@ async fn reconciliation_sql_failures_roll_back_fills_leg_and_parent_before_retry
             };
             sqlx::query(&format!("ALTER TABLE {table} ADD CONSTRAINT {constraint} CHECK ({check})"))
                 .execute(&store.pool).await?;
-            let rejected = store.record_reconciliation(&current, &[fill.clone()], &evidence, &progress).await;
+            let rejected = store.record_reconciliation(&|_, _| None, &current, &[fill.clone()], &evidence, &progress).await;
             ensure!(matches!(&rejected, Err(market_arb::error::Error::Sqlx(sqlx::Error::Database(err)))
                 if err.code().as_deref() == Some("23514") && err.constraint() == Some(constraint.as_str())),
                 "expected injected {table} constraint failure, got {rejected:?}");
@@ -2088,13 +2140,13 @@ async fn reconciliation_sql_failures_roll_back_fills_leg_and_parent_before_retry
             sqlx::query(&format!("ALTER TABLE {table} DROP CONSTRAINT {constraint}"))
                 .execute(&store.pool).await?;
             // The original snapshot must still be valid because every preceding write rolled back.
-            ensure!(matches!(store.record_reconciliation(&current, &[fill], &evidence, &progress).await?,
+            ensure!(matches!(store.record_reconciliation(&|_, _| None, &current, &[fill], &evidence, &progress).await?,
                 LegResolution::Terminal {status:"matched", ..}));
             ensure!(leg_snapshot(&store.pool, id).await?["last_order_info"]["fill_progress"] == progress);
             ensure!(fill_snapshots(&store.pool, id).await?.len() == 1);
             let parent = order_snapshot(&store.pool, order_id).await?;
             ensure!(parent["status"] == "completed" && parent["actual_cost"] == json!(4.07));
-            store.complete_orders().await?;
+            store.complete_orders(&|_, _| None, ).await?;
             ensure!(order_snapshot(&store.pool, order_id).await? == parent);
         }
         Ok(())
@@ -2118,25 +2170,25 @@ async fn reconciliation_timeouts_use_first_submission_and_history_stays_frozen()
         sqlx::query("UPDATE legs SET submitted_at=NOW()-INTERVAL '2 hours', created_at=NOW(), updated_at=NOW() WHERE order_id=$1")
             .bind(order_id).execute(&store.pool).await?;
         let first = reconciliation_open_leg(store, legs[0].id).await?.submitted_at;
-        store.record_submission(legs[0].id, "unknown", None, &json!({"kind":"unknown"}), &json!({"timeout":true})).await?;
-        store.record_submission(legs[1].id, "actived", Some("partial-oid"), &json!({"kind":"ack"}), &json!({"ack":true})).await?;
+        store.record_submission(&|_, _| None, legs[0].id, "unknown", None, &json!({"kind":"unknown"}), &json!({"timeout":true})).await?;
+        store.record_submission(&|_, _| None, legs[1].id, "actived", Some("partial-oid"), &json!({"kind":"ack"}), &json!({"ack":true})).await?;
         let evidence = reconciliation_evidence("partial-oid", "filled");
         let current = reconciliation_open_leg(store, legs[1].id).await?;
-        let current = store.record_order_poll(&current, &evidence.poll).await?
+        let current = store.record_order_poll(&|_, _| None, &current, &evidence.poll).await?
             .ok_or_else(|| anyhow::anyhow!("partial fill poll rejected"))?;
         let partial = reconciliation_trade("partial-oid", "partial", 2, Decimal::new(1, 2));
-        ensure!(matches!(store.record_reconciliation(&current, &[partial], &evidence, &json!({"cursor":"remaining"})).await?,
+        ensure!(matches!(store.record_reconciliation(&|_, _| None, &current, &[partial], &evidence, &json!({"cursor":"remaining"})).await?,
             LegResolution::Pending(_)));
         for leg in &legs {
-            store.record_submission(leg.id, "unknown", None, &json!({"kind":"unknown","retry":true}), &json!({"retry":true})).await?;
+            store.record_submission(&|_, _| None, leg.id, "unknown", None, &json!({"kind":"unknown","retry":true}), &json!({"retry":true})).await?;
             ensure!(reconciliation_open_leg(store, leg.id).await?.submitted_at == first);
         }
-        ensure!(store.insert_envelope(legs[0].id, "retry-must-not-reset", &json!({}), &json!({}), None).await.is_err());
+        ensure!(store.insert_envelope(&|_, _| None, legs[0].id, "retry-must-not-reset", &json!({}), &json!({}), None).await.is_err());
         let (recent_id, _) = submitted_reconciliation_order(store, &["outcome"]).await?;
         sqlx::query("UPDATE legs SET created_at=NOW()-INTERVAL '2 hours' WHERE order_id=$1")
             .bind(recent_id).execute(&store.pool).await?;
-        ensure!(store.fail_stale_pending_unsubmitted(std::time::Duration::from_secs(60)).await? == 0);
-        ensure!(store.promote_submitted_pending_to_unknown().await? == 1);
+        ensure!(store.fail_stale_pending_unsubmitted(&|_, _| None, std::time::Duration::from_secs(60)).await? == 0);
+        ensure!(store.promote_submitted_pending_to_unknown(&|_, _| None, ).await? == 1);
         let before: Vec<_> = store.open_legs().await?;
         let timeout = std::time::Duration::from_secs(60);
         let stale = store.stale_unknown_legs(timeout).await?;
@@ -2145,7 +2197,7 @@ async fn reconciliation_timeouts_use_first_submission_and_history_stays_frozen()
         ensure!(before[0].status == "unknown" && before[1].status == "actived");
         ensure!(fill_snapshots(&store.pool, legs[1].id).await?.len() == 1, "partial observation must survive timeout");
         let parent = order_snapshot(&store.pool, order_id).await?;
-        store.complete_orders().await?;
+        store.complete_orders(&|_, _| None, ).await?;
         ensure!(order_snapshot(&store.pool, order_id).await? == parent && parent["status"] == "actived");
 
         for position in ["closed", "settled"] {
@@ -2163,19 +2215,19 @@ async fn reconciliation_timeouts_use_first_submission_and_history_stays_frozen()
             let historical_leg = leg_snapshot(&store.pool, leg.id).await?;
             let historical_fills = fill_snapshots(&store.pool, leg.id).await?;
             let evidence = reconciliation_evidence("historical-oid", "filled");
-            store.record_submission(leg.id, "actived", Some("historical-oid"), &json!({"kind":"ack"}), &json!({"late":true})).await?;
-            ensure!(store.record_order_poll(leg, &evidence.poll).await?.is_none());
-            ensure!(matches!(store.record_reconciliation(leg, &[reconciliation_trade("historical-oid", "late-trade", 10, Decimal::ZERO)],
+            store.record_submission(&|_, _| None, leg.id, "actived", Some("historical-oid"), &json!({"kind":"ack"}), &json!({"late":true})).await?;
+            ensure!(store.record_order_poll(&|_, _| None, leg, &evidence.poll).await?.is_none());
+            ensure!(matches!(store.record_reconciliation(&|_, _| None, leg, &[reconciliation_trade("historical-oid", "late-trade", 10, Decimal::ZERO)],
                 &evidence, &json!({})).await?, LegResolution::Pending(_)));
             store.migrate().await?;
-            store.complete_orders().await?;
+            store.complete_orders(&|_, _| None, ).await?;
             ensure!(leg_snapshot(&store.pool, leg.id).await? == historical_leg);
             ensure!(order_snapshot(&store.pool, historical_id).await? == historical_parent);
             ensure!(fill_snapshots(&store.pool, leg.id).await? == historical_fills);
             // Also force the completion scanner's all-terminal path over a historical parent.
             sqlx::query("UPDATE legs SET status='matched',actual_shares=10,actual_price=0.4,actual_fee=0.1 WHERE id=$1")
                 .bind(leg.id).execute(&store.pool).await?;
-            store.complete_orders().await?;
+            store.complete_orders(&|_, _| None, ).await?;
             ensure!(order_snapshot(&store.pool, historical_id).await? == historical_parent,
                 "{position} historical actuals must never be recomputed");
         }
@@ -2386,7 +2438,7 @@ async fn outcome_fee_estimates_survive_abort_timeout_and_lifecycle_insert() {
             fee_estimate: Some(estimate.clone()),
             ..identity_probe_leg()
         }).collect();
-        let (order_id, ids) = fixture.store.insert_actived_order_with_legs(
+        let (order_id, ids) = fixture.store.insert_actived_order_with_legs(&|_, _| None,
             TopicKey::new(Uuid::new_v4(), 0),
             &MarketIdentity::new("polymarket", "fee-estimate-test")?,
             "fee estimate", "fee estimate", None,
@@ -2396,7 +2448,7 @@ async fn outcome_fee_estimates_survive_abort_timeout_and_lifecycle_insert() {
         // 签名证据存在时，费用快照失效不能撤销可能已经提交的腿。
         sqlx::query("INSERT INTO signed_envelopes (leg_id, order_hash, payload) VALUES ($1,'test-envelope','{}')")
             .bind(ids[1]).execute(&fixture.store.pool).await?;
-        fixture.store.abort_unsubmitted_legs(&ids[..2], "fee_snapshot_changed").await?;
+        fixture.store.abort_unsubmitted_legs(&|_, _| None, &ids[..2], "fee_snapshot_changed").await?;
         let aborted = leg_snapshot(&fixture.store.pool, ids[0]).await?;
         ensure!(aborted["status"] == "failed");
         ensure!(aborted["last_order_info"]["fee_estimate"] == estimate);
@@ -2404,7 +2456,7 @@ async fn outcome_fee_estimates_survive_abort_timeout_and_lifecycle_insert() {
         ensure!(signed["status"] == "pending");
         sqlx::query("UPDATE legs SET created_at=NOW()-INTERVAL '1 hour' WHERE id=$1")
             .bind(ids[2]).execute(&fixture.store.pool).await?;
-        fixture.store.fail_stale_pending_unsubmitted(std::time::Duration::from_secs(300)).await?;
+        fixture.store.fail_stale_pending_unsubmitted(&|_, _| None, std::time::Duration::from_secs(300)).await?;
         let expired = leg_snapshot(&fixture.store.pool, ids[2]).await?;
         ensure!(expired["status"] == "failed");
         ensure!(expired["last_order_info"]["fee_estimate"] == estimate);
@@ -2412,7 +2464,7 @@ async fn outcome_fee_estimates_survive_abort_timeout_and_lifecycle_insert() {
         let claim = Uuid::new_v4();
         sqlx::query("UPDATE arb_orders SET lifecycle_action='rebalance', lifecycle_claim_id=$2, lifecycle_claimed_at=NOW() WHERE id=$1")
             .bind(order_id).bind(claim).execute(&fixture.store.pool).await?;
-        let added = fixture.store.insert_legs_atomic(order_id, "rebalance", claim, &legs[..1]).await?;
+        let added = fixture.store.insert_legs_atomic(&|_, _| None, order_id, "rebalance", claim, &legs[..1]).await?;
         let added = leg_snapshot(&fixture.store.pool, added[0]).await?;
         ensure!(added["last_order_info"]["fee_estimate"] == estimate);
         ensure!(added["actual_fee"].is_null());
@@ -2486,6 +2538,7 @@ async fn actived_order_and_initial_legs_are_never_visible_without_each_other() {
         let (order_id, leg_ids) = fixture
             .store
             .insert_actived_order_with_legs(
+                &|_, _| None,
                 TopicKey::new(Uuid::new_v4(), 0),
                 &identity,
                 "atomic creation",
@@ -2502,7 +2555,7 @@ async fn actived_order_and_initial_legs_are_never_visible_without_each_other() {
             .await?;
         let created = order_snapshot(&fixture.store.pool, order_id).await?;
         // 回填任务在建档后立刻跑一轮：新单必须因为持有未完成腿而不被取消。
-        market_arb::exec::mark_orders_complete(&fixture.store).await?;
+        market_arb::exec::mark_orders_complete(&|_, _| None, &fixture.store).await?;
         let after_reconcile = order_snapshot(&fixture.store.pool, order_id).await?;
         let leg_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM legs WHERE order_id = $1 AND status = 'pending'",
@@ -2513,6 +2566,7 @@ async fn actived_order_and_initial_legs_are_never_visible_without_each_other() {
         let rejected_without_legs = fixture
             .store
             .insert_actived_order_with_legs(
+                &|_, _| None,
                 TopicKey::new(Uuid::new_v4(), 0),
                 &identity,
                 "atomic creation",
@@ -2570,6 +2624,7 @@ async fn admission_order(
 ) -> market_arb::error::Result<(i64, Vec<i64>)> {
     store
         .insert_actived_order_with_legs(
+            &|_, _| None,
             key,
             &MarketIdentity::new("polymarket", "admission-condition")?,
             "admission test",
@@ -2837,7 +2892,7 @@ async fn stale_token_cannot_release_or_insert_under_new_claim() {
         };
         let stale_insert_failed = fixture
             .store
-            .insert_leg_for_claim(fixture.order_id, "rebalance", old, &leg)
+            .insert_leg_for_claim(&|_, _| None, fixture.order_id, "rebalance", old, &leg)
             .await
             .is_err();
         let leg_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM legs WHERE order_id = $1")
@@ -3432,6 +3487,7 @@ async fn order_market_identities_insert_read_backfill_and_conflict() {
     identity.insert("outcome", "516").unwrap();
     let (order_id, _) = store
         .insert_actived_order_with_legs(
+            &|_, _| None,
             TopicKey::new(Uuid::new_v4(), 0),
             &identity,
             "identity integration test",

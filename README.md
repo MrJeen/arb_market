@@ -99,9 +99,13 @@ common 数据库提供给本服务的统一事件视为已经完成业务筛选�
 
 任一平台先确认结算时，订单停止止盈、再平衡和所有新交易；两平台 payout 以及 Outcome 实际结算费证据未齐时保持 `settlement_pending`。Outcome 使用官方 `userFillsByTime` 中 `dir=Settlement` 的 `sz/px/fee/feeToken/tid` 核实实扣，并核对钱包/token 的真实买卖成交、转移记录和结算数量。缺费用不是零费用，零兑付也须明确零费证据；已确认无剩余 Outcome 仓位则记 `not_applicable`，不查询无关结算费。不会用单平台结果推算另一侧，也不会自动卖出另一平台持仓。
 
-同钱包/token 的所有相关订单（包括历史 settled）共同参与剩余股数核对，按份额分配真实结算费；确定性尾差保证分配总额等于官方实扣。同组事件和分配独立保存，不改写普通交易 fills。费用核实后 `actual_rev` 为原结算收入减分配费用，`actual_profit` 同额扣减，保留现有成交成本/均价精度口径；证据标记 `settlement_fee_status=verified`、`profit_basis=net_payout_less_trade_costs`。查询窗口不完整、外部持仓或归属不明均继续等待，不使用估算值顶替实扣。未结算 actual 汇总仍保留既有毛锁定兑付口径。
+同钱包/token 的所有相关订单（包括历史 settled）共同参与剩余股数核对，按份额分配真实结算费；确定性尾差保证分配总额等于官方实扣。同组事件和分配独立保存，不改写普通交易 fills。费用核实后 `actual_rev` 为原结算收入减分配费用，`actual_profit` 同额扣减，保留现有成交成本/均价精度口径；证据标记 `settlement_fee_status=verified`、`profit_basis=net_payout_less_trade_costs`。查询窗口不完整、外部持仓或归属不明均继续等待，不使用估算值顶替实扣。未结算 actual 汇总按既有毛锁定兑付减 Outcome 剩余净仓位的卖出费用准备（假设 payout=1，包含 builder），保持 estimated，不是实扣证据。
 
-历史 unknown/旧版毛收益订单不自动重写。使用 `cargo run --bin settlement-audit -- --order-id ID` 只读对账（`APP_POSTGRES_URI` 由进程环境注入，不加载环境文件、不运行迁移、不初始化签名）。报告包含实费、旧值、新值与 `report_fingerprint`；审阅并明确确认后，才可附加 `--apply --confirm-report FINGERPRINT` 应用。写入前重查证据、参与者与旧金额，指纹变化拒绝应用；保留 `actual_cost` 和原 `settled_at`，记录更正审计。历史证据缺失时不得强制套用当前费率。服务启动迁移会新增结算组/事件/分配表并放宽实际收入、利润列的数值精度；不会自动补扣历史费用。
+未结算订单按规范化 wallet/token 分组，优先使用按 submitted_at、leg.id 排序的最新合法冻结 `fee_estimate`；冻结来源没有 TTL，新损坏候选不覆盖旧合法快照。仅当组内相关有成交腿全部已提交、且 `last_order_info` 为 SQL NULL 或合法对象完全缺少 `fee_estimate` 键时，订单真实变化事件才显式使用当前配置账户、严格对应市场的最新有效内存缓存兜底。此处“历史缺失”只是数据形态，不能区分旧数据与新数据意外丢失；JSON null、损坏字段、未提交、钱包/市场不匹配或缓存缺失/过期保持 unknown，不默认零。套利、止盈、再平衡建腿/成交、对账新增或更正执行证据及真实终态转换，在原事务内通过同步缓存 resolver 投影；PM 异步成交费快照与此 resolver 独立，锁内不做网络请求。重复回执、仅诊断/分页进度变化、无状态转换的完成扫描均不重估。
+
+来源只写 `arb_orders.actuals_projection`：各组 `source_kind=frozen/latest_valid_fallback`，冻结保留来源腿，兜底保留原始抓取快照及数值 Unix 秒有效期，不伪造历史腿。顶层标记是否含兜底及最早 `fallback_valid_until`；有效期受双源900秒 TTL 和 monotonic 剩余时间共同限制，选取时仍严格验证缓存 TTL 与身份，原始期限只作为事件估值的审计信息，已落库收益不因当前时间超过该期限自动失效。已取消周期收益扫描及其游标：持仓检查、行情或费率缓存刷新、时间流逝不会改收益及 computed_at；下一次订单真实变化才使用当时合法费率。历史 unknown 无新事件不会自动恢复，不做启动回填。通知只取条件完成事务中的有效已存收益，不独立重算。亏损门禁仍检查投影 status/version/stale，MAX_REALIZED_LOSS 不关闭，真实成交 `fills/actual_fee`、最终结算及零仓关闭不被此估算改写。
+
+历史已最终结算的 unknown/旧版毛收益订单不自动重写。使用 `cargo run --bin settlement-audit -- --order-id ID` 只读对账（`APP_POSTGRES_URI` 由进程环境注入，不加载环境文件、不运行迁移、不初始化签名）。报告包含实费、旧值、新值与 `report_fingerprint`；审阅并明确确认后，才可附加 `--apply --confirm-report FINGERPRINT` 应用。写入前重查证据、参与者与旧金额，指纹变化拒绝应用；保留 `actual_cost` 和原 `settled_at`，记录更正审计。历史证据缺失时不得强制套用当前费率。服务启动迁移会新增结算组/事件/分配表并放宽实际收入、利润列的数值精度；不会自动补扣历史费用。
 
 `settlement_pending` 走独立的扫描游标和批量，默认每 `SETTLEMENT_PENDING_SCAN_INTERVAL_SECS`（60 秒）清扫一次、每次至多 `SETTLEMENT_PENDING_SCAN_BATCH` 条，不再占用 `POSITION_SCAN_BATCH` 给活跃订单的配额，因此 pending 积压不会拉长止盈响应。清扫在同一个循环内串行执行，同一订单不会被两条路径并发处理。pending 没有超时自动最终化，长期缺失对手方 payout 时会持续驻留并每轮重试。
 

@@ -48,7 +48,6 @@ pub struct Engine {
     pub notify: Option<NatsNotifier>,
     pub stats: Arc<MinuteStats>,
     pub position_scan_cursor: Mutex<i64>,
-    pub actuals_scan_cursor: Mutex<i64>,
     pub settlement_scan_cursor: Mutex<i64>,
     pub last_settlement_sweep: Mutex<Option<Instant>>,
     /// 已告警过的超时 unknown 腿；超时腿留在库里持续重试，告警只推一次。
@@ -555,6 +554,7 @@ impl Engine {
         let (order_id, leg_ids) = match self
             .store
             .insert_actived_order_with_legs(
+                &|wallet, token| self.outcome.latest_actuals_fee(wallet, token),
                 topic.key,
                 &topic.market_identity()?,
                 &topic.title,
@@ -594,9 +594,17 @@ impl Engine {
         // 建档等待也可能跨越刷新/过期；尚未签名时整组取消，不能留下单边提交。
         if !self.fees_admitted(selected_fees, confirmation_deadline) {
             self.store
-                .abort_unsubmitted_legs(&[pm_leg, out_leg], "fee_confirmation_changed_or_expired")
+                .abort_unsubmitted_legs(
+                    &|wallet, token| self.outcome.latest_actuals_fee(wallet, token),
+                    &[pm_leg, out_leg],
+                    "fee_confirmation_changed_or_expired",
+                )
                 .await?;
-            mark_orders_complete(&self.store).await?;
+            mark_orders_complete(
+                &|wallet, token| self.outcome.latest_actuals_fee(wallet, token),
+                &self.store,
+            )
+            .await?;
             return Ok(());
         }
         self.stats.orders();
@@ -950,6 +958,7 @@ impl Engine {
         let book_snapshot = self.token_book_snapshot(POLYMARKET, &req.token_id).await;
         self.store
             .insert_envelope(
+                &|wallet, token| self.outcome.latest_actuals_fee(wallet, token),
                 leg_id,
                 &prepared.order_hash,
                 &prepared.envelope,
@@ -959,6 +968,7 @@ impl Engine {
             .await?;
         let (result, response) = self.pm.post_prepared(prepared).await?;
         persist_submit(
+            &|wallet, token| self.outcome.latest_actuals_fee(wallet, token),
             &self.store,
             leg_id,
             POLYMARKET,
@@ -983,6 +993,7 @@ impl Engine {
         let book_snapshot = self.token_book_snapshot(OUTCOME, &req.token_id).await;
         self.store
             .insert_envelope(
+                &|wallet, token| self.outcome.latest_actuals_fee(wallet, token),
                 leg_id,
                 &prepared.order_hash,
                 &prepared.envelope,
@@ -992,6 +1003,7 @@ impl Engine {
             .await?;
         let (result, response) = self.outcome.post_prepared(prepared).await?;
         persist_submit(
+            &|wallet, token| self.outcome.latest_actuals_fee(wallet, token),
             &self.store,
             leg_id,
             OUTCOME,
@@ -1007,12 +1019,20 @@ impl Engine {
     pub async fn reconcile(&self) -> Result<()> {
         let expired = self
             .store
-            .fail_stale_pending_unsubmitted(self.cfg.pending_leg_timeout)
+            .fail_stale_pending_unsubmitted(
+                &|wallet, token| self.outcome.latest_actuals_fee(wallet, token),
+                self.cfg.pending_leg_timeout,
+            )
             .await?;
         if expired > 0 {
             tracing::warn!(expired, "failed stale pending legs never submitted");
         }
-        let promoted = self.store.promote_submitted_pending_to_unknown().await?;
+        let promoted = self
+            .store
+            .promote_submitted_pending_to_unknown(&|wallet, token| {
+                self.outcome.latest_actuals_fee(wallet, token)
+            })
+            .await?;
         if promoted > 0 {
             tracing::warn!(
                 promoted,
@@ -1045,7 +1065,11 @@ impl Engine {
                 tracing::warn!(leg_id = leg.id, error = %err, "reconcile failed");
             }
         }
-        mark_orders_complete(&self.store).await?;
+        mark_orders_complete(
+            &|wallet, token| self.outcome.latest_actuals_fee(wallet, token),
+            &self.store,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1074,7 +1098,13 @@ impl Engine {
     }
 
     async fn reconcile_pm(&self, leg: &crate::store::LegRow) -> Result<()> {
-        let Some((current, poll, page)) = reconcile_pm_page(&self.pm, &self.store, leg).await?
+        let Some((current, poll, page)) = reconcile_pm_page(
+            &|wallet, token| self.outcome.latest_actuals_fee(wallet, token),
+            &self.pm,
+            &self.store,
+            leg,
+        )
+        .await?
         else {
             return Ok(());
         };
@@ -1093,7 +1123,15 @@ impl Engine {
         if !poll.found {
             return Ok(());
         }
-        let Some(current) = self.store.record_order_poll(leg, &poll).await? else {
+        let Some(current) = self
+            .store
+            .record_order_poll(
+                &|wallet, token| self.outcome.latest_actuals_fee(wallet, token),
+                leg,
+                &poll,
+            )
+            .await?
+        else {
             return Ok(());
         };
         let submitted = current
@@ -1209,9 +1247,14 @@ impl Engine {
                 .and_then(Value::as_array)
                 .is_some_and(Vec::is_empty);
         let started = Instant::now();
-        let resolution = apply_reconciliation_page(&self.store, leg, poll, page, || {
-            self.pm_reconciliation_fee_snapshot(leg)
-        })
+        let resolution = apply_reconciliation_page(
+            &|wallet, token| self.outcome.latest_actuals_fee(wallet, token),
+            &self.store,
+            leg,
+            poll,
+            page,
+            || self.pm_reconciliation_fee_snapshot(leg),
+        )
         .await?;
         match resolution {
             LegResolution::Pending(reason) => tracing::debug!(
@@ -1237,15 +1280,6 @@ impl Engine {
     }
 
     pub async fn hedge_once(&self) -> Result<()> {
-        let actuals_after = *self.actuals_scan_cursor.lock().await;
-        match self
-            .store
-            .refresh_actuals_batch(actuals_after, self.cfg.position_scan_batch as i64)
-            .await
-        {
-            Ok(cursor) => *self.actuals_scan_cursor.lock().await = cursor,
-            Err(error) => tracing::warn!(error=%error, "actuals projection scan failed"),
-        }
         let after_id = *self.position_scan_cursor.lock().await;
         let watching = self
             .store
@@ -1602,16 +1636,9 @@ impl Engine {
         } else {
             false
         };
-        // Keep the claim until actuals are durable: a transient refresh failure must remain
-        // retryable on the next scan and must not lose the completion notification.
-        let take_profit_actuals = if action == "take_profit" && has_positive_fill {
-            self.store.refresh_order_actuals(order.id).await?.actuals()
-        } else {
-            None
-        };
-        let released = self
+        let (released, take_profit_actuals) = self
             .store
-            .release_lifecycle(order.id, action, claim_id)
+            .release_lifecycle_with_actuals(order.id, action, claim_id)
             .await?;
         if !released {
             tracing::debug!(
@@ -1622,7 +1649,7 @@ impl Engine {
             );
             return Ok(true);
         }
-        if action == "take_profit" {
+        if action == "take_profit" && has_positive_fill {
             if let Some((actual_cost, _, actual_profit)) = take_profit_actuals {
                 if let Some(notify) = &self.notify {
                     notify.publish_take_profit_completed(TakeProfitCompletedNotice {
@@ -2298,6 +2325,7 @@ impl Engine {
         let leg_ids = self
             .store
             .insert_legs_atomic(
+                &|wallet, token| self.outcome.latest_actuals_fee(wallet, token),
                 order_id,
                 "take_profit",
                 claim_id,
@@ -2340,7 +2368,11 @@ impl Engine {
             .map_err(|_| Error::msg("take profit must create exactly two legs"))?;
         if !self.fees_admitted(&confirmed.fees, confirmed.deadline) {
             self.store
-                .abort_unsubmitted_legs(&[pm_leg, out_leg], "fee_confirmation_changed_or_expired")
+                .abort_unsubmitted_legs(
+                    &|wallet, token| self.outcome.latest_actuals_fee(wallet, token),
+                    &[pm_leg, out_leg],
+                    "fee_confirmation_changed_or_expired",
+                )
                 .await?;
             self.store
                 .release_lifecycle(order_id, "take_profit", claim_id)
@@ -2487,9 +2519,9 @@ impl Engine {
     }
 
     async fn complete_rebalance(&self, order_id: i64) -> Result<()> {
-        // 先落最终实际值；失败时保留 pending/actived，下一轮仍可重试并避免漏通知。
-        let projection = self.store.refresh_order_actuals(order_id).await?;
-        self.store.mark_rebalance(order_id, "completed").await?;
+        let Some(projection) = self.store.mark_rebalance(order_id, "completed").await? else {
+            return Ok(());
+        };
         let Some((actual_cost, _actual_rev, actual_profit)) = projection.actuals() else {
             tracing::warn!(
                 order_id,
@@ -2719,11 +2751,21 @@ impl Engine {
         }
         let ids = self
             .store
-            .insert_legs_atomic(order_id, "rebalance", claim_id, &legs)
+            .insert_legs_atomic(
+                &|wallet, token| self.outcome.latest_actuals_fee(wallet, token),
+                order_id,
+                "rebalance",
+                claim_id,
+                &legs,
+            )
             .await?;
         if !self.fees_admitted(&selected, deadline) {
             self.store
-                .abort_unsubmitted_legs(&ids, "fee_confirmation_changed_or_expired")
+                .abort_unsubmitted_legs(
+                    &|wallet, token| self.outcome.latest_actuals_fee(wallet, token),
+                    &ids,
+                    "fee_confirmation_changed_or_expired",
+                )
                 .await?;
             self.store
                 .release_lifecycle(order_id, "rebalance", claim_id)
@@ -3279,6 +3321,7 @@ pub fn book_recv_skew_ok(a: Instant, b: Instant, max: Duration) -> bool {
 }
 
 async fn apply_reconciliation_page<F, Fut>(
+    resolver: &crate::store::actuals::FeeResolver<'_>,
     store: &Store,
     leg: &crate::store::LegRow,
     poll: OrderPoll,
@@ -3355,7 +3398,7 @@ where
         pm_order_constraints: None,
     };
     store
-        .record_reconciliation(leg, &matched, &evidence, &page.progress)
+        .record_reconciliation(resolver, leg, &matched, &evidence, &page.progress)
         .await
 }
 
@@ -3379,6 +3422,7 @@ fn merge_page_observations(page: &[TradeFill], stored: Vec<TradeFill>) -> Result
 }
 
 async fn reconcile_pm_page(
+    resolver: &crate::store::actuals::FeeResolver<'_>,
     pm: &PolymarketVenue,
     store: &Store,
     leg: &crate::store::LegRow,
@@ -3395,7 +3439,7 @@ async fn reconcile_pm_page(
         return Ok(None);
     };
     let poll = pm.poll_order(funder, selector).await?;
-    let Some(current) = store.record_order_poll(leg, &poll).await? else {
+    let Some(current) = store.record_order_poll(resolver, leg, &poll).await? else {
         return Ok(None);
     };
     let Some(submitted) = current.submitted_at else {
@@ -3432,6 +3476,7 @@ async fn reconcile_pm_page(
 }
 
 async fn persist_submit(
+    resolver: &crate::store::actuals::FeeResolver<'_>,
     store: &Store,
     leg_id: i64,
     platform: &str,
@@ -3504,7 +3549,15 @@ async fn persist_submit(
         ),
     };
     store
-        .record_submission_with_fill(leg_id, status, oid, &evidence, response, matched_fill)
+        .record_submission_with_fill(
+            resolver,
+            leg_id,
+            status,
+            oid,
+            &evidence,
+            response,
+            matched_fill,
+        )
         .await
 }
 
@@ -3617,8 +3670,11 @@ pub fn parent_terminal_status(has_open_legs: bool, positive_matched: bool) -> Op
     }
 }
 
-pub async fn mark_orders_complete(store: &Store) -> Result<()> {
-    store.complete_orders().await
+pub async fn mark_orders_complete(
+    resolver: &crate::store::actuals::FeeResolver<'_>,
+    store: &Store,
+) -> Result<()> {
+    store.complete_orders(resolver).await
 }
 
 fn resolve_hedge_pm_funder(
@@ -3717,7 +3773,6 @@ mod tests {
             notify: None,
             stats: Arc::new(MinuteStats::new()),
             position_scan_cursor: Mutex::new(0),
-            actuals_scan_cursor: Mutex::new(0),
             settlement_scan_cursor: Mutex::new(0),
             last_settlement_sweep: Mutex::new(None),
             reported_stale_unknown: Mutex::new(HashSet::new()),
@@ -4428,7 +4483,6 @@ mod tests {
             notify: None,
             stats: Arc::new(MinuteStats::new()),
             position_scan_cursor: Mutex::new(0),
-            actuals_scan_cursor: Mutex::new(0),
             settlement_scan_cursor: Mutex::new(0),
             last_settlement_sweep: Mutex::new(None),
             reported_stale_unknown: Mutex::new(HashSet::new()),
@@ -4588,7 +4642,6 @@ mod tests {
             notify: None,
             stats: Arc::new(MinuteStats::new()),
             position_scan_cursor: Mutex::new(0),
-            actuals_scan_cursor: Mutex::new(0),
             settlement_scan_cursor: Mutex::new(0),
             last_settlement_sweep: Mutex::new(None),
             reported_stale_unknown: Mutex::new(HashSet::new()),
@@ -4739,7 +4792,6 @@ mod tests {
                 notify: None,
                 stats: Arc::new(MinuteStats::new()),
                 position_scan_cursor: Mutex::new(0),
-                actuals_scan_cursor: Mutex::new(0),
                 settlement_scan_cursor: Mutex::new(0),
                 last_settlement_sweep: Mutex::new(None),
                 reported_stale_unknown: Mutex::new(HashSet::new()),
@@ -5180,7 +5232,7 @@ mod tests {
             ] {
                 let identity = MarketIdentity::new(POLYMARKET, "test-condition")?;
                 let (_, ids) = store
-                    .insert_actived_order_with_legs(
+                    .insert_actived_order_with_legs(&|_, _| None,
                         TopicKey::new(uuid::Uuid::new_v4(), 0),
                         &identity,
                         "PM window test",
@@ -5211,7 +5263,7 @@ mod tests {
                     .await?;
                 let oid = format!("taker-{}", ids[0]);
                 store
-                    .insert_envelope(ids[0], &oid, &json!({}), &json!({"test":true}), None)
+                    .insert_envelope(&|_, _| None, ids[0], &oid, &json!({}), &json!({"test":true}), None)
                     .await?;
                 if missing_time {
                     sqlx::query("UPDATE legs SET submitted_at=NULL WHERE id=$1")
@@ -5241,7 +5293,7 @@ mod tests {
                     ));
                 }
                 let (pm, server) = poll_stub(responses).await;
-                let page_result = reconcile_pm_page(&pm, &store, &leg).await?;
+                let page_result = reconcile_pm_page(&|_, _| None, &pm, &store, &leg).await?;
                 let requests = tokio::time::timeout(Duration::from_secs(5), server).await??;
                 if missing_time {
                     assert!(page_result.is_none());
@@ -5269,7 +5321,7 @@ mod tests {
                 assert_eq!(current.submitted_at, leg.submitted_at);
                 assert_eq!(current.third_order_id.as_deref(), Some(oid.as_str()));
                 assert!(
-                    matches!(apply_reconciliation_page(&store, &current, poll, page, || async {
+                    matches!(apply_reconciliation_page(&|_, _| None, &store, &current, poll, page, || async {
                         panic!("actual fee must not load a fee source")
                     }).await?,
                     LegResolution::Terminal { status, shares, .. }
@@ -5319,7 +5371,7 @@ mod tests {
             sqlx::query("CREATE TABLE events (id UUID PRIMARY KEY, unified_options JSONB)").execute(&pool).await?;
             let key = TopicKey::new(uuid::Uuid::new_v4(), 7);
             let identity = MarketIdentity::new(POLYMARKET, "test-condition")?;
-            let (_, ids) = store.insert_actived_order_with_legs(
+            let (_, ids) = store.insert_actived_order_with_legs(&|_, _| None,
                 key, &identity, "fee source", "fee source", None,
                 d("10"), d("1"), d("9"), &json!([]), &[NewLeg {
                     platform: POLYMARKET, token_id: "yes", label: "yes", side: "BUY", intent: "arb_buy",
@@ -5343,7 +5395,7 @@ mod tests {
                 dirty: Arc::new(Mutex::new(DirtyCoalescer::default())),
                 topics: Arc::new(RwLock::new(HashMap::new())), pm, outcome,
                 pm_sub_tx, out_sub_tx, notify: None, stats: Arc::new(MinuteStats::new()),
-                position_scan_cursor: Mutex::new(0), actuals_scan_cursor: Mutex::new(0), settlement_scan_cursor: Mutex::new(0),
+                position_scan_cursor: Mutex::new(0), settlement_scan_cursor: Mutex::new(0),
                 last_settlement_sweep: Mutex::new(None), reported_stale_unknown: Mutex::new(HashSet::new()),
             };
             let missing = engine.pm_reconciliation_fee_snapshot(&leg).await?;
@@ -5432,7 +5484,7 @@ mod tests {
             // 复用、混合新旧快照、真正缺费失败、以及预读后的并发更新。
             for mode in ["reuse", "mixed", "fee_failure", "stale"] {
                 let identity = MarketIdentity::new(POLYMARKET, "test-condition")?;
-                let (parent_id, ids) = store.insert_actived_order_with_legs(
+                let (parent_id, ids) = store.insert_actived_order_with_legs(&|_, _| None,
                     TopicKey::new(uuid::Uuid::new_v4(),0), &identity, "PM fee recovery", "PM fee recovery", None,
                     d("10"), d("1"), d("9"), &json!([]), &[NewLeg {
                         platform:POLYMARKET,token_id:"yes",label:"yes",side:"BUY",intent:"arb_buy",
@@ -5443,7 +5495,7 @@ mod tests {
                 ).await?;
                 let id=ids[0];
                 let oid=format!("fee-oid-{id}");
-                store.insert_envelope(id,&oid,&json!({}),&json!({"test":true}),None).await?;
+                store.insert_envelope(&|_, _| None, id,&oid,&json!({}),&json!({"test":true}),None).await?;
                 let trade = |trade_id:&str, size:&str, status:&str| json!({
                     "id":trade_id,"taker_order_id":oid,"asset_id":"yes","size":size,"price":"0.5",
                     "status":status,"maker_orders":[]
@@ -5458,8 +5510,8 @@ mod tests {
                     "rate":rate,"bps":(d(rate)*d("10000")).to_string(),
                     "condition_id":"test-condition","token_id":"yes"});
                 let leg=store.open_legs().await?.into_iter().find(|leg|leg.id==id).unwrap();
-                let (current,poll,page)=reconcile_pm_page(&pm,&store,&leg).await?.unwrap();
-                assert!(matches!(apply_reconciliation_page(&store,&current,poll,page,|| async {
+                let (current,poll,page)=reconcile_pm_page(&|_, _| None, &pm,&store,&leg).await?.unwrap();
+                assert!(matches!(apply_reconciliation_page(&|_, _| None, &store,&current,poll,page,|| async {
                     source_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     Ok(snapshot_for("0.07"))
                 }).await?,LegResolution::Pending(_)));
@@ -5473,10 +5525,10 @@ mod tests {
                 let responses=vec![(200,Value::Null),(200,json!({"data":[a.clone(),a.clone(),next_b],"next_cursor":"LTE="}))];
                 let (pm,server)=poll_stub(responses).await;
                 let leg=store.open_legs().await?.into_iter().find(|leg|leg.id==id).unwrap();
-                let (current,poll,page)=reconcile_pm_page(&pm,&store,&leg).await?.unwrap();
+                let (current,poll,page)=reconcile_pm_page(&|_, _| None, &pm,&store,&leg).await?.unwrap();
                 let before:Value=sqlx::query_scalar("SELECT to_jsonb(l) FROM legs l WHERE id=$1").bind(id).fetch_one(&store.pool).await?;
                 if mode=="stale" {store.record_reconciliation_wait(&current,"concurrent_update").await?;}
-                let resolution=apply_reconciliation_page(&store,&current,poll,page,|| async {
+                let resolution=apply_reconciliation_page(&|_, _| None, &store,&current,poll,page,|| async {
                     assert!(mode=="mixed" || mode=="fee_failure", "saved fee must skip lookup");
                     source_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if mode=="fee_failure" { return Err(Error::msg("COMMON lookup failed")); }
@@ -5745,7 +5797,7 @@ mod tests {
             let fees = FeeContext { polymarket_fee_rate:d("0.07"), outcome_taker_rate:Decimal::ZERO, outcome_builder_rate:Decimal::ZERO };
             for side in [OrderSide::Buy, OrderSide::Sell] {
                 let identity = MarketIdentity::new(POLYMARKET, "test-condition")?;
-                let (parent, ids) = store.insert_actived_order_with_legs(
+                let (parent, ids) = store.insert_actived_order_with_legs(&|_, _| None,
                     TopicKey::new(uuid::Uuid::new_v4(), 0), &identity,
                     "PM submit test", "PM submit test", None, d("10"), d("1"), d("9"), &json!([]),
                     &[NewLeg {
@@ -5756,7 +5808,7 @@ mod tests {
                 ).await?;
                 let id = ids[0];
                 let oid = format!("oid-{id}");
-                store.insert_envelope(id, &oid, &json!({}), &json!({}), None).await?;
+                store.insert_envelope(&|_, _| None, id, &oid, &json!({}), &json!({}), None).await?;
                 let stale = store.open_legs().await?.into_iter().find(|leg|leg.id == id).unwrap();
                 let (making, taking) = if side == OrderSide::Buy { ("1.2", "3") } else { ("3", "1.2") };
                 let response = json!({"success":true,"status":"matched","orderID":oid,"makingAmount":making,"takingAmount":taking});
@@ -5765,7 +5817,7 @@ mod tests {
                     // 父单刷新失败时，提交响应与腿账务也必须一起回滚。
                     sqlx::query("CREATE FUNCTION reject_parent_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test parent failure'; END $$").execute(&store.pool).await?;
                     sqlx::query("CREATE TRIGGER reject_parent BEFORE UPDATE ON arb_orders FOR EACH ROW EXECUTE FUNCTION reject_parent_update()").execute(&store.pool).await?;
-                    assert!(persist_submit(store,id,POLYMARKET,side,&result,&fees,&response).await.is_err());
+                    assert!(persist_submit(&|_, _| None, store,id,POLYMARKET,side,&result,&fees,&response).await.is_err());
                     let row:(String,Option<Decimal>,Option<Value>)=sqlx::query_as("SELECT l.status,l.actual_shares,e.submit_response FROM legs l JOIN signed_envelopes e ON e.leg_id=l.id WHERE l.id=$1").bind(id).fetch_one(&store.pool).await?;
                     assert_eq!(row.0, "pending");
                     assert!(row.1.is_none());
@@ -5775,8 +5827,8 @@ mod tests {
                     // 先前仅观察到的部分明细不能与提交返回的总量叠加。
                     sqlx::query("INSERT INTO fills(leg_id,third_order_id,trade_id,shares,price) VALUES($1,$2,'observed',1,0.4)").bind(id).bind(&oid).execute(&store.pool).await?;
                 }
-                persist_submit(store,id,POLYMARKET,side,&result,&fees,&response).await?;
-                persist_submit(store,id,POLYMARKET,side,&result,&fees,&response).await?;
+                persist_submit(&|_, _| None, store,id,POLYMARKET,side,&result,&fees,&response).await?;
+                persist_submit(&|_, _| None, store,id,POLYMARKET,side,&result,&fees,&response).await?;
                 let row:(String,Decimal,Decimal,Decimal,Value)=sqlx::query_as("SELECT status,actual_shares,actual_price,actual_fee,last_order_info FROM legs WHERE id=$1").bind(id).fetch_one(&store.pool).await?;
                 assert_eq!((row.0.as_str(),row.1,row.2,row.3),("matched",d("3"),d("0.4"),d("0.0504")));
                 assert_eq!(row.4["submission"]["fill"]["source"],"submit_response");
@@ -5790,9 +5842,9 @@ mod tests {
                 // HTTP 端点不可用；matched 腿不再调度 order/trades 查询。
                 engine.reconcile().await?;
                 let poll=OrderPoll {found:true,status:"matched".into(),order_id:Some(oid.clone()),..Default::default()};
-                assert!(store.record_order_poll(&stale,&poll).await?.is_none());
+                assert!(store.record_order_poll(&|_, _| None, &stale,&poll).await?.is_none());
                 let evidence=FillEvidence {poll,page_complete:true,history_complete:true,expected_shares:None,outcome_scan:None,pm_scan:None,pm_order_constraints:None};
-                assert_eq!(store.record_reconciliation(&stale,&[],&evidence,&Value::Null).await?,LegResolution::Pending("stale_leg_snapshot"));
+                assert_eq!(store.record_reconciliation(&|_, _| None, &stale,&[],&evidence,&Value::Null).await?,LegResolution::Pending("stale_leg_snapshot"));
                 let count:i64=sqlx::query_scalar("SELECT count(*) FROM fills WHERE leg_id=$1").bind(id).fetch_one(&store.pool).await?;
                 assert_eq!(count,if side==OrderSide::Buy {0} else {1});
             }

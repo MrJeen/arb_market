@@ -726,8 +726,86 @@ async fn claims_nonterminal_legs_and_changed_snapshots_block_group_commit() -> R
     exercised
 }
 
+#[test]
+fn event_actuals_have_no_periodic_or_wall_clock_expiry_path() {
+    let store = include_str!("../src/store.rs");
+    let query = store
+        .split("pub async fn sum_actual_profit")
+        .nth(1)
+        .unwrap()
+        .split("pub async fn count_stale_unknown_legs")
+        .next()
+        .unwrap();
+    assert!(!query.contains("fallback_valid_until"));
+    assert!(query.contains("actuals_projection->'version'"));
+    assert!(query.contains("actuals_projection->'stale'"));
+    assert!(!store.contains("refresh_actuals_batch"));
+    let lock = store
+        .split("async fn lock_leg_parent(")
+        .nth(1)
+        .unwrap()
+        .split("async fn leg_actuals_evidence")
+        .next()
+        .unwrap();
+    assert!(!lock.contains("UPDATE arb_orders"));
+    let exec = include_str!("../src/exec.rs");
+    assert!(!exec.contains("actuals_scan_cursor"));
+    assert!(!exec.contains("refresh_order_actuals"));
+}
+
 fn reserve_snapshot(taker: &str, builder: &str) -> Value {
     json!({"fee_estimate":{"version":1,"fee_model":"out_usdc_taker_close_v1","outcome_id":"10000000","token_ids":["#100000000","#100000001"],"taker_rate":taker,"builder_rate":builder,"user_fees_fetched_at":"2000-01-01T00:00:00Z","outcome_meta_fetched_at":"2000-01-01T00:00:00Z"}})
+}
+
+#[tokio::test]
+#[ignore = "requires process APP_POSTGRES_URI; private schema only"]
+async fn actuals_event_estimate_survives_expiry_and_locked_evidence() -> Result<()> {
+    use market_arb::store::actuals::LatestFee;
+    let f = Fixture::new().await?.unwrap();
+    let exercised:Result<()> = async {
+        let s=&f.store;let id=insert_order(s,dec("30")).await?;
+        let source=reserve_snapshot("0.001344","0.0003")["fee_estimate"].clone();
+        let deadline=chrono::Utc::now()+chrono::Duration::seconds(800);
+        let resolver=|wallet:&str,token:&str| Some(LatestFee {wallet:wallet.into(),token:token.into(),snapshot:source.clone(),valid_until:deadline});
+        let before:Value=sqlx::query_scalar("SELECT jsonb_build_object('legs',(SELECT jsonb_agg(to_jsonb(l)) FROM legs l WHERE order_id=$1),'fills',(SELECT jsonb_agg(to_jsonb(f)) FROM fills f JOIN legs l ON l.id=f.leg_id WHERE l.order_id=$1))").bind(id).fetch_one(&s.pool).await?;
+        let projected=s.refresh_order_actuals_with_fallback(id,&resolver).await?;
+        ensure!(projected.actuals().unwrap().1 == -dec("0.04932"));
+        ensure!(projected.evidence()["source_kind"]=="latest_valid_fallback");
+        ensure!(s.sum_actual_profit().await?.1==0);
+        let after:Value=sqlx::query_scalar("SELECT jsonb_build_object('legs',(SELECT jsonb_agg(to_jsonb(l)) FROM legs l WHERE order_id=$1),'fills',(SELECT jsonb_agg(to_jsonb(f)) FROM fills f JOIN legs l ON l.id=f.leg_id WHERE l.order_id=$1))").bind(id).fetch_one(&s.pool).await?;
+        ensure!(before==after);
+        // Persisted source deadlines are audit data, not a live gate or a refresh trigger.
+        for expiry in [None,Some(json!(null)),Some(json!("999999999999999999999")),Some(json!({})),Some(json!([])),Some(json!(true)),Some(json!(0)),Some(json!(chrono::Utc::now().timestamp()))] {
+            let mut evidence=projected.evidence();
+            if let Some(expiry)=expiry {evidence["fallback_valid_until"]=expiry;} else {evidence.as_object_mut().unwrap().remove("fallback_valid_until");}
+            sqlx::query("UPDATE arb_orders SET actuals_projection=$2 WHERE id=$1").bind(id).bind(evidence).execute(&s.pool).await?;
+            ensure!(s.sum_actual_profit().await?.1==0);
+        }
+        let saved=order_json(s,id).await?;
+        s.complete_orders(&resolver).await?;
+        ensure!(order_json(s,id).await?==saved);
+        ensure!(s.sum_actual_profit().await?.1==0);
+        ensure!(s.refresh_order_actuals(id).await?.actuals().is_none());
+        // Hold the parent while new trade evidence is committed; refresh must reread the locked legs.
+        let mut tx=s.pool.begin().await?;
+        sqlx::query("SELECT id FROM arb_orders WHERE id=$1 FOR UPDATE").bind(id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE legs SET actual_shares=15 WHERE order_id=$1").bind(id).execute(&mut *tx).await?;
+        let refresh=s.refresh_order_actuals_with_fallback(id,&resolver);
+        let (refreshed, committed)=tokio::join!(refresh,tx.commit()); committed?;
+        ensure!(serde_json::from_value::<Decimal>(refreshed?.evidence()["estimated_fee"].clone())?==dec("0.02466"));
+        // Zero-position finalization and fallback refresh must serialize without overwriting final evidence.
+        insert_leg(s,id,"SELL",dec("15")).await?;
+        let (closed,refresh)=tokio::join!(s.finalize_closed_position(id),s.refresh_order_actuals_with_fallback(id,&resolver));
+        ensure!(closed?.is_some());refresh?;
+        let final_row=order_json(s,id).await?;
+        ensure!(final_row["actuals_projection"]["status"]=="final");
+        s.refresh_order_actuals_with_fallback(id,&resolver).await?;
+        ensure!(order_json(s,id).await?==final_row);
+        ensure!(s.sum_actual_profit().await?.1==0);
+        Ok(())
+    }.await;
+    f.cleanup().await?;
+    exercised
 }
 
 #[tokio::test]
@@ -738,7 +816,7 @@ async fn actuals_reserve_unknown_completion_retry_and_partial_close() -> Result<
         let s=&f.store;let id=insert_order(s,dec("30")).await?;
         sqlx::query("UPDATE arb_orders SET status='actived',actual_cost=3,actual_rev=2,actual_profit=-1 WHERE id=$1").bind(id).execute(&s.pool).await?;
         sqlx::query("UPDATE legs SET status='failed' WHERE order_id=$1").bind(id).execute(&s.pool).await?;
-        s.complete_orders().await?;
+        s.complete_orders(&|_, _| None, ).await?;
         let row=order_json(s,id).await?;
         ensure!(row["status"]=="completed" && row["actuals_projection"]["status"]=="unknown");
         ensure!(serde_json::from_value::<Decimal>(row["actual_profit"].clone())?==dec("-1"));
@@ -756,7 +834,7 @@ async fn actuals_reserve_unknown_completion_retry_and_partial_close() -> Result<
         }
         let first=s.refresh_order_actuals(id).await?.actuals().unwrap();
         ensure!(first.1 == -dec("0.04932"));ensure!(s.refresh_order_actuals(id).await?.actuals()==Some(first));
-        sqlx::query("UPDATE arb_orders SET status='actived' WHERE id=$1").bind(id).execute(&s.pool).await?;s.complete_orders().await?;
+        sqlx::query("UPDATE arb_orders SET status='actived' WHERE id=$1").bind(id).execute(&s.pool).await?;s.complete_orders(&|_, _| None, ).await?;
         let row=order_json(s,id).await?;ensure!(serde_json::from_value::<Decimal>(row["actual_rev"].clone())?==first.1);
         let sell=insert_leg(s,id,"SELL",dec("15")).await?;
         sqlx::query("UPDATE legs SET status='cancelled' WHERE id=$1").bind(sell).execute(&s.pool).await?;
@@ -767,7 +845,7 @@ async fn actuals_reserve_unknown_completion_retry_and_partial_close() -> Result<
         sqlx::query("UPDATE legs SET status='unknown' WHERE id=$1").bind(sell).execute(&s.pool).await?;
         ensure!(s.refresh_order_actuals(id).await?.actuals().is_none());
         sqlx::query("UPDATE legs SET status='cancelled' WHERE id=$1").bind(sell).execute(&s.pool).await?;
-        let next=s.refresh_actuals_batch(0,1).await?;ensure!(next==id);ensure!(s.refresh_actuals_batch(next,1).await?==0);
+        s.refresh_order_actuals(id).await?;
         sqlx::query("UPDATE arb_orders SET position_status='watching' WHERE id=$1").bind(id).execute(&s.pool).await?;
         insert_leg(s,id,"SELL",dec("15")).await?;
         let (closed,refreshed)=tokio::join!(s.finalize_closed_position(id),s.refresh_order_actuals(id));
@@ -787,17 +865,41 @@ async fn actuals_reserve_unknown_completion_retry_and_partial_close() -> Result<
 #[tokio::test]
 #[ignore = "requires process APP_POSTGRES_URI; private schema only"]
 async fn actuals_reserve_final_fee_replaces_estimate_above_and_below() -> Result<()> {
-    for real_fee in ["0.001", "0.1"] {
+    for (real_fee, use_fallback) in [
+        ("0.001", false),
+        ("0.1", false),
+        ("0.001", true),
+        ("0.1", true),
+    ] {
         let f = Fixture::new().await?.unwrap();
         let exercised: Result<()> = async {
             let s = &f.store;
             let id = insert_order(s, dec("9")).await?;
-            sqlx::query("UPDATE legs SET last_order_info=$2 WHERE order_id=$1")
-                .bind(id)
-                .bind(reserve_snapshot("0.001344", "0.0003"))
-                .execute(&s.pool)
-                .await?;
-            ensure!(s.refresh_order_actuals(id).await?.actuals().unwrap().1 == -dec("0.014796"));
+            let source = reserve_snapshot("0.001344", "0.0003");
+            let deadline = chrono::Utc::now() + chrono::Duration::seconds(800);
+            let resolver = |wallet: &str, token: &str| {
+                Some(market_arb::store::actuals::LatestFee {
+                    wallet: wallet.into(),
+                    token: token.into(),
+                    snapshot: source["fee_estimate"].clone(),
+                    valid_until: deadline,
+                })
+            };
+            if !use_fallback {
+                sqlx::query("UPDATE legs SET last_order_info=$2 WHERE order_id=$1")
+                    .bind(id)
+                    .bind(&source)
+                    .execute(&s.pool)
+                    .await?;
+            }
+            ensure!(
+                s.refresh_order_actuals_with_fallback(id, &resolver)
+                    .await?
+                    .actuals()
+                    .unwrap()
+                    .1
+                    == -dec("0.014796")
+            );
             let prepared = s.prepare_settlement_fee_group(&key()).await?;
             s.commit_settlement_fee_group(
                 &prepared,
@@ -809,7 +911,7 @@ async fn actuals_reserve_final_fee_replaces_estimate_above_and_below() -> Result
             let final_evidence = json!({});
             let (finalized, refresh) = tokio::join!(
                 s.finalize_position_settlement(id, "test", &final_evidence),
-                s.refresh_order_actuals(id)
+                s.refresh_order_actuals_with_fallback(id, &resolver)
             );
             refresh?;
             let actual = finalized?.unwrap();
@@ -826,4 +928,104 @@ async fn actuals_reserve_final_fee_replaces_estimate_above_and_below() -> Result
         exercised?;
     }
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires process APP_POSTGRES_URI; private schema only"]
+async fn order_events_project_atomically_and_noops_preserve_saved_estimates() -> Result<()> {
+    use market_arb::store::{actuals::LatestFee, NewLeg};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let f = Fixture::new().await?.unwrap();
+    let exercised: Result<()> = async {
+        let s = &f.store;
+        let id = insert_order(s, dec("30")).await?;
+        let calls = AtomicUsize::new(0);
+        let source = reserve_snapshot("0.001344", "0.0003")["fee_estimate"].clone();
+        let resolver = |wallet: &str, token: &str| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some(LatestFee { wallet: wallet.into(), token: token.into(), snapshot: source.clone(),
+                valid_until: chrono::Utc::now() + chrono::Duration::seconds(800) })
+        };
+        // No new event means historical unknown remains unknown, even with a valid cache.
+        let historical = order_json(s, id).await?;
+        s.complete_orders(&resolver).await?;
+        ensure!(order_json(s, id).await? == historical);
+        ensure!(calls.load(Ordering::SeqCst) == 0);
+        let claim = s.try_claim_lifecycle(id, "take_profit").await?.unwrap();
+        let pending = NewLeg { platform: "polymarket", token_id: "pm-win", label: "NO",
+            side: "SELL", intent: "take_profit", funder: Some("funder"), wallet: None,
+            service: None, req_price: dec("0.5"), req_shares: dec("1"), req_fee: Decimal::ZERO,
+            client_order_id: None, fee_estimate: None };
+        let leg_id = s.insert_leg_for_claim(&resolver, id, "take_profit", claim, &pending).await?;
+        let before = order_json(s, id).await?;
+        let leg = s.open_legs().await?.into_iter().find(|leg| leg.id == leg_id).unwrap();
+        s.record_reconciliation_wait(&leg, "diagnostic only").await?;
+        ensure!(order_json(s, id).await? == before);
+        sqlx::query("UPDATE arb_orders SET status='actived' WHERE id=$1").bind(id).execute(&s.pool).await?;
+        let incomplete = order_json(s, id).await?;
+        s.complete_orders(&|_, _| panic!("incomplete scan must not price")).await?;
+        ensure!(order_json(s, id).await? == incomplete);
+        let poll = market_arb::platforms::OrderPoll {
+            found: true, status: "live".into(), order_id: Some("pm-event-order".into()),
+            coin: Some("pm-win".into()), ..Default::default()
+        };
+        let leg = s.open_legs().await?.into_iter().find(|leg| leg.id == leg_id).unwrap();
+        let current = s.record_order_poll(&resolver, &leg, &poll).await?.unwrap();
+        let polled = order_json(s, id).await?;
+        let no_cache = |_: &str, _: &str| -> Option<LatestFee> { panic!("no-op must not resolve fees") };
+        let current = s.record_order_poll(&no_cache, &current, &poll).await?.unwrap();
+        ensure!(order_json(s, id).await? == polled);
+        let evidence = market_arb::reconcile::FillEvidence {
+            poll: poll.clone(), page_complete: false, history_complete: false,
+            expected_shares: None, pm_scan: None, outcome_scan: None, pm_order_constraints: None,
+        };
+        s.record_reconciliation(&no_cache, &current, &[], &evidence, &json!({"diagnostic_page":1})).await?;
+        ensure!(order_json(s, id).await? == polled);
+        // A failed parent projection must roll back the terminal receipt too.
+        sqlx::query("CREATE FUNCTION reject_event_projection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test projection failure'; END $$")
+            .execute(&s.pool).await?;
+        sqlx::query("CREATE TRIGGER reject_event_projection BEFORE UPDATE OF actuals_projection ON arb_orders FOR EACH ROW EXECUTE FUNCTION reject_event_projection()")
+            .execute(&s.pool).await?;
+        // Restore the pre-ack fixture state to exercise the submission terminal branch.
+        sqlx::query("UPDATE legs SET status='pending' WHERE id=$1").bind(leg_id).execute(&s.pool).await?;
+        ensure!(s.record_submission(&resolver, leg_id, "cancelled", None, &json!({"kind":"no_match"}), &json!({})).await.is_err());
+        let status: String = sqlx::query_scalar("SELECT status FROM legs WHERE id=$1").bind(leg_id).fetch_one(&s.pool).await?;
+        ensure!(status == "pending");
+        sqlx::query("DROP TRIGGER reject_event_projection ON arb_orders").execute(&s.pool).await?;
+        sqlx::query("DROP FUNCTION reject_event_projection()").execute(&s.pool).await?;
+        // Accepting a zero-fill terminal receipt resolves the new leg and prices the old
+        // Outcome exposure in the same transaction, without manufacturing a frozen leg.
+        s.record_submission(&resolver, leg_id, "cancelled", None, &json!({"kind":"no_match"}), &json!({})).await?;
+        let priced = order_json(s, id).await?;
+        ensure!(priced["actuals_projection"]["source_kind"] == "latest_valid_fallback");
+        ensure!(serde_json::from_value::<Decimal>(priced["actual_rev"].clone())? == -dec("0.04932"));
+        let frozen: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM legs WHERE order_id=$1 AND last_order_info ? 'fee_estimate')")
+            .bind(id).fetch_one(&s.pool).await?;
+        ensure!(!frozen);
+        let count = calls.load(Ordering::SeqCst);
+        let no_cache = |_: &str, _: &str| -> Option<LatestFee> { panic!("no-op must not resolve fees") };
+        s.record_submission(&no_cache, leg_id, "cancelled", None, &json!({"kind":"no_match","diagnostic":2}), &json!({"replay":true})).await?;
+        s.complete_orders(&no_cache).await?;
+        ensure!(order_json(s, id).await? == priced);
+        ensure!(calls.load(Ordering::SeqCst) == count);
+        let (released, amounts) = s.release_lifecycle_with_actuals(id, "take_profit", claim).await?;
+        ensure!(released && amounts.is_some());
+        ensure!(!s.release_lifecycle_with_actuals(id, "take_profit", claim).await?.0);
+        ensure!(s.mark_rebalance(id, "completed").await?.unwrap().actuals() == amounts);
+        let completed = order_json(s, id).await?;
+        ensure!(s.mark_rebalance(id, "completed").await?.is_none());
+        ensure!(order_json(s, id).await? == completed);
+        // A new real transition with expired/missing cache cannot reuse the old estimate.
+        let claim = s.try_claim_lifecycle(id, "rebalance").await?.unwrap();
+        let leg_id = s.insert_leg_for_claim(&resolver, id, "rebalance", claim, &pending).await?;
+        s.abort_unsubmitted_legs(&|_, _| None, &[leg_id], "aborted").await?;
+        ensure!(order_json(s, id).await?["actuals_projection"]["status"] == "unknown");
+        let unknown = order_json(s, id).await?;
+        s.abort_unsubmitted_legs(&no_cache, &[leg_id], "replay").await?;
+        s.complete_orders(&no_cache).await?;
+        ensure!(order_json(s, id).await? == unknown);
+        Ok(())
+    }.await;
+    f.cleanup().await?;
+    exercised
 }

@@ -59,6 +59,32 @@ impl OutcomeFeeSnapshot {
         self.account_time.fresh_at(now) && self.market_time.fresh_at(now)
     }
 
+    /// Bound persisted estimates by both original wall-clock deadlines and remaining
+    /// monotonic lifetime. Recomputing a projection never renews its fee sources.
+    pub fn valid_until(&self) -> Option<DateTime<Utc>> {
+        self.valid_until_at(Instant::now(), Utc::now())
+    }
+
+    fn valid_until_at(&self, instant: Instant, utc: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let mut deadline =
+            utc.checked_add_signed(chrono::Duration::seconds(FEE_MAX_AGE.as_secs() as i64))?;
+        for source in [&self.account_time, &self.market_time] {
+            let remaining =
+                FEE_MAX_AGE.checked_sub(instant.saturating_duration_since(source.monotonic))?;
+            if remaining.is_zero() {
+                return None;
+            }
+            let wall = source
+                .utc
+                .checked_add_signed(chrono::Duration::seconds(FEE_MAX_AGE.as_secs() as i64))?;
+            let monotonic = utc.checked_add_signed(chrono::Duration::from_std(remaining).ok()?)?;
+            deadline = deadline.min(wall).min(monotonic);
+        }
+        // Persist whole Unix seconds conservatively; exact expiry is unavailable.
+        let deadline = DateTime::from_timestamp(deadline.timestamp(), 0)?;
+        (deadline > utc).then_some(deadline)
+    }
+
     /// 成功续期不改变经济规则；账户或本市场参数变化后旧确认失效。
     pub fn same_rules(&self, other: &Self) -> bool {
         self.outcome_id == other.outcome_id
@@ -380,6 +406,53 @@ mod tests {
         let markets = parse_markets(value, &account).unwrap();
         cache.publish(account, markets, Decimal::ZERO).unwrap();
     }
+    #[test]
+    fn persisted_deadline_uses_both_sources_and_never_renews() {
+        let mut cache = FeeCache::default();
+        publish(&mut cache, &meta());
+        let mut snapshot = cache.get(516).unwrap();
+        let instant = Instant::now();
+        let utc = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        for account_old in [true, false] {
+            snapshot.account_time = SourceTime {
+                monotonic: instant,
+                utc,
+            };
+            snapshot.market_time = SourceTime {
+                monotonic: instant,
+                utc,
+            };
+            let old = if account_old {
+                &mut snapshot.account_time
+            } else {
+                &mut snapshot.market_time
+            };
+            old.monotonic = instant - Duration::from_secs(100);
+            old.utc = utc - chrono::Duration::seconds(100);
+            let deadline = utc + chrono::Duration::seconds(800);
+            assert_eq!(snapshot.valid_until_at(instant, utc), Some(deadline));
+            assert_eq!(
+                snapshot.valid_until_at(
+                    instant + Duration::from_secs(50),
+                    utc + chrono::Duration::seconds(50)
+                ),
+                Some(deadline)
+            );
+            assert_eq!(
+                snapshot.valid_until_at(instant + Duration::from_secs(800), deadline),
+                None
+            );
+            // Forward/backward wall-clock movement cannot extend monotonic TTL.
+            assert!(
+                snapshot
+                    .valid_until_at(instant, utc - chrono::Duration::seconds(50))
+                    .unwrap()
+                    <= deadline
+            );
+            assert_eq!(snapshot.valid_until_at(instant, deadline), None);
+        }
+    }
+
     #[test]
     fn sample_scale_and_discount_boundaries() {
         for (scale, expected) in [("0", "0.000672"), ("1", "0.001344"), ("10", "0.01344")] {
