@@ -1785,6 +1785,54 @@ impl Store {
         Ok(row.and_then(|item| item.0))
     }
 
+    /// Fixed ID bound, not a database snapshot: later commits below it may be seen.
+    pub async fn unknown_actuals_upper_id(&self) -> Result<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT COALESCE(MAX(id),0) FROM arb_orders")
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    pub async fn unknown_actuals_page(&self, after: i64, upper: i64) -> Result<Vec<i64>> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM arb_orders WHERE id>$1 AND id<=$2
+            AND settled_at IS NULL AND position_status IN ('watching','settlement_pending')
+            AND COALESCE(actuals_projection->>'status','unknown')='unknown'
+            ORDER BY id LIMIT 20",
+        )
+        .bind(after)
+        .bind(upper)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Recheck after the same advisory → parent lock used by event projections.
+    pub async fn refresh_unknown_order_actuals_with_fallback(
+        &self,
+        order_id: i64,
+        resolver: &actuals::FeeResolver<'_>,
+    ) -> Result<Option<actuals::Projection>> {
+        let mut tx = self.pool.begin().await?;
+        settlement_fees::lock_writes(&mut tx).await?;
+        let eligible: Option<bool> = sqlx::query_scalar(
+            "SELECT settled_at IS NULL
+            AND position_status IN ('watching','settlement_pending')
+            AND COALESCE(actuals_projection->>'status','unknown')='unknown'
+            FROM arb_orders WHERE id=$1 FOR UPDATE",
+        )
+        .bind(order_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let projection = if eligible == Some(true) {
+            Some(project_in_tx_with_fallback(&mut tx, order_id, resolver).await?)
+        } else {
+            None
+        };
+        tx.commit().await?;
+        Ok(projection)
+    }
+
     pub async fn refresh_order_actuals(&self, order_id: i64) -> Result<actuals::Projection> {
         self.refresh_order_actuals_with_fallback(order_id, &|_, _| None)
             .await

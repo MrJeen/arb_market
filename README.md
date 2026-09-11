@@ -71,6 +71,23 @@ PM 买入签名保持既有 maker 金额两位、taker 股数五位精度，但�
 分钟统计：`outcome_fee_refresh_ok/failed` 统计完整刷新结果，`outcome_fee_unavailable` 统计费率不可用跳过。正常细节DEBUG、就绪/失效/恢复INFO、刷新失败WARN；不打印完整费用响应。
 
 
+## 人工重算历史 unknown 收益
+
+历史订单没有新事件时不会自动恢复估值。部署包含此命令的新版二进制后，建议先停服务，在项目工作目录以服务用户执行一次，再根据汇总排查残留 unknown 后启动服务：
+
+```sh
+cd /var/www/arb_market
+sudo -u market-arb ./dist/market-arb recompute-actuals --confirm
+```
+
+这是独立于日常事件驱动的人工维护入口，不加入正常启动、systemd 或定时扫描。无参数仍启动原服务；`--help` 仅显示帮助；缺确认、未知/重复/多余参数均在配置和 I/O 前拒绝。
+
+命令沿用工作目录 dotenv 配置，仅使用 `APP_POSTGRES_URI`、`HYPERLIQUID_INFO_URL`、`OUTCOME_ACCOUNT_ADDRESS`、`OUTCOME_BUILDER_ADDRESS/FEE`，不加载 funders、不解析私钥、不要求 common；只读费用客户端不创建 signer，不发送交易或连接 WS。不执行迁移，业务库须已完成已有迁移，并预留投影写入和 info 费用查询权限。
+
+一轮固定最大订单 ID，每页20个，仅尝试未 settled 且处于 `watching/settlement_pending` 的 unknown 投影。ID 上界不是一致性快照，可能看到启动前已分配 ID、稍后才提交的行；不追逐上界外新订单。锁内重检后跳过已恢复、已关闭/最终结算或删除的订单。只原子更新收益及投影，不改交易腿、fills、历史 fee_estimate、实扣费用、结算和生命周期。优先冻结快照；只有完全缺失快照且已提交的历史组才使用身份匹配的有效内存费率，损坏/过期/错误钱包证据仍 unknown，无证据不清零原金额。
+
+有候选才查询费用，长批次在页间按300秒间隔刷新；刷新失败计入 errors，但仍尝试冻结证据，不延长旧缓存有效期。账户缺失也不阻止冻结路径。单单失败继续并推进游标，数据库连接或分页失败停止。运行后输出 `upper_id/scanned/repaired/still_unknown/skipped/errors`；存在 still_unknown 或 errors 时非零退出，并发正常跳过不算失败。重跑只尝试剩余 unknown，不覆盖已成功估值；成功仅代表本轮候选，不代表全局风控一定放行。
+
 ## 成交确认与恢复
 
 ACK 仅记录已受理及预期撮合量，交易腿保留 `actived`，不生成 `ack:` 伪成交或暂估实际费用。Polymarket 必须取齐订单关联的成交并等待 `CONFIRMED`／`FAILED` 最终状态；兼容 REST 的 `TRADE_STATUS_*` 和既有裸值，只有 Confirmed 部分计入仓位，`MATCHED`、`MATCHED_NOT_BROADCASTED`、`MINED`、`RETRYING` 和未知状态继续等待。订单状态兼容明确的 `ORDER_STATUS_*` 枚举及裸值，未知状态不能靠后缀猜为取消；原始状态保留在证据中。订单查询中的正撮合量不替代成交确认。

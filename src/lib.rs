@@ -8,6 +8,7 @@ pub mod exec;
 pub mod hedge;
 pub mod notify;
 pub mod platforms;
+pub mod recompute_actuals;
 pub mod reconcile;
 pub mod settlement;
 pub mod settlement_fees;

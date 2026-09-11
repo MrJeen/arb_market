@@ -14,6 +14,31 @@ pub const OUTCOME: &str = "outcome";
 /// https://docs.outcome.xyz/builder-codes
 pub const DEFAULT_OUTCOME_BUILDER: &str = "0xab5dbc057628bc18523c4cdfc0e1e2ebdbecb704";
 
+const DEFAULT_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
+
+/// 人工重算仅需业务库和只读费用配置；不加载 funders、私钥或 common。
+#[derive(Clone)]
+pub struct RecomputeActualsConfig {
+    pub app_postgres_uri: String,
+    pub hyperliquid_info_url: String,
+    pub outcome_account_address: Option<String>,
+    pub outcome_builder_address: Option<String>,
+    pub outcome_builder_fee: u32,
+}
+
+impl RecomputeActualsConfig {
+    pub fn from_env() -> Result<Self> {
+        let _ = dotenvy::dotenv();
+        Ok(Self {
+            app_postgres_uri: env_required("APP_POSTGRES_URI")?,
+            hyperliquid_info_url: env_or("HYPERLIQUID_INFO_URL", DEFAULT_INFO_URL),
+            outcome_account_address: env_opt("OUTCOME_ACCOUNT_ADDRESS"),
+            outcome_builder_address: parse_outcome_builder()?,
+            outcome_builder_fee: env_u64("OUTCOME_BUILDER_FEE", 0) as u32,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub common_postgres_uri: String,
@@ -122,10 +147,7 @@ impl Config {
             ),
             polymarket_funders: funders,
             polymarket_auth_ttl: Duration::from_secs(env_u64("POLYMARKET_AUTH_TTL_SECS", 86400)),
-            hyperliquid_info_url: env_or(
-                "HYPERLIQUID_INFO_URL",
-                "https://api.hyperliquid.xyz/info",
-            ),
+            hyperliquid_info_url: env_or("HYPERLIQUID_INFO_URL", DEFAULT_INFO_URL),
             hyperliquid_exchange_url: env_or(
                 "HYPERLIQUID_EXCHANGE_URL",
                 "https://api.hyperliquid.xyz/exchange",

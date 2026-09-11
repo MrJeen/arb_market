@@ -190,6 +190,27 @@ impl Drop for FeeRefreshGuard<'_> {
 }
 
 impl OutcomeVenue {
+    /// Only info queries are configured; no private key parsing or exchange endpoint.
+    pub fn connect_read_only(cfg: &crate::config::RecomputeActualsConfig) -> Result<Self> {
+        Ok(Self {
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()?,
+            info_url: cfg.hyperliquid_info_url.clone(),
+            exchange_url: String::new(),
+            mainnet: true,
+            signer: None,
+            account: cfg.outcome_account_address.clone(),
+            builder: cfg
+                .outcome_builder_address
+                .clone()
+                .map(|addr| (addr, cfg.outcome_builder_fee)),
+            nonce: Arc::new(StdMutex::new(0)),
+            fee_cache: Arc::new(StdRwLock::new(fees::FeeCache::default())),
+            fee_refreshing: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
     pub fn connect(cfg: &Config) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
@@ -1435,6 +1456,43 @@ mod tests {
         }
         venue.expire_test_fee_snapshot(516);
         assert!(venue.latest_actuals_fee("0xtest", "#5160").is_none());
+    }
+
+    #[tokio::test]
+    async fn read_only_constructor_queries_only_info_without_signer() {
+        for builder in [
+            None,
+            Some(crate::config::DEFAULT_OUTCOME_BUILDER.to_owned()),
+        ] {
+            let (stub, server) = info_stub(vec![(200, fee_user_reply()), (200, fee_meta_reply())]);
+            let cfg = crate::config::RecomputeActualsConfig {
+                app_postgres_uri: String::new(),
+                hyperliquid_info_url: stub.info_url.clone(),
+                outcome_account_address: Some("0xtest".into()),
+                outcome_builder_address: builder.clone(),
+                outcome_builder_fee: 10,
+            };
+            let venue = OutcomeVenue::connect_read_only(&cfg).unwrap();
+            assert!(venue.signer.is_none());
+            assert!(venue.exchange_url.is_empty());
+            venue.refresh_fees().await.unwrap();
+            assert_eq!(
+                venue.fee_snapshot(516).unwrap().builder_rate,
+                if builder.is_some() {
+                    Decimal::new(1, 4)
+                } else {
+                    Decimal::ZERO
+                }
+            );
+            assert!(venue.latest_actuals_fee("0xtest", "#5160").is_some());
+            assert_eq!(
+                server.join().unwrap(),
+                vec![
+                    json!({"type":"userFees","user":"0xtest"}),
+                    json!({"type":"outcomeMeta"})
+                ]
+            );
+        }
     }
 
     #[tokio::test]

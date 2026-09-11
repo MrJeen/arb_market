@@ -932,6 +932,71 @@ async fn actuals_reserve_final_fee_replaces_estimate_above_and_below() -> Result
 
 #[tokio::test]
 #[ignore = "requires process APP_POSTGRES_URI; private schema only"]
+async fn manual_unknown_recompute_bounded_locked_and_evidence_preserving() -> Result<()> {
+    let f = Fixture::new().await?.unwrap();
+    let exercised: Result<()> = async {
+        let s = &f.store;
+        ensure!(s.unknown_actuals_page(0, s.unknown_actuals_upper_id().await?).await?.is_empty());
+        let mut ids = Vec::new();
+        for _ in 0..23 { ids.push(insert_order(s, dec("9")).await?); }
+        let upper = s.unknown_actuals_upper_id().await?;
+        let later = insert_order(s, dec("9")).await?;
+        let first = s.unknown_actuals_page(0, upper).await?;
+        ensure!(first == ids[..20]);
+        ensure!(s.unknown_actuals_page(first[19], upper).await? == ids[20..]);
+        ensure!(s.unknown_actuals_page(upper, upper).await?.is_empty());
+        ensure!(!first.contains(&later));
+        let id = ids[0];
+        let before: Value = sqlx::query_scalar("SELECT jsonb_build_object('legs',(SELECT jsonb_agg(to_jsonb(l) ORDER BY id) FROM legs l WHERE order_id=$1),'fills',(SELECT jsonb_agg(to_jsonb(f) ORDER BY f.id) FROM fills f JOIN legs l ON l.id=f.leg_id WHERE l.order_id=$1))")
+            .bind(id).fetch_one(&s.pool).await?;
+        let unknown = s.refresh_unknown_order_actuals_with_fallback(id, &|_, _| None).await?.unwrap();
+        ensure!(unknown.actuals().is_none());
+        let source = reserve_snapshot("0.001344", "0.0003")["fee_estimate"].clone();
+        let resolver = |wallet: &str, token: &str| Some(market_arb::store::actuals::LatestFee {
+            wallet: wallet.into(), token: token.into(), snapshot: source.clone(),
+            valid_until: chrono::Utc::now() + chrono::Duration::seconds(800),
+        });
+        // Two simultaneous maintenance attempts: the second must recheck under the lock.
+        let (a,b) = tokio::join!(s.refresh_unknown_order_actuals_with_fallback(id, &resolver),
+            s.refresh_unknown_order_actuals_with_fallback(id, &resolver));
+        let (a,b) = (a?, b?);
+        ensure!(a.is_some() != b.is_some());
+        ensure!(a.or(b).unwrap().actuals().is_some());
+        let priced = order_json(s, id).await?;
+        ensure!(s.refresh_unknown_order_actuals_with_fallback(id, &|_,_| panic!("already repaired")).await?.is_none());
+        ensure!(order_json(s,id).await? == priced);
+        let after: Value = sqlx::query_scalar("SELECT jsonb_build_object('legs',(SELECT jsonb_agg(to_jsonb(l) ORDER BY id) FROM legs l WHERE order_id=$1),'fills',(SELECT jsonb_agg(to_jsonb(f) ORDER BY f.id) FROM fills f JOIN legs l ON l.id=f.leg_id WHERE l.order_id=$1))")
+            .bind(id).fetch_one(&s.pool).await?;
+        ensure!(after == before);
+        for id in &ids[1..4] {
+            // Candidate was fetched before another writer finalizes/closes/deletes it.
+            if *id == ids[1] {
+                sqlx::query("UPDATE arb_orders SET position_status='settled',settled_at=NOW(),settlement_source='test',settlement_result='{}',actuals_projection='{\"status\":\"final\"}' WHERE id=$1").bind(id).execute(&s.pool).await?;
+            } else if *id == ids[2] {
+                sqlx::query("UPDATE arb_orders SET position_status='closed' WHERE id=$1").bind(id).execute(&s.pool).await?;
+            } else {
+                // Nonexistent parent follows the same safe skip path without touching a resolver.
+                ensure!(s.refresh_unknown_order_actuals_with_fallback(later+100, &|_,_| panic!("deleted")).await?.is_none());
+                continue;
+            }
+            ensure!(s.refresh_unknown_order_actuals_with_fallback(*id, &|_,_| panic!("final")).await?.is_none());
+        }
+        let failed = ids[4];
+        let original = order_json(s, failed).await?;
+        sqlx::query("CREATE FUNCTION reject_manual_projection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test rollback'; END $$").execute(&s.pool).await?;
+        sqlx::query("CREATE TRIGGER reject_manual_projection BEFORE UPDATE OF actuals_projection ON arb_orders FOR EACH ROW EXECUTE FUNCTION reject_manual_projection()").execute(&s.pool).await?;
+        ensure!(s.refresh_unknown_order_actuals_with_fallback(failed, &resolver).await.is_err());
+        ensure!(order_json(s, failed).await? == original);
+        sqlx::query("DROP TRIGGER reject_manual_projection ON arb_orders").execute(&s.pool).await?;
+        ensure!(s.refresh_unknown_order_actuals_with_fallback(failed, &resolver).await?.unwrap().actuals().is_some());
+        Ok(())
+    }.await;
+    f.cleanup().await?;
+    exercised
+}
+
+#[tokio::test]
+#[ignore = "requires process APP_POSTGRES_URI; private schema only"]
 async fn order_events_project_atomically_and_noops_preserve_saved_estimates() -> Result<()> {
     use market_arb::store::{actuals::LatestFee, NewLeg};
     use std::sync::atomic::{AtomicUsize, Ordering};
