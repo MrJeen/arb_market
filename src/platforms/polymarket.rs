@@ -676,7 +676,9 @@ impl PolymarketVenue {
         })
     }
 
+    #[tracing::instrument(name = "polymarket_submit", skip_all, fields(order_hash = %prepared.order_hash))]
     pub async fn post_prepared(&self, prepared: &PreparedOrder) -> Result<(SubmitResult, Value)> {
+        let started = Instant::now();
         let funder = prepared
             .funder
             .as_deref()
@@ -698,11 +700,20 @@ impl PolymarketVenue {
         match response {
             Ok(body) => {
                 let result = parse_submit(&body, order_hash, envelope);
+                log_submit_result(&result, &body, &prepared.order_hash, None, started);
                 Ok((result, body))
             }
             Err(err) => {
                 let response = super::submit_http_error_response(&err);
-                Ok((classify_submit_error(&err, order_hash, envelope), response))
+                let result = classify_submit_error(&err, order_hash, envelope);
+                log_submit_result(
+                    &result,
+                    &Value::Null,
+                    &prepared.order_hash,
+                    Some(&err),
+                    started,
+                );
+                Ok((result, response))
             }
         }
     }
@@ -930,8 +941,20 @@ impl PolymarketVenue {
             req = req.header("Content-Type", "application/json").body(bytes);
         }
         let poll_request = path == "/data/trades" || path.starts_with("/data/order/");
+        let submit_request = method == reqwest::Method::POST && path == "/order";
         let started = Instant::now();
         let resp = req.send().await.map_err(|err| {
+            if submit_request {
+                log_submit_http(
+                    None,
+                    started,
+                    if err.is_timeout() {
+                        "timeout"
+                    } else {
+                        "transport"
+                    },
+                );
+            }
             if poll_request {
                 tracing::warn!(
                     service = "polymarket",
@@ -946,6 +969,7 @@ impl PolymarketVenue {
             err
         })?;
         let status = resp.status();
+        let mut submit_body_failure = None;
         let text = match resp.text().await {
             Ok(text) => text,
             Err(err) if poll_request => {
@@ -961,8 +985,46 @@ impl PolymarketVenue {
                 );
                 return Err(err.into());
             }
-            Err(_) => String::new(),
+            Err(err) => {
+                if submit_request {
+                    submit_body_failure = Some(if err.is_timeout() {
+                        "response_body_timeout"
+                    } else {
+                        "response_body"
+                    });
+                }
+                // POST /order 沿用读取失败时空响应的分类语义，日志不改变返回值。
+                String::new()
+            }
         };
+        if submit_request {
+            let parsed = serde_json::from_str::<Value>(&text);
+            let reason = submit_body_failure.unwrap_or_else(|| {
+                if !status.is_success() {
+                    "http_status"
+                } else if text.is_empty() {
+                    "empty_body"
+                } else {
+                    match &parsed {
+                        Err(_) => "invalid_json",
+                        Ok(value) => submit_body_log_reason(value),
+                    }
+                }
+            });
+            log_submit_http(Some(status.as_u16()), started, reason);
+            if !status.is_success() {
+                return Err(Error::Http {
+                    status: status.as_u16(),
+                    message: redact_http(&text),
+                });
+            }
+            // 精确保留既有 empty/null/raw 约定，包括带空白 JSON null 的差异。
+            return Ok(if text.is_empty() || text == "null" {
+                json!({})
+            } else {
+                parsed.unwrap_or_else(|_| json!({"raw": text}))
+            });
+        }
         if poll_request {
             if status.is_success() || status.as_u16() == 404 {
                 tracing::debug!(
@@ -1317,6 +1379,116 @@ fn signed_envelope(
             "post_only": false
         }
     })
+}
+
+// 日志只接受交易所订单哈希格式，不回显远端任意字符串；不参与业务分类。
+fn safe_submit_order_id(body: &Value) -> Option<&str> {
+    body.get("orderID")
+        .or_else(|| body.get("orderId"))
+        .and_then(Value::as_str)
+        .filter(|id| {
+            id.len() == 66
+                && id.starts_with("0x")
+                && id.as_bytes()[2..].iter().all(u8::is_ascii_hexdigit)
+        })
+}
+
+fn submit_body_log_reason(body: &Value) -> &'static str {
+    if body.is_null() {
+        return "null_body";
+    }
+    let Some(object) = body.as_object() else {
+        return "malformed_body";
+    };
+    let has_result = object.get("success").is_some_and(Value::is_boolean)
+        || ["error", "errorMsg", "status"]
+            .iter()
+            .any(|key| object.get(*key).is_some_and(Value::is_string));
+    let invalid_success = object.get("success").is_some_and(|v| !v.is_boolean());
+    let invalid_string = ["status", "orderID", "orderId", "error", "errorMsg"]
+        .iter()
+        .any(|key| object.get(*key).is_some_and(|v| !v.is_string()));
+    let invalid_amount = ["makingAmount", "takingAmount"].iter().any(|key| {
+        object
+            .get(*key)
+            .is_some_and(|v| !v.is_null() && parse_decimal(v).is_none())
+    });
+    if !has_result || invalid_success || invalid_string || invalid_amount {
+        "malformed_body"
+    } else {
+        "received"
+    }
+}
+
+fn log_submit_http(http_status: Option<u16>, started: Instant, reason: &'static str) {
+    if reason == "received" {
+        tracing::info!(
+            service = "polymarket",
+            event = "submit_http",
+            operation = "POST",
+            endpoint = "/order",
+            http_status,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            reason,
+            "polymarket submit response received"
+        );
+    } else {
+        tracing::warn!(
+            service = "polymarket",
+            event = "submit_http",
+            operation = "POST",
+            endpoint = "/order",
+            http_status,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            reason,
+            "polymarket submit request anomaly"
+        );
+    }
+}
+
+fn log_submit_result(
+    result: &SubmitResult,
+    body: &Value,
+    order_hash: &str,
+    error: Option<&Error>,
+    started: Instant,
+) {
+    let (classification, reason) = match result {
+        SubmitResult::Ack { .. } => ("ack", "accepted"),
+        SubmitResult::NoMatch { .. } => ("no_match", "fak_no_match"),
+        SubmitResult::Failed { .. } => ("failed", "http_rejected"),
+        SubmitResult::Unknown { .. } => (
+            "unknown",
+            match error {
+                Some(Error::Http { .. }) => "http_ambiguous",
+                Some(Error::Reqwest(err)) if err.is_timeout() => "timeout",
+                Some(Error::Reqwest(_)) => "transport",
+                Some(_) => "request_error",
+                None => "unrecognized_response",
+            },
+        ),
+    };
+    let order_id = safe_submit_order_id(body);
+    let success = body.get("success").and_then(Value::as_bool);
+    let status = body
+        .get("status")
+        .and_then(Value::as_str)
+        .and_then(normalized_order_status);
+    let making = body.get("makingAmount").and_then(parse_decimal);
+    let taking = body.get("takingAmount").and_then(parse_decimal);
+    // 不记录 SubmitResult/envelope/raw/error 正文；数值先解析，状态与原因只用白名单。
+    if matches!(
+        result,
+        SubmitResult::Ack { .. } | SubmitResult::NoMatch { .. }
+    ) {
+        tracing::info!(service = "polymarket", event = "submit_classified", order_hash,
+            order_id, success, status, making = ?making, taking = ?taking, classification, reason,
+            elapsed_ms = started.elapsed().as_millis() as u64, "polymarket submit classified");
+    } else {
+        tracing::warn!(service = "polymarket", event = "submit_classified", order_hash,
+            order_id, success, status, making = ?making, taking = ?taking, classification, reason,
+            elapsed_ms = started.elapsed().as_millis() as u64, "polymarket submit classified");
+    }
 }
 
 pub fn classify_submit_error(err: &Error, order_hash: String, envelope: Value) -> SubmitResult {
@@ -4062,6 +4234,394 @@ pub(crate) mod tests {
             },
         );
         (venue, server)
+    }
+
+    // 同时捕获 span，验证 HTTP 事件继承 order_hash 和执行层 leg_id。
+    struct SubmitLogCapture(mpsc::UnboundedSender<WsLogEvent>);
+
+    impl<S> tracing_subscriber::Layer<S> for SubmitLogCapture
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut captured = WsLogEvent {
+                level: *attrs.metadata().level(),
+                fields: HashMap::new(),
+            };
+            attrs.record(&mut captured);
+            ctx.span(id).unwrap().extensions_mut().insert(captured);
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut captured = WsLogEvent {
+                level: *event.metadata().level(),
+                fields: HashMap::new(),
+            };
+            if let Some(scope) = ctx.event_scope(event) {
+                for span in scope.from_root() {
+                    if let Some(values) = span.extensions().get::<WsLogEvent>() {
+                        captured.fields.extend(values.fields.clone());
+                    }
+                }
+            }
+            event.record(&mut captured);
+            let _ = self.0.send(captured);
+        }
+    }
+
+    const SUBMIT_LOG_SECRET: &str = "PRIVATE_SUBMIT_SENTINEL";
+
+    async fn capture_submit_response(
+        status: Option<u16>,
+        body: &str,
+        declared_length: Option<usize>,
+        hold_open: bool,
+    ) -> (SubmitResult, Value, Vec<WsLogEvent>) {
+        use tokio::io::AsyncReadExt;
+        use tracing::instrument::WithSubscriber;
+        use tracing::Instrument;
+        use tracing_subscriber::prelude::*;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let response = status.map(|status| format!(
+            "HTTP/1.1 {status} Stub\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            declared_length.unwrap_or(body.len())
+        ));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let mut buffer = [0u8; 1024];
+                let count = tokio::time::timeout(Duration::from_secs(3), socket.read(&mut buffer))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&buffer[..count]);
+                if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                    assert!(headers.starts_with("POST /order HTTP/1.1"));
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if bytes.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+                assert!(bytes.len() < 16_384);
+            }
+            if let Some(response) = response {
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            if hold_open {
+                let _ = release_rx.await;
+            }
+        });
+        let (mut venue, funder) = execution_test_venue(format!("http://{address}")).await;
+        venue.http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(250))
+            .build()
+            .unwrap();
+        {
+            let mut accounts = venue.authed.lock().await;
+            let account = accounts.get_mut(&funder).unwrap();
+            account.api_key = SUBMIT_LOG_SECRET.into();
+            account.api_passphrase = SUBMIT_LOG_SECRET.into();
+        }
+        let prepared = PreparedOrder {
+            order_hash: format!("0x{}", "a".repeat(64)),
+            envelope: json!({"signature": SUBMIT_LOG_SECRET}),
+            payload: json!({"signature": SUBMIT_LOG_SECRET}),
+            funder: Some(funder),
+        };
+        let (log_tx, mut log_rx) = mpsc::unbounded_channel();
+        let subscriber = tracing_subscriber::registry().with(SubmitLogCapture(log_tx));
+        let (result, raw) = async {
+            venue
+                .post_prepared(&prepared)
+                .instrument(tracing::info_span!("exec_leg", leg_id = "test-leg"))
+                .await
+                .unwrap()
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let _ = release_tx.send(());
+        server.await.unwrap();
+        let mut logs = Vec::new();
+        while let Ok(entry) = log_rx.try_recv() {
+            // 检查所有捕获事件及 span，而不只是新事件的字段。
+            let rendered = format!("{:?}", entry.fields);
+            assert!(!rendered.contains(SUBMIT_LOG_SECRET));
+            assert!(!rendered.contains("dGVzdA=="));
+            if matches!(
+                entry.fields.get("event").map(String::as_str),
+                Some("submit_http" | "submit_classified")
+            ) {
+                assert_eq!(entry.fields["service"], "polymarket");
+                assert_eq!(entry.fields["order_hash"], prepared.order_hash);
+                assert_eq!(entry.fields["leg_id"], "test-leg");
+                assert!(entry.fields["elapsed_ms"].parse::<u64>().is_ok());
+                logs.push(entry);
+            }
+        }
+        assert_eq!(
+            logs.len(),
+            2,
+            "one HTTP event and one classification per submit"
+        );
+        assert_eq!(logs[0].fields["event"], "submit_http");
+        assert_eq!(logs[1].fields["event"], "submit_classified");
+        assert_eq!(logs[0].fields["operation"], "POST");
+        assert_eq!(logs[0].fields["endpoint"], "/order");
+        if let Some(status) = status {
+            assert_eq!(logs[0].fields["http_status"], status.to_string());
+        } else {
+            assert!(!logs[0].fields.contains_key("http_status"));
+        }
+        (result, raw, logs)
+    }
+
+    #[tokio::test]
+    async fn submit_logging_classifications_and_safe_fields() {
+        let oid = format!("0x{}", "b".repeat(64));
+        let cases = [
+            (
+                json!({"success":true,"status":"live","orderID":oid,"makingAmount":"1.25","takingAmount":"2.5"}),
+                "ack",
+                "accepted",
+            ),
+            (
+                json!({"success":true,"status":"matched","orderId":oid}),
+                "ack",
+                "accepted",
+            ),
+            (
+                json!({"success":false,"status":"unmatched","errorMsg":SUBMIT_LOG_SECRET}),
+                "no_match",
+                "fak_no_match",
+            ),
+            (
+                json!({"errorMsg":format!("FAK {SUBMIT_LOG_SECRET}")}),
+                "no_match",
+                "fak_no_match",
+            ),
+            (
+                json!({"success":true,"status":"matched","orderID":SUBMIT_LOG_SECRET}),
+                "ack",
+                "accepted",
+            ),
+            (
+                json!({"success":true,"status":SUBMIT_LOG_SECRET,"orderID":SUBMIT_LOG_SECRET,"errorMsg":SUBMIT_LOG_SECRET}),
+                "unknown",
+                "unrecognized_response",
+            ),
+            (
+                json!({"success":false,"status":"ORDER_STATUS_MATCHED","orderID":oid}),
+                "unknown",
+                "unrecognized_response",
+            ),
+            (
+                json!({"success":true,"status":"matched","orderID":oid,"makingAmount":SUBMIT_LOG_SECRET,"takingAmount":{"secret":SUBMIT_LOG_SECRET}}),
+                "ack",
+                "accepted",
+            ),
+        ];
+        for (body, classification, reason) in cases {
+            let (result, raw, logs) =
+                capture_submit_response(Some(200), &body.to_string(), None, false).await;
+            assert_eq!(raw, body);
+            assert_eq!(logs[1].fields["classification"], classification);
+            assert_eq!(logs[1].fields["reason"], reason);
+            assert_eq!(
+                logs[1].level,
+                if classification == "unknown" {
+                    tracing::Level::WARN
+                } else {
+                    tracing::Level::INFO
+                }
+            );
+            assert_eq!(logs[0].fields["reason"], submit_body_log_reason(&body));
+            assert_eq!(
+                logs[0].level,
+                if submit_body_log_reason(&body) == "received" {
+                    tracing::Level::INFO
+                } else {
+                    tracing::Level::WARN
+                }
+            );
+            assert_eq!(
+                logs[1].fields.get("order_id").map(String::as_str),
+                safe_submit_order_id(&body)
+            );
+            assert_eq!(
+                logs[1].fields.get("status").map(String::as_str),
+                body.get("status")
+                    .and_then(Value::as_str)
+                    .and_then(normalized_order_status)
+            );
+            assert_eq!(
+                logs[1].fields.get("success").cloned(),
+                body.get("success")
+                    .and_then(Value::as_bool)
+                    .map(|v| v.to_string())
+            );
+            assert_eq!(
+                logs[1].fields["making"],
+                format!("{:?}", body.get("makingAmount").and_then(parse_decimal))
+            );
+            assert_eq!(
+                logs[1].fields["taking"],
+                format!("{:?}", body.get("takingAmount").and_then(parse_decimal))
+            );
+            match (classification, result) {
+                ("ack", SubmitResult::Ack { .. })
+                | ("no_match", SubmitResult::NoMatch { .. })
+                | ("unknown", SubmitResult::Unknown { .. }) => {}
+                _ => panic!("classification changed"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_logging_http_errors_preserve_classification() {
+        for status in [400, 401, 408, 429, 500, 503] {
+            let (result, raw, logs) =
+                capture_submit_response(Some(status), SUBMIT_LOG_SECRET, None, false).await;
+            assert_eq!(logs[0].level, tracing::Level::WARN);
+            assert_eq!(logs[0].fields["reason"], "http_status");
+            assert_eq!(logs[1].level, tracing::Level::WARN);
+            assert_eq!(raw["http_status"], status);
+            assert_eq!(raw["body"], SUBMIT_LOG_SECRET);
+            if super::super::http_status_proves_reject(status) {
+                assert!(matches!(result, SubmitResult::Failed { .. }));
+                assert_eq!(logs[1].fields["classification"], "failed");
+                assert_eq!(logs[1].fields["reason"], "http_rejected");
+            } else {
+                assert!(matches!(result, SubmitResult::Unknown { .. }));
+                assert_eq!(logs[1].fields["classification"], "unknown");
+                assert_eq!(logs[1].fields["reason"], "http_ambiguous");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_logging_malformed_responses_preserve_raw() {
+        for (body, reason, expected) in [
+            ("", "empty_body", json!({})),
+            ("null", "null_body", json!({})),
+            (" null ", "null_body", Value::Null),
+            (
+                SUBMIT_LOG_SECRET,
+                "invalid_json",
+                json!({"raw":SUBMIT_LOG_SECRET}),
+            ),
+            ("{}", "malformed_body", json!({})),
+            ("[]", "malformed_body", json!([])),
+            ("42", "malformed_body", json!(42)),
+            (
+                "{\"success\":\"PRIVATE_SUBMIT_SENTINEL\"}",
+                "malformed_body",
+                json!({"success":SUBMIT_LOG_SECRET}),
+            ),
+            (
+                "{\"status\":{\"secret\":\"PRIVATE_SUBMIT_SENTINEL\"}}",
+                "malformed_body",
+                json!({"status":{"secret":SUBMIT_LOG_SECRET}}),
+            ),
+        ] {
+            let (result, raw, logs) = capture_submit_response(Some(200), body, None, false).await;
+            assert!(matches!(result, SubmitResult::Unknown { .. }));
+            assert_eq!(raw, expected);
+            assert_eq!(logs[0].fields["reason"], reason);
+            assert_eq!(logs[0].level, tracing::Level::WARN);
+            assert_eq!(logs[1].fields["classification"], "unknown");
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_logging_transport_timeout_and_body_failure() {
+        for (status, body, length, hold_open, reason) in [
+            (None, "", None, false, "transport"),
+            (None, "", None, true, "timeout"),
+            (
+                Some(200),
+                SUBMIT_LOG_SECRET,
+                Some(1000),
+                false,
+                "response_body",
+            ),
+            (
+                Some(200),
+                SUBMIT_LOG_SECRET,
+                Some(1000),
+                true,
+                "response_body_timeout",
+            ),
+            (
+                Some(400),
+                SUBMIT_LOG_SECRET,
+                Some(1000),
+                false,
+                "response_body",
+            ),
+        ] {
+            let (result, raw, logs) =
+                capture_submit_response(status, body, length, hold_open).await;
+            assert_eq!(logs[0].fields["reason"], reason);
+            assert_eq!(logs[0].level, tracing::Level::WARN);
+            assert_eq!(logs[1].level, tracing::Level::WARN);
+            if status == Some(400) {
+                assert!(matches!(result, SubmitResult::Failed { status: 400, .. }));
+                assert_eq!(raw, json!({"http_status":400,"body":""}));
+            } else {
+                assert!(matches!(result, SubmitResult::Unknown { .. }));
+                if status.is_some() {
+                    assert_eq!(raw, json!({}));
+                } else {
+                    assert_eq!(logs[1].fields["reason"], reason);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn submit_logging_order_id_format_is_strict() {
+        let valid = format!("0x{}", "aB12".repeat(16));
+        assert_eq!(
+            safe_submit_order_id(&json!({"orderID":valid})),
+            Some(valid.as_str())
+        );
+        for invalid in [
+            SUBMIT_LOG_SECRET.into(),
+            "".into(),
+            format!("0x{}", "a".repeat(63)),
+            format!("0x{}", "a".repeat(65)),
+            format!("0x{}g", "a".repeat(63)),
+            format!("0X{}", "a".repeat(64)),
+        ] {
+            assert_eq!(safe_submit_order_id(&json!({"orderID":invalid})), None);
+        }
+        assert_eq!(
+            safe_submit_order_id(&json!({"orderID":123,"orderId":valid})),
+            None
+        );
     }
 
     pub(crate) async fn execution_test_venue(base: String) -> (PolymarketVenue, String) {

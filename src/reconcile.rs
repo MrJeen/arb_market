@@ -349,14 +349,11 @@ pub fn resolve_leg(
         if !evidence.page_complete || !evidence.history_complete || scan.next_cursor != "LTE=" {
             return Ok(LegResolution::Pending("trade_pages_incomplete"));
         }
-        if scan.trade_ids.is_empty() {
-            return Ok(LegResolution::Pending("zero_fill_not_proven"));
-        }
         let scanned: HashSet<_> = scan.trade_ids.iter().map(String::as_str).collect();
         if scanned.len() != trades.len() || trades.keys().any(|id| !scanned.contains(id.as_str())) {
             return Ok(LegResolution::Pending("trade_scan_snapshot_mismatch"));
         }
-        // FAK 缺单时采用当轮可见的非空终态集合，不虚构 order 撮合量或关联列表。
+        // 缺单时采用当轮完整扫描集合；空集合仍须通过下方历史成交约束，才能按零成交失败收口。
     } else if platform == POLYMARKET {
         if state != "matched" && !cancelled {
             return Ok(LegResolution::Pending("order_still_open"));
@@ -452,9 +449,10 @@ pub fn resolve_leg(
     }
     if shares.is_zero() {
         return Ok(LegResolution::Terminal {
-            status: if trades
-                .values()
-                .any(|fill| fill.finality == FillFinality::Failed)
+            status: if (missing_pm_order && trades.is_empty())
+                || trades
+                    .values()
+                    .any(|fill| fill.finality == FillFinality::Failed)
             {
                 "failed"
             } else {
@@ -878,7 +876,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_pm_order_waits_for_nonempty_current_scan_and_finality() {
+    fn missing_pm_order_requires_current_scan_and_finality() {
         let evidence = missing_pm_evidence("http_404", &["one"]);
         let confirmed = fill("one", "6", FillFinality::Confirmed);
         let mut incomplete = evidence.clone();
@@ -899,12 +897,10 @@ mod tests {
             LegResolution::Pending("trade_confirmation_pending")
         );
         let empty = missing_pm_evidence("null_body", &[]);
-        for observations in [vec![], vec![confirmed.clone()]] {
-            assert_eq!(
-                resolve_leg(POLYMARKET, &observations, &empty).unwrap(),
-                LegResolution::Pending("zero_fill_not_proven")
-            );
-        }
+        assert_eq!(
+            resolve_leg(POLYMARKET, &[confirmed.clone()], &empty).unwrap(),
+            LegResolution::Pending("trade_scan_snapshot_mismatch")
+        );
         assert_eq!(
             resolve_leg(POLYMARKET, &[], &evidence).unwrap(),
             LegResolution::Pending("trade_scan_snapshot_mismatch")
@@ -920,6 +916,64 @@ mod tests {
             resolve_leg(POLYMARKET, &[no_fee], &evidence).unwrap(),
             LegResolution::Pending("fee_evidence_missing")
         );
+    }
+
+    #[test]
+    fn missing_pm_order_empty_scan_fails_only_without_execution_evidence() {
+        for source in ["http_404", "null_body"] {
+            let empty = missing_pm_evidence(source, &[]);
+            let failed = LegResolution::Terminal {
+                status: "failed",
+                shares: Decimal::ZERO,
+                price: Decimal::ZERO,
+                fee: Decimal::ZERO,
+                fee_sources: vec![],
+            };
+            assert_eq!(resolve_leg(POLYMARKET, &[], &empty).unwrap(), failed);
+            for field in ["page", "history", "cursor"] {
+                let mut incomplete = empty.clone();
+                match field {
+                    "page" => incomplete.page_complete = false,
+                    "history" => incomplete.history_complete = false,
+                    _ => incomplete.pm_scan.as_mut().unwrap().next_cursor = "next".into(),
+                }
+                assert_eq!(
+                    resolve_leg(POLYMARKET, &[], &incomplete).unwrap(),
+                    LegResolution::Pending("trade_pages_incomplete")
+                );
+            }
+            let mut constrained = empty.clone();
+            let mut known = pm_order_constraints(None, "777", "token", "funder", None).unwrap();
+            known.matched_shares_lower_bound = Some(Decimal::ZERO);
+            constrained.pm_order_constraints = Some(known.clone());
+            assert_eq!(resolve_leg(POLYMARKET, &[], &constrained).unwrap(), failed);
+            known.matched_shares_lower_bound = Some(d("1"));
+            constrained.pm_order_constraints = Some(known.clone());
+            assert_eq!(
+                resolve_leg(POLYMARKET, &[], &constrained).unwrap(),
+                LegResolution::Pending("known_matched_quantity_incomplete")
+            );
+            known.associated_trade_ids.insert("known".into());
+            constrained.pm_order_constraints = Some(known);
+            assert_eq!(
+                resolve_leg(POLYMARKET, &[], &constrained).unwrap(),
+                LegResolution::Pending("known_associated_trade_missing")
+            );
+            for finality in [
+                FillFinality::Confirmed,
+                FillFinality::Failed,
+                FillFinality::Pending,
+            ] {
+                assert_eq!(
+                    resolve_leg(POLYMARKET, &[fill("old", "1", finality)], &empty).unwrap(),
+                    LegResolution::Pending(if finality == FillFinality::Pending {
+                        "trade_confirmation_pending"
+                    } else {
+                        "trade_scan_snapshot_mismatch"
+                    })
+                );
+            }
+        }
     }
 
     #[test]

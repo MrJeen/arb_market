@@ -927,6 +927,7 @@ impl Engine {
         ensure_trading_submission_enabled(intent.enabled(&self.cfg), intent)
     }
 
+    #[tracing::instrument(skip_all, fields(leg_id = leg_id, order_hash = %prepared.order_hash))]
     async fn submit_prepared_pm(
         &self,
         leg_id: i64,
@@ -1192,6 +1193,12 @@ impl Engine {
         page: FillPage,
     ) -> Result<()> {
         let trades_only = leg.platform == POLYMARKET && !poll.found;
+        let empty_missing_scan = trades_only
+            && page
+                .progress
+                .get("trade_ids")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty);
         let started = Instant::now();
         let resolution = apply_reconciliation_page(&self.store, leg, poll, page, || {
             self.pm_reconciliation_fee_snapshot(leg)
@@ -1210,7 +1217,11 @@ impl Engine {
                 ..
             } => tracing::info!(
                 platform=%leg.platform,leg_id=leg.id,order_id=leg.order_id,status,%shares,%fee,
-                trades_only,?fee_sources,elapsed_ms=started.elapsed().as_millis() as u64,"trade reconciliation finalized"
+                trades_only,?fee_sources,
+                reason = if empty_missing_scan && status == "failed" && shares.is_zero() {
+                    "order_missing_empty_trade_scan"
+                } else { "terminal_trade_evidence" },
+                elapsed_ms=started.elapsed().as_millis() as u64,"trade reconciliation finalized"
             ),
         }
         Ok(())
@@ -4898,10 +4909,12 @@ mod tests {
                 .await?;
             let store = Store { pool };
             store.migrate().await?;
-            for (http_status, body, missing_time) in [
-                (404, json!({}), false),
-                (200, Value::Null, false),
-                (404, json!({}), true),
+            for (http_status, body, missing_time, empty) in [
+                (404, json!({}), false, false),
+                (200, Value::Null, false, false),
+                (404, json!({}), false, true),
+                (200, Value::Null, false, true),
+                (404, json!({}), true, false),
             ] {
                 let identity = MarketIdentity::new(POLYMARKET, "test-condition")?;
                 let (_, ids) = store
@@ -4954,11 +4967,15 @@ mod tests {
                 if !missing_time {
                     responses.push((
                         200,
-                        json!({"data":[{
+                        if empty {
+                            json!({"data":[], "next_cursor":"LTE="})
+                        } else {
+                            json!({"data":[{
                         "id":"confirmed-trade","taker_order_id":oid,"asset_id":"yes",
                         "size":"6","price":"0.5","status":"CONFIRMED",
                         "fee_amount":"0.01","fee_token":"USDC","maker_orders":[]
-                    }], "next_cursor":"LTE="}),
+                    }], "next_cursor":"LTE="})
+                        },
                     ));
                 }
                 let (pm, server) = poll_stub(responses).await;
@@ -4983,7 +5000,7 @@ mod tests {
                     requests[1].split_whitespace().nth(1).unwrap()
                 ))?;
                 let query: HashMap<_, _> = url.query_pairs().into_owned().collect();
-                assert_eq!(query.get("after"), Some(&after.to_string()));
+                assert_eq!(query.get("after"), Some(&(after - 10).max(0).to_string()));
                 assert_eq!(query.get("before"), Some(&(after + 300).to_string()));
                 let (current, poll, page) = page_result.unwrap();
                 assert!(!poll.found);
@@ -4993,7 +5010,9 @@ mod tests {
                     matches!(apply_reconciliation_page(&store, &current, poll, page, || async {
                         panic!("actual fee must not load a fee source")
                     }).await?,
-                    LegResolution::Terminal { status:"matched", shares, .. } if shares == d("6"))
+                    LegResolution::Terminal { status, shares, .. }
+                        if status == if empty { "failed" } else { "matched" }
+                            && shares == if empty { Decimal::ZERO } else { d("6") })
                 );
             }
             store.pool.close().await;

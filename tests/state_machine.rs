@@ -607,6 +607,59 @@ async fn reconciliation_pm_accumulates_pages_and_only_accounts_confirmed_trades(
 
 #[tokio::test]
 #[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn reconciliation_pm_empty_missing_scan_preserves_other_venue_position() {
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let exercised: Result<()> = async {
+        let store = &fixture.store;
+        store.migrate().await?;
+        for source in ["http_404", "null_body"] {
+            let (parent_id, legs) = submitted_reconciliation_order(store, &["polymarket", "outcome"]).await?;
+            let pm = &legs[0];
+            store.record_submission(pm.id, "unknown", None, &json!({"kind":"unknown"}), &json!({})).await?;
+            let mut out = reconciliation_evidence(&format!("out-{}", legs[1].id), "filled");
+            out.expected_shares = Some(Decimal::from(9));
+            store.record_submission(legs[1].id, "actived", out.poll.order_id.as_deref(),
+                &json!({"kind":"ack", "expected_shares":"9"}), &json!({"ack":true})).await?;
+            let current = reconciliation_open_leg(store, legs[1].id).await?;
+            let current = store.record_order_poll(&current, &out.poll).await?.unwrap();
+            let fill = reconciliation_trade(out.poll.order_id.as_deref().unwrap(), "out-fill", 9, Decimal::ZERO);
+            ensure!(matches!(store.record_reconciliation(&current, &[fill], &out, &json!({})).await?,
+                LegResolution::Terminal {status:"matched", shares, ..} if shares == Decimal::from(9)));
+            ensure!(order_snapshot(&store.pool, parent_id).await?["status"] == "actived");
+            let current = reconciliation_open_leg(store, pm.id).await?;
+            let incomplete = pm_missing_evidence(&current, source, "page-2", &[]);
+            let current = store.record_order_poll(&current, &incomplete.poll).await?.unwrap();
+            ensure!(matches!(store.record_reconciliation(&current, &[], &incomplete,
+                &serde_json::to_value(incomplete.pm_scan.as_ref().unwrap())?).await?, LegResolution::Pending(_)));
+            let current = reconciliation_open_leg(store, pm.id).await?;
+            let complete = pm_missing_evidence(&current, source, "LTE=", &[]);
+            let progress = serde_json::to_value(complete.pm_scan.as_ref().unwrap())?;
+            ensure!(matches!(store.record_reconciliation(&current, &[], &complete, &progress).await?,
+                LegResolution::Terminal {status:"failed", shares, price, fee, ..}
+                    if shares.is_zero() && price.is_zero() && fee.is_zero()));
+            let terminal = leg_snapshot(&store.pool, pm.id).await?;
+            ensure!(terminal["status"] == "failed" && terminal["last_order_info"]["waiting_reason"].is_null());
+            ensure!(terminal["last_order_info"]["fill_evidence"]["pm_scan"]["trade_ids"] == json!([]));
+            let parent = order_snapshot(&store.pool, parent_id).await?;
+            ensure!(parent["status"] == "completed" && parent["actual_cost"] == json!(3.6));
+            let positions = store.positions_for_order(parent_id).await?;
+            ensure!(positions["outcome"]["no"] == Decimal::from(9));
+            ensure!(positions["polymarket"]["yes"].is_zero());
+            ensure!(!store.open_legs().await?.iter().any(|leg| leg.order_id == parent_id));
+            ensure!(store.record_order_poll(&current, &complete.poll).await?.is_none());
+            ensure!(matches!(store.record_reconciliation(&current, &[], &complete, &progress).await?, LegResolution::Pending(_)));
+            store.record_submission(pm.id, "actived", None, &json!({"kind":"unknown"}), &json!({"late":true})).await?;
+            ensure!(leg_snapshot(&store.pool, pm.id).await? == terminal);
+            ensure!(order_snapshot(&store.pool, parent_id).await? == parent);
+        }
+        Ok(())
+    }.await;
+    fixture.cleanup().await.expect("clean up empty scan schema");
+    exercised.expect("empty PM scan fails atomically without losing Outcome position");
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
 async fn reconciliation_pm_missing_order_pages_reload_with_fixed_window_and_exact_accounting() {
     let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
     let exercised: Result<()> = async {
@@ -1289,7 +1342,7 @@ async fn reconciliation_pm_missing_order_does_not_finish_from_cached_confirmed_f
             fills.len() == 1 && fills[0]["raw"]["reconciliation_v1"]["finality"] == "confirmed"
         );
         for (case, reason) in [
-            ("empty", "zero_fill_not_proven"),
+            ("empty", "trade_scan_snapshot_mismatch"),
             ("different_ids", "trade_scan_snapshot_mismatch"),
             ("legacy", "trade_scan_evidence_missing"),
         ] {
@@ -1607,16 +1660,13 @@ async fn reconciliation_pm_hash_fills_lock_identity_and_reject_inconsistent_scan
             ensure!(constraints["matched_shares_lower_bound"] == if via_ack { Value::Null } else { serde_json::to_value(Decimal::ZERO)? },
                 "old hash order_poll was restored under the recovered oid");
             ensure!(matches!(store.record_reconciliation(&recovered, &[], &missing,
-                &serde_json::to_value(missing.pm_scan.as_ref().unwrap())?).await?, LegResolution::Pending(_)),
-                "empty missing-order scan must not prove zero execution");
-            let recovered = reconciliation_open_leg(store, recovered.id).await?;
-            let mut cancelled = reconciliation_evidence(&oid, "cancelled");
-            cancelled.poll.shares = Some(Decimal::ZERO);
-            cancelled.poll.raw = json!({"associate_trades":[]});
-            let recovered = store.record_order_poll(&recovered, &cancelled.poll).await?
-                .ok_or_else(|| anyhow::anyhow!("zero cancellation poll rejected"))?;
-            ensure!(matches!(store.record_reconciliation(&recovered, &[], &cancelled, &json!({})).await?,
-                LegResolution::Terminal {status:"cancelled", shares, fee, ..} if shares.is_zero() && fee.is_zero()));
+                &serde_json::to_value(missing.pm_scan.as_ref().unwrap())?).await?,
+                LegResolution::Terminal {status:"failed", shares, price, fee, ..}
+                    if shares.is_zero() && price.is_zero() && fee.is_zero()));
+            ensure!(!store.open_legs().await?.iter().any(|leg| leg.id == recovered.id));
+            let snapshot = leg_snapshot(&store.pool, recovered.id).await?;
+            ensure!(snapshot["last_order_info"]["waiting_reason"].is_null());
+            ensure!(store.record_order_poll(&recovered, &missing.poll).await?.is_none());
             ensure!(fill_snapshots(&store.pool, current.id).await?.is_empty());
             let parent = order_snapshot(&store.pool, parent_id).await?;
             ensure!(parent["status"] == "cancelled" && parent["actual_cost"] == json!(0.0));
