@@ -179,6 +179,14 @@ pub struct OutcomeVenue {
     nonce: Arc<StdMutex<u64>>,
     fee_cache: Arc<StdRwLock<fees::FeeCache>>,
     fee_refreshing: Arc<AtomicBool>,
+    fee_last_attempt: Arc<StdMutex<Option<Instant>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeeRefreshOutcome {
+    Refreshed,
+    InFlight,
+    Throttled,
 }
 
 // 只防重复刷新，不持快照锁跨 HTTP；取消任务也必须释放刷新标记。
@@ -208,6 +216,7 @@ impl OutcomeVenue {
             nonce: Arc::new(StdMutex::new(0)),
             fee_cache: Arc::new(StdRwLock::new(fees::FeeCache::default())),
             fee_refreshing: Arc::new(AtomicBool::new(false)),
+            fee_last_attempt: Arc::new(StdMutex::new(None)),
         })
     }
 
@@ -236,14 +245,23 @@ impl OutcomeVenue {
             nonce: Arc::new(StdMutex::new(0)),
             fee_cache: Arc::new(StdRwLock::new(fees::FeeCache::default())),
             fee_refreshing: Arc::new(AtomicBool::new(false)),
+            fee_last_attempt: Arc::new(StdMutex::new(None)),
         })
     }
 
     pub fn fee_snapshot(&self, outcome_id: u64) -> Result<OutcomeFeeSnapshot> {
+        self.lookup_fees(outcome_id)
+            .map_err(|err| Error::msg(err.reason()))
+    }
+
+    pub fn lookup_fees(
+        &self,
+        outcome_id: u64,
+    ) -> std::result::Result<OutcomeFeeSnapshot, fees::FeeLookupError> {
         self.fee_cache
             .read()
-            .map_err(|_| Error::msg("outcome fee cache lock poisoned"))?
-            .get(outcome_id)
+            .map_err(|_| fees::FeeLookupError::CacheLock)?
+            .lookup(outcome_id)
     }
 
     /// Local cache only: historical wallets must not borrow the configured account's rates.
@@ -273,11 +291,32 @@ impl OutcomeVenue {
     }
 
     pub async fn refresh_fees(&self) -> Result<()> {
-        self.fee_refreshing
+        self.refresh_fees_coordinated().await.map(|_| ())
+    }
+
+    pub async fn refresh_fees_coordinated(&self) -> Result<FeeRefreshOutcome> {
+        if self
+            .fee_refreshing
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| Error::msg("outcome fee refresh already running"))?;
+            .is_err()
+        {
+            return Ok(FeeRefreshOutcome::InFlight);
+        }
         let _guard = FeeRefreshGuard(&self.fee_refreshing);
         let started = Instant::now();
+        {
+            let mut last = self
+                .fee_last_attempt
+                .lock()
+                .map_err(|_| Error::msg("fee refresh attempt lock poisoned"))?;
+            if last.is_some_and(|at| {
+                started.saturating_duration_since(at) < fees::FEE_REFRESH_INTERVAL
+            }) {
+                return Ok(FeeRefreshOutcome::Throttled);
+            }
+            // 失败和取消也保留本次尝试时间，避免逐 tick 重试。
+            *last = Some(started);
+        }
         let result = async {
             let account = self
                 .account
@@ -321,7 +360,7 @@ impl OutcomeVenue {
             tracing::warn!(service = "outcome", api = "fee_snapshot", elapsed_ms = started.elapsed().as_millis() as u64,
                 error = %err, "outcome fee refresh failed; retaining original source ages");
         }
-        result
+        result.map(|()| FeeRefreshOutcome::Refreshed)
     }
 
     #[cfg(test)]
@@ -511,7 +550,11 @@ impl OutcomeVenue {
         })
     }
 
-    pub async fn post_prepared(&self, prepared: PreparedOrder) -> Result<(SubmitResult, Value)> {
+    pub async fn post_prepared(
+        &self,
+        prepared: PreparedOrder,
+    ) -> Result<(SubmitResult, super::SubmissionResponse)> {
+        let started = Instant::now();
         let hash = prepared.order_hash.clone();
         let envelope = prepared.envelope.clone();
         let cloid = envelope
@@ -528,19 +571,40 @@ impl OutcomeVenue {
         match response {
             Ok(resp) => {
                 let status = resp.status().as_u16();
-                let body: Value = resp.json().await.unwrap_or(json!({}));
-                let stored = if status >= 400 {
-                    json!({ "http_status": status, "body": body })
-                } else {
-                    body.clone()
+                let text = resp.text().await;
+                // 分类沿用无法解码时的空对象，审计独立保存真实正文/读取诊断。
+                let body = text
+                    .as_ref()
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                    .unwrap_or(json!({}));
+                let reason = match &text {
+                    Err(err) => {
+                        if err.is_timeout() {
+                            "response_body_timeout"
+                        } else {
+                            "response_body"
+                        }
+                    }
+                    Ok(text) if text.is_empty() => "empty_body",
+                    Ok(text) if serde_json::from_str::<Value>(text).is_err() => "invalid_json",
+                    _ if status >= 400 => "http_status",
+                    _ => "received",
                 };
+                if reason == "received" {
+                    tracing::debug!(service="outcome", operation="submit", endpoint="/exchange", order_hash=%hash, http_status=status, elapsed_ms=started.elapsed().as_millis() as u64, reason, "outcome submit response received");
+                } else {
+                    tracing::warn!(service="outcome", operation="submit", endpoint="/exchange", order_hash=%hash, http_status=status, elapsed_ms=started.elapsed().as_millis() as u64, reason, "outcome submit response diagnostic");
+                }
+                let stored = super::SubmissionResponse::http(status, text);
                 Ok((
                     classify_http_submit(status, &body, hash, envelope, &cloid),
                     stored,
                 ))
             }
             Err(err) => {
-                let response = json!({ "error": err.to_string() });
+                tracing::warn!(service="outcome", operation="submit", endpoint="/exchange", order_hash=%hash, elapsed_ms=started.elapsed().as_millis() as u64, reason=if err.is_timeout() {"timeout"} else {"transport"}, "outcome submit request failed");
+                let response = super::SubmissionResponse::transport(&err);
                 Ok((
                     classify_submit_transport_error(err, hash, envelope),
                     response,
@@ -1414,11 +1478,13 @@ mod tests {
         for _ in 0..100 {
             assert!(first.same_rules(&venue.fee_snapshot(516).unwrap()));
         }
+        *venue.fee_last_attempt.lock().unwrap() = None;
         assert!(venue.refresh_fees().await.is_err());
         assert_eq!(
             first.estimate_json(),
             venue.fee_snapshot(516).unwrap().estimate_json()
         );
+        *venue.fee_last_attempt.lock().unwrap() = None;
         venue.refresh_fees().await.unwrap();
         let renewed = venue.fee_snapshot(516).unwrap();
         assert!(first.same_rules(&renewed));
@@ -1523,14 +1589,80 @@ mod tests {
         ]);
         venue.refresh_fees().await.unwrap();
         let first = venue.fee_snapshot(516).unwrap();
+        *venue.fee_last_attempt.lock().unwrap() = None;
         assert!(venue.refresh_fees().await.is_err());
         assert_eq!(
             first.estimate_json(),
             venue.fee_snapshot(516).unwrap().estimate_json()
         );
+        *venue.fee_last_attempt.lock().unwrap() = None;
         venue.refresh_fees().await.unwrap();
         assert!(venue.fee_snapshot(516).is_err());
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_clones_share_single_flight_and_failed_attempt_cooldown() {
+        let mut venue = test_venue();
+        venue.account = None;
+        let clone = venue.clone();
+        venue.fee_refreshing.store(true, Ordering::Release);
+        assert_eq!(
+            clone.refresh_fees_coordinated().await.unwrap(),
+            FeeRefreshOutcome::InFlight
+        );
+        venue.fee_refreshing.store(false, Ordering::Release);
+        assert!(venue.refresh_fees_coordinated().await.is_err());
+        assert_eq!(
+            clone.refresh_fees_coordinated().await.unwrap(),
+            FeeRefreshOutcome::Throttled
+        );
+        assert!(!clone.fee_refreshing.load(Ordering::Acquire));
+        // 取消释放 guard，但开始尝试时间不能被清空。
+        {
+            venue.fee_refreshing.store(true, Ordering::Release);
+            let _guard = FeeRefreshGuard(&venue.fee_refreshing);
+        }
+        assert_eq!(
+            clone.refresh_fees_coordinated().await.unwrap(),
+            FeeRefreshOutcome::Throttled
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_http_refresh_releases_single_flight_but_keeps_cooldown() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut venue = test_venue();
+        venue.info_url = format!("http://{}", listener.local_addr().unwrap());
+        venue.http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 4096];
+            stream.read(&mut buf).await.unwrap();
+            sent.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let clone = venue.clone();
+        let request = tokio::spawn(async move { clone.refresh_fees_coordinated().await });
+        tokio::time::timeout(Duration::from_secs(2), received)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            venue.refresh_fees_coordinated().await.unwrap(),
+            FeeRefreshOutcome::InFlight
+        );
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(!venue.fee_refreshing.load(Ordering::Acquire));
+        assert_eq!(
+            venue.clone().refresh_fees_coordinated().await.unwrap(),
+            FeeRefreshOutcome::Throttled
+        );
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
@@ -1555,6 +1687,90 @@ mod tests {
             nonce: Arc::new(StdMutex::new(0)),
             fee_cache: Arc::new(StdRwLock::new(fees::FeeCache::default())),
             fee_refreshing: Arc::new(AtomicBool::new(false)),
+            fee_last_attempt: Arc::new(StdMutex::new(None)),
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_http_evidence_preserves_json_and_distinguishes_missing_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let long = json!({"status":"ok","response":{"data":{"statuses":[{"resting":{"oid":123}}]}},"error":"real field", "unknown":[null,{"secret":"PRIVATE_RESPONSE".repeat(100)}]}).to_string();
+        for (status, text, broken) in [
+            (200, long.as_str(), false),
+            (400, long.as_str(), false),
+            (500, long.as_str(), false),
+            (200, "null", false),
+            (200, "", false),
+            (200, "not JSON", false),
+            (400, "not JSON", false),
+            (200, "partial", true),
+            (400, "partial", true),
+            (0, "", false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let reply = format!(
+                "HTTP/1.1 {status} Stub\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                if broken { text.len() + 100 } else { text.len() }
+            );
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0; 4096];
+                socket.read(&mut buf).await.unwrap();
+                if status != 0 {
+                    socket.write_all(reply.as_bytes()).await.unwrap();
+                }
+            });
+            let mut venue = test_venue();
+            venue.exchange_url = format!("http://{addr}");
+            venue.http = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap();
+            let (result, raw) = venue
+                .post_prepared(PreparedOrder {
+                    order_hash: "hash".into(),
+                    envelope: json!({"cloid":"cloid"}),
+                    payload: json!({}),
+                    funder: None,
+                })
+                .await
+                .unwrap();
+            server.await.unwrap();
+            assert!(!format!("{raw:?}").contains("PRIVATE_RESPONSE"));
+            if status == 0 {
+                assert!(matches!(
+                    raw,
+                    super::super::SubmissionResponse::NoResponse(_)
+                ));
+                assert!(matches!(result, SubmitResult::Unknown { .. }));
+            } else {
+                assert!(matches!(raw, super::super::SubmissionResponse::Http(_)));
+                if broken {
+                    assert_eq!(raw["body_error"], "response_body");
+                    assert!(raw.get("body").is_none());
+                } else if let Ok(body) = serde_json::from_str::<Value>(text) {
+                    if status == 200 {
+                        assert_eq!(*raw, body);
+                    } else {
+                        assert_eq!(raw["body"], body);
+                    }
+                } else {
+                    assert_eq!(raw["body"], text);
+                    assert_eq!(
+                        raw["body_format"],
+                        if text.is_empty() { "empty" } else { "non_json" }
+                    );
+                }
+                if status == 400 {
+                    assert!(matches!(result, SubmitResult::Failed { status: 400, .. }));
+                } else if status == 200 && text == long {
+                    assert!(matches!(result, SubmitResult::Ack { .. }));
+                } else {
+                    assert!(matches!(result, SubmitResult::Unknown { .. }));
+                }
+            }
         }
     }
 

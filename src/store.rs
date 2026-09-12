@@ -520,7 +520,13 @@ impl Store {
         response: &Value,
     ) -> Result<()> {
         self.record_submission_with_fill(
-            resolver, leg_id, status, order_id, evidence, response, None,
+            resolver,
+            leg_id,
+            status,
+            order_id,
+            evidence,
+            &crate::platforms::SubmissionResponse::Http(response.clone()),
+            None,
         )
         .await
     }
@@ -533,7 +539,7 @@ impl Store {
         status: &str,
         order_id: Option<&str>,
         evidence: &Value,
-        response: &Value,
+        response: &crate::platforms::SubmissionResponse,
         matched_fill: Option<(Decimal, Decimal, Decimal)>,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
@@ -554,15 +560,41 @@ impl Store {
                 return Err(Error::msg("invalid matched submission fill"));
             }
         }
-        sqlx::query(
-            "UPDATE signed_envelopes SET submit_response = $2 WHERE id =
-             (SELECT id FROM signed_envelopes WHERE leg_id = $1 ORDER BY id DESC LIMIT 1)",
-        )
-        .bind(leg_id)
-        .bind(response)
-        .execute(&mut *tx)
-        .await?;
+        let mut info = current
+            .last_order_info
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}));
+        match response {
+            crate::platforms::SubmissionResponse::Http(value) => {
+                sqlx::query(
+                    "UPDATE signed_envelopes SET submit_response = $2 WHERE id =
+                     (SELECT id FROM signed_envelopes WHERE leg_id = $1 ORDER BY id DESC LIMIT 1)",
+                )
+                .bind(leg_id)
+                .bind(value)
+                .execute(&mut *tx)
+                .await?;
+            }
+            crate::platforms::SubmissionResponse::NoResponse(diagnostic) => {
+                // 无响应错误不是平台回执，不能覆盖先前真实响应（包括 JSON null）。
+                let diagnostic = serde_json::json!({
+                    "kind": diagnostic.get("kind").and_then(Value::as_str).unwrap_or("local_error"),
+                    "received": false,
+                    "error": diagnostic.get("error").cloned().unwrap_or(Value::Null),
+                });
+                sqlx::query(
+                    "UPDATE signed_envelopes SET submit_response = $2 WHERE id =
+                     (SELECT id FROM signed_envelopes WHERE leg_id = $1 ORDER BY id DESC LIMIT 1)
+                     AND submit_response IS NULL",
+                )
+                .bind(leg_id)
+                .bind(diagnostic)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
         if !parent_open || !leg_open(&current.status) {
+            // 回执只写 envelope；终态腿及其风控基线不再变化。
             tx.commit().await?;
             return Ok(());
         }
@@ -600,9 +632,6 @@ impl Store {
         } else {
             status
         };
-        let mut info = current
-            .last_order_info
-            .unwrap_or_else(|| serde_json::json!({}));
         if current.platform == POLYMARKET
             && known
                 .zip(order_id)

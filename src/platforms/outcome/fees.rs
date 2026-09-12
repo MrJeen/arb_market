@@ -54,6 +54,21 @@ pub struct OutcomeFeeSnapshot {
 }
 
 impl OutcomeFeeSnapshot {
+    #[cfg(test)]
+    pub(crate) fn expire_test(&mut self) {
+        self.account_time.monotonic = Instant::now() - FEE_MAX_AGE;
+    }
+
+    pub fn source_ages_ms(&self) -> (u64, u64) {
+        let now = Instant::now();
+        (
+            now.saturating_duration_since(self.account_time.monotonic)
+                .as_millis() as u64,
+            now.saturating_duration_since(self.market_time.monotonic)
+                .as_millis() as u64,
+        )
+    }
+
     pub fn is_fresh(&self) -> bool {
         let now = Instant::now();
         self.account_time.fresh_at(now) && self.market_time.fresh_at(now)
@@ -149,23 +164,66 @@ struct CombinedSnapshot {
     builder_rate: Decimal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeeLookupError {
+    Missing,
+    Expired,
+    MarketMissing,
+    MarketInvalid(&'static str),
+    InvalidIdentity,
+    CacheLock,
+}
+
+impl FeeLookupError {
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::MarketInvalid(detail) => detail,
+            _ => self.reason(),
+        }
+    }
+
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Missing => "current_fee_snapshot_missing",
+            Self::Expired => "current_fee_snapshot_expired",
+            Self::MarketMissing => "current_fee_market_missing",
+            Self::MarketInvalid(_) => "unsupported_fee_market",
+            Self::InvalidIdentity => "invalid_fee_market_identity",
+            Self::CacheLock => "fee_cache_lock_error",
+        }
+    }
+}
+
+impl std::fmt::Display for FeeLookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+impl std::error::Error for FeeLookupError {}
+
 impl FeeCache {
+    #[cfg(test)]
     pub(super) fn get(&self, outcome_id: u64) -> Result<OutcomeFeeSnapshot> {
-        let combined = self
-            .snapshot
-            .as_ref()
-            .ok_or_else(|| Error::msg("outcome fee snapshot unavailable"))?;
+        self.lookup(outcome_id)
+            .map_err(|err| Error::msg(err.reason()))
+    }
+
+    pub(super) fn lookup(
+        &self,
+        outcome_id: u64,
+    ) -> std::result::Result<OutcomeFeeSnapshot, FeeLookupError> {
+        let combined = self.snapshot.as_ref().ok_or(FeeLookupError::Missing)?;
         let now = Instant::now();
         if !combined.account.time.fresh_at(now) || !combined.markets.time.fresh_at(now) {
-            return Err(Error::msg("outcome fee snapshot expired"));
+            return Err(FeeLookupError::Expired);
         }
         let market = combined
             .markets
             .rules
             .get(&outcome_id)
-            .ok_or_else(|| Error::msg("outcome market fee unknown"))?
+            .ok_or(FeeLookupError::MarketMissing)?
             .as_ref()
-            .map_err(|reason| Error::msg(*reason))?;
+            .map_err(|reason| FeeLookupError::MarketInvalid(reason))?;
         Ok(OutcomeFeeSnapshot {
             taker_rate: market.taker_rate,
             builder_rate: combined.builder_rate,

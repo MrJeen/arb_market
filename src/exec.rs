@@ -15,6 +15,7 @@ use crate::notify::{
     self, NatsNotifier, PlaceNotice, PlaceResult, SettlementNotice, TakeProfitCompletedNotice,
     TakeProfitTriggerNotice,
 };
+use crate::platforms::outcome::fees::FeeLookupError;
 use crate::platforms::outcome::{OutcomeFeeSnapshot, OutcomeVenue};
 use crate::platforms::polymarket::PolymarketVenue;
 use crate::platforms::{
@@ -62,6 +63,24 @@ struct ActionFees {
     outcome_id: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeeAdmissionError {
+    DeadlineExpired,
+    SelectedExpired,
+    Current(FeeLookupError),
+    RulesChanged,
+}
+impl FeeAdmissionError {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::DeadlineExpired => "confirmation_deadline_expired",
+            Self::SelectedExpired => "selected_fee_snapshot_expired",
+            Self::Current(err) => err.reason(),
+            Self::RulesChanged => "fee_rules_changed",
+        }
+    }
+}
+
 struct ConfirmedArb {
     plan: ArbPlan,
     fees: ActionFees,
@@ -87,6 +106,17 @@ fn action_fee_estimate(
     reserve: Decimal,
     funding: Decimal,
 ) -> Value {
+    if platform == POLYMARKET {
+        return json!({
+            "version": 1, "fee_model": "pm_taker_v1",
+            "polymarket_fee_rate": fees.context.polymarket_fee_rate.to_string(),
+            "action": {
+                "platform": platform, "token": token_id, "side": side.as_str(),
+                "shares": shares.to_string(), "notional": notional.to_string(),
+                "fee": fee.to_string(), "funding": funding.to_string(),
+            }
+        });
+    }
     let mut estimate = fees.outcome.estimate_json();
     estimate["action"] = json!({
         "platform": platform, "token": token_id, "side": side.as_str(),
@@ -189,12 +219,14 @@ impl Engine {
         Ok(false)
     }
 
-    fn fee_context(&self, topic: &Topic) -> Result<ActionFees> {
+    fn fee_context(&self, topic: &Topic) -> std::result::Result<ActionFees, FeeLookupError> {
         let outcome_id: u64 = topic
-            .market_identity()?
-            .require(OUTCOME)?
+            .market_identity()
+            .map_err(|_| FeeLookupError::InvalidIdentity)?
+            .require(OUTCOME)
+            .map_err(|_| FeeLookupError::InvalidIdentity)?
             .parse()
-            .map_err(|_| Error::msg("invalid outcome fee market identity"))?;
+            .map_err(|_| FeeLookupError::InvalidIdentity)?;
         if topic
             .tokens
             .iter()
@@ -204,9 +236,9 @@ impl Engine {
                     != Some(outcome_id)
             })
         {
-            return Err(Error::msg("outcome fee token/market identity mismatch"));
+            return Err(FeeLookupError::InvalidIdentity);
         }
-        let outcome = self.outcome.fee_snapshot(outcome_id)?;
+        let outcome = self.outcome.lookup_fees(outcome_id)?;
         Ok(ActionFees {
             context: FeeContext {
                 polymarket_fee_rate: topic
@@ -232,13 +264,90 @@ impl Engine {
         }
     }
 
-    fn fees_admitted(&self, fees: &ActionFees, deadline: Instant) -> bool {
-        Instant::now() < deadline
-            && fees.outcome.is_fresh()
-            && self
-                .outcome
-                .fee_snapshot(fees.outcome_id)
-                .is_ok_and(|current| current.is_fresh() && fees.outcome.same_rules(&current))
+    fn fees_admitted(
+        &self,
+        fees: &ActionFees,
+        deadline: Instant,
+    ) -> std::result::Result<(), FeeAdmissionError> {
+        if Instant::now() >= deadline {
+            return Err(FeeAdmissionError::DeadlineExpired);
+        }
+        if !fees.outcome.is_fresh() {
+            return Err(FeeAdmissionError::SelectedExpired);
+        }
+        let current = self
+            .outcome
+            .lookup_fees(fees.outcome_id)
+            .map_err(FeeAdmissionError::Current)?;
+        if !fees.outcome.same_rules(&current) {
+            return Err(FeeAdmissionError::RulesChanged);
+        }
+        Ok(())
+    }
+
+    // 只能在 books/事务锁外调用。即使刷新成功，本轮仍退出，下一轮重新确认。
+    async fn prepare_fees(&self, topic: &Topic, action: &str, stage: &str) -> bool {
+        match self.fee_context(topic) {
+            Ok(_) => true,
+            Err(err) => {
+                self.stats.outcome_fee_unavailable();
+                tracing::debug!(topic = %topic.key.as_str(), action, stage, reason = err.reason(), detail = err.detail(), "fee preparation rejected");
+                self.refresh_missing_fees(err, action, stage).await;
+                false
+            }
+        }
+    }
+
+    async fn refresh_missing_fees(&self, err: FeeLookupError, action: &str, stage: &str) {
+        if matches!(err, FeeLookupError::Missing | FeeLookupError::Expired) {
+            match self.outcome.refresh_fees_coordinated().await {
+                Ok(outcome) => {
+                    if outcome == crate::platforms::outcome::FeeRefreshOutcome::Refreshed {
+                        self.stats.outcome_fee_refresh_ok();
+                    }
+                    tracing::debug!(
+                        action,
+                        stage,
+                        cause = err.reason(),
+                        ?outcome,
+                        "fee preparation refresh completed; defer to next round"
+                    );
+                }
+                Err(error) => {
+                    self.stats.outcome_fee_refresh_failed();
+                    tracing::warn!(action, stage, cause = err.reason(), %error, "fee preparation refresh failed; skip round");
+                }
+            }
+        }
+    }
+
+    fn admit_fees(
+        &self,
+        fees: &ActionFees,
+        deadline: Instant,
+        action: &str,
+        stage: &str,
+        scope: &str,
+    ) -> std::result::Result<(), FeeAdmissionError> {
+        let result = self.fees_admitted(fees, deadline);
+        if let Err(err) = result {
+            let now = Instant::now();
+            let (account_age_ms, market_age_ms) = fees.outcome.source_ages_ms();
+            tracing::info!(
+                action,
+                stage,
+                scope,
+                outcome_id = fees.outcome_id,
+                account_age_ms,
+                market_age_ms,
+                reason = err.reason(),
+                remaining_ms = deadline.saturating_duration_since(now).as_millis() as u64,
+                expired_ms = now.saturating_duration_since(deadline).as_millis() as u64,
+                "fee confirmation rejected"
+            );
+            // 最终准入同步拒绝，先及时 abort/release；下轮锁外准备才允许刷新。
+        }
+        result
     }
 
     async fn evaluate_topic(&self, topic_key: TopicKey) -> Result<()> {
@@ -268,6 +377,9 @@ impl Engine {
             return Ok(());
         }
         self.ensure_topic_pm_ticks(&topic).await;
+        if !self.prepare_fees(&topic, "trading", "initial_screen").await {
+            return Ok(());
+        }
         let Some(selected_fees) = self.available_fees(&topic) else {
             return Ok(());
         };
@@ -468,7 +580,13 @@ impl Engine {
             tracing::info!(topic = %topic.key.as_str(), "polymarket tick unavailable or cap changed before admission");
             return Ok(());
         }
-        if !self.fees_admitted(selected_fees, confirmation_deadline) {
+        if let Err(_reason) = self.admit_fees(
+            selected_fees,
+            confirmation_deadline,
+            "arbitrage",
+            "before_prepare",
+            &topic.key.as_str(),
+        ) {
             tracing::debug!(topic = %topic.key.as_str(), "arb fee confirmation expired or changed");
             return Ok(());
         }
@@ -521,7 +639,13 @@ impl Engine {
             return Ok(());
         }
         let prepared_pm = self.pm.prepare_market_order(funder, &pm_req).await?;
-        if !self.fees_admitted(selected_fees, confirmation_deadline) {
+        if let Err(_reason) = self.admit_fees(
+            selected_fees,
+            confirmation_deadline,
+            "arbitrage",
+            "after_prepare_before_archive",
+            &topic.key.as_str(),
+        ) {
             return Ok(());
         }
         // 建档必须原子：`actived` 且没有腿的父单会被回填判为无成交并取消。
@@ -598,12 +722,21 @@ impl Engine {
         let [pm_leg, out_leg] = <[i64; 2]>::try_from(leg_ids)
             .map_err(|_| Error::msg("arb order must be created with both initial legs"))?;
         // 建档等待也可能跨越刷新/过期；尚未签名时整组取消，不能留下单边提交。
-        if !self.fees_admitted(selected_fees, confirmation_deadline) {
+        if let Err(reason) = self.admit_fees(
+            selected_fees,
+            confirmation_deadline,
+            "arbitrage",
+            "after_archive",
+            &format!(
+                "topic={} order={order_id} legs={pm_leg},{out_leg}",
+                topic.key.as_str()
+            ),
+        ) {
             self.store
                 .abort_unsubmitted_legs(
                     &|wallet, token| self.outcome.latest_actuals_fee(wallet, token),
                     &[pm_leg, out_leg],
-                    "fee_confirmation_changed_or_expired",
+                    reason.reason(),
                 )
                 .await?;
             mark_orders_complete(
@@ -801,6 +934,12 @@ impl Engine {
             return Ok(None);
         }
         let confirmation_deadline = pm_at.min(out_at) + self.cfg.book_stale;
+        if !self
+            .prepare_fees(topic, "arbitrage", "final_book_confirmation")
+            .await
+        {
+            return Ok(None);
+        }
         let Some(selected_fees) = self.available_fees(topic) else {
             return Ok(None);
         };
@@ -1402,6 +1541,9 @@ impl Engine {
             return Ok(());
         }
 
+        if !self.prepare_fees(&topic, "trading", "initial_screen").await {
+            return Ok(());
+        }
         let Some(selected_fees) = self.available_fees(&topic) else {
             return Ok(());
         };
@@ -2184,6 +2326,12 @@ impl Engine {
                 return Ok(None);
             }
         }
+        if !self
+            .prepare_fees(topic, "take_profit", "final_book_confirmation")
+            .await
+        {
+            return Ok(None);
+        }
         let Some(fees) = self.available_fees(topic) else {
             return Ok(None);
         };
@@ -2309,10 +2457,14 @@ impl Engine {
             .await;
         let out_req = self.take_profit_request(topic, out_action, None).await;
         validate_pm_request_tick(&pm_req)?;
-        if !self.fees_admitted(&confirmed.fees, confirmed.deadline) {
-            return Err(Error::msg(
-                "take profit fee confirmation changed or expired",
-            ));
+        if let Err(reason) = self.admit_fees(
+            &confirmed.fees,
+            confirmed.deadline,
+            "take_profit",
+            "before_prepare",
+            &format!("order={order_id} claim={claim_id}"),
+        ) {
+            return Err(Error::msg(reason.reason()));
         }
         let prepared_pm = self.pm.prepare_market_order(&funder, &pm_req).await?;
         let identity = self.market_identity_for_order(order_id, topic).await?;
@@ -2323,10 +2475,14 @@ impl Engine {
         {
             return Err(Error::msg("take profit settlement gate changed"));
         }
-        if !self.fees_admitted(&confirmed.fees, confirmed.deadline) {
-            return Err(Error::msg(
-                "take profit fee confirmation changed or expired",
-            ));
+        if let Err(reason) = self.admit_fees(
+            &confirmed.fees,
+            confirmed.deadline,
+            "take_profit",
+            "after_prepare_before_archive",
+            &format!("order={order_id} claim={claim_id}"),
+        ) {
+            return Err(Error::msg(reason.reason()));
         }
         let leg_ids = self
             .store
@@ -2372,12 +2528,18 @@ impl Engine {
         let [pm_leg, out_leg]: [i64; 2] = leg_ids
             .try_into()
             .map_err(|_| Error::msg("take profit must create exactly two legs"))?;
-        if !self.fees_admitted(&confirmed.fees, confirmed.deadline) {
+        if let Err(reason) = self.admit_fees(
+            &confirmed.fees,
+            confirmed.deadline,
+            "take_profit",
+            "after_archive",
+            &format!("order={order_id} claim={claim_id}"),
+        ) {
             self.store
                 .abort_unsubmitted_legs(
                     &|wallet, token| self.outcome.latest_actuals_fee(wallet, token),
                     &[pm_leg, out_leg],
-                    "fee_confirmation_changed_or_expired",
+                    reason.reason(),
                 )
                 .await?;
             self.store
@@ -2580,6 +2742,16 @@ impl Engine {
                 self.load_outcome_buy_balance(&mut balances).await?;
             }
         }
+        if !self
+            .prepare_fees(topic, "rebalance", "final_book_confirmation")
+            .await
+        {
+            // 本轮尚未创建订单腿，退出时立即释放占用，不等待零腿超时回收。
+            self.store
+                .release_lifecycle(order_id, "rebalance", claim_id)
+                .await?;
+            return Ok(());
+        }
         let tokens = hedge_order_tokens(topic, positions, self.cfg.min_rebalance_qty);
         self.refresh_hedge_books(order_id, &tokens).await;
         let selected = self
@@ -2701,6 +2873,15 @@ impl Engine {
                 ));
             }
         }
+        if let Err(reason) = self.admit_fees(
+            &selected,
+            deadline,
+            "rebalance",
+            "before_prepare",
+            &format!("order={order_id} claim={claim_id}"),
+        ) {
+            return Err(Error::msg(reason.reason()));
+        }
         let mut prepared_pm = Vec::new();
         for (action, request) in actions.iter().zip(&requests) {
             prepared_pm.push(if action.platform == POLYMARKET {
@@ -2752,8 +2933,14 @@ impl Engine {
             return Err(Error::msg("rebalance settlement gate changed"));
         }
         self.store.mark_rebalance(order_id, "actived").await?;
-        if !self.fees_admitted(&selected, deadline) {
-            return Err(Error::msg("rebalance fee confirmation changed or expired"));
+        if let Err(reason) = self.admit_fees(
+            &selected,
+            deadline,
+            "rebalance",
+            "after_prepare_before_archive",
+            &format!("order={order_id} claim={claim_id}"),
+        ) {
+            return Err(Error::msg(reason.reason()));
         }
         let ids = self
             .store
@@ -2765,12 +2952,18 @@ impl Engine {
                 &legs,
             )
             .await?;
-        if !self.fees_admitted(&selected, deadline) {
+        if let Err(reason) = self.admit_fees(
+            &selected,
+            deadline,
+            "rebalance",
+            "after_archive",
+            &format!("order={order_id} claim={claim_id}"),
+        ) {
             self.store
                 .abort_unsubmitted_legs(
                     &|wallet, token| self.outcome.latest_actuals_fee(wallet, token),
                     &ids,
-                    "fee_confirmation_changed_or_expired",
+                    reason.reason(),
                 )
                 .await?;
             self.store
@@ -3489,7 +3682,7 @@ async fn persist_submit(
     side: OrderSide,
     result: &SubmitResult,
     fees: &FeeContext,
-    response: &serde_json::Value,
+    response: &crate::platforms::SubmissionResponse,
 ) -> Result<()> {
     let matched_fill = pm_matched_submit_fill(platform, side, result, fees, response);
     let (status, oid, evidence) = match result {
@@ -4102,6 +4295,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rebalance_fee_exit_propagates_claim_release_failure() {
+        let (base, stop, server) = balance_test_server(vec![usdc_reply("100")], None).await;
+        let (mut engine, _) = balance_test_engine(&base).await;
+        engine.cfg.enable_rebalance = true;
+        engine.store.pool.close().await;
+        let mut topic = fee_test_topic();
+        for token in &mut topic.tokens {
+            if token.platform == OUTCOME {
+                token.token_id = if token.label == "yes" {
+                    "#9990"
+                } else {
+                    "#9991"
+                }
+                .into();
+            }
+        }
+        let action = crate::hedge::HedgeAction {
+            platform: OUTCOME.into(),
+            token_id: "#9991".into(),
+            label: "no".into(),
+            side: HedgeSide::Buy,
+            shares: d("10"),
+            cap_price: d("0.4"),
+            fee: Decimal::ZERO,
+            marginal_value: d("6"),
+        };
+        assert!(
+            engine
+                .execute_hedges(
+                    1,
+                    uuid::Uuid::new_v4(),
+                    &topic,
+                    &crate::hedge::Positions::new(),
+                    &[action]
+                )
+                .await
+                .is_err(),
+            "claim release failure must not be reported as a successful fee exit"
+        );
+        stop.send(()).unwrap();
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+    async fn rebalance_fee_exit_releases_zero_leg_claim_immediately() {
+        let uri = std::env::var("APP_POSTGRES_URI").expect("set APP_POSTGRES_URI");
+        let schema = format!("rebalance_fee_test_{}", uuid::Uuid::new_v4().simple());
+        let connection_schema = schema.clone();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .after_connect(move |connection, _| {
+                let schema = connection_schema.clone();
+                Box::pin(async move {
+                    sqlx::query("SELECT set_config('search_path',$1,false)")
+                        .bind(schema)
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&uri)
+            .await
+            .unwrap();
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (base, stop, server) = balance_test_server(vec![usdc_reply("100")], None).await;
+        let (mut engine, _) = balance_test_engine(&base).await;
+        engine.cfg.enable_rebalance = true;
+        engine.store = Store { pool: pool.clone() };
+        let exercised: Result<()> = async {
+            engine.store.migrate().await?;
+            let order_id: i64 = sqlx::query_scalar(
+                "INSERT INTO arb_orders (event_id, unified_index, status) VALUES ($1,0,'completed') RETURNING id"
+            ).bind(uuid::Uuid::new_v4()).fetch_one(&pool).await?;
+            let claim = engine.store.try_claim_lifecycle(order_id, "rebalance").await?.unwrap();
+            let mut topic = fee_test_topic();
+            // 当前市场没有费率；余额仍足够，必须走费用拒绝而不是资金拒绝。
+            for token in &mut topic.tokens {
+                if token.platform == OUTCOME {
+                    token.token_id = if token.label == "yes" { "#9990" } else { "#9991" }.into();
+                }
+            }
+            let action = crate::hedge::HedgeAction {
+                platform: OUTCOME.into(), token_id: "#9991".into(), label: "no".into(),
+                side: HedgeSide::Buy, shares: d("10"), cap_price: d("0.4"),
+                fee: Decimal::ZERO, marginal_value: d("6"),
+            };
+            engine.execute_hedges(order_id, claim, &topic, &crate::hedge::Positions::new(), &[action]).await?;
+            let (state, owner): (String, Option<uuid::Uuid>) = sqlx::query_as(
+                "SELECT position_status,lifecycle_claim_id FROM arb_orders WHERE id=$1"
+            ).bind(order_id).fetch_one(&pool).await?;
+            assert_eq!(state, "watching");
+            assert!(owner.is_none());
+            let legs: i64 = sqlx::query_scalar("SELECT count(*) FROM legs WHERE order_id=$1")
+                .bind(order_id).fetch_one(&pool).await?;
+            assert_eq!(legs, 0);
+            engine.outcome.install_test_fee_snapshot(999, Decimal::ZERO, Decimal::ZERO);
+            assert!(engine.available_fees(&topic).is_some());
+            let next = engine.store.try_claim_lifecycle(order_id, "rebalance").await?.unwrap();
+            assert_ne!(claim, next);
+            assert!(!engine.store.release_lifecycle(order_id, "rebalance", claim).await?);
+            assert!(engine.store.release_lifecycle(order_id, "rebalance", next).await?);
+            Ok(())
+        }.await;
+        stop.send(()).unwrap();
+        let requests = server.await.unwrap();
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        exercised.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "only the balance query may reach the venue"
+        );
+    }
+
+    #[tokio::test]
     async fn outcome_execution_balance_is_local_to_each_stage() {
         let (base, stop, server) =
             balance_test_server(vec![usdc_reply("100"), usdc_reply("0")], None).await;
@@ -4207,22 +4523,22 @@ mod tests {
             .install_test_fee_snapshot(1, d("0.001344"), d("0.0001"));
         let fees = engine.fee_context(&topic).unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
-        assert!(engine.fees_admitted(&fees, deadline));
-        assert!(!engine.fees_admitted(&fees, Instant::now()));
+        assert!(engine.fees_admitted(&fees, deadline).is_ok());
+        assert!(engine.fees_admitted(&fees, Instant::now()).is_err());
         engine
             .outcome
             .install_test_fee_snapshot(1, d("0.001344"), d("0.0001"));
         assert!(
-            engine.fees_admitted(&fees, deadline),
+            engine.fees_admitted(&fees, deadline).is_ok(),
             "same rules renewal must remain valid"
         );
         engine
             .outcome
             .install_test_fee_snapshot(1, d("0.002"), d("0.0001"));
-        assert!(!engine.fees_admitted(&fees, deadline));
+        assert!(engine.fees_admitted(&fees, deadline).is_err());
         let current = engine.fee_context(&topic).unwrap();
         engine.outcome.expire_test_fee_snapshot(1);
-        assert!(!engine.fees_admitted(&current, deadline));
+        assert!(engine.fees_admitted(&current, deadline).is_err());
         assert!(engine.available_fees(&topic).is_none());
         assert_eq!(engine.stats.snapshot_and_reset().outcome_fee_unavailable, 2);
     }
@@ -4289,7 +4605,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn frozen_action_estimates_do_not_follow_refresh_and_include_pm_pair_reserve() {
+    async fn preparation_refresh_exits_current_round_and_next_round_is_cache_only() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for body in [
+                json!({"userSpotCrossRate":"0.0007", "activeReferralDiscount":"0"}),
+                json!({"feeScale":"1", "outcomes":[{"outcome":1,"venue":"out","quoteToken":"USDC","deployerFeeScale":"1","sideSpecs":[{"name":"Yes"},{"name":"No"}]}]}),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0; 4096];
+                socket.read(&mut buf).await.unwrap();
+                let body = body.to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let mut engine = fee_test_engine().await;
+        engine.outcome = OutcomeVenue::connect(&admission_test_config(&base)).unwrap();
+        assert!(
+            !engine
+                .prepare_fees(&fee_test_topic(), "test", "initial")
+                .await
+        );
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        // 服务已退出，新轮只读取新鲜缓存，不再发 HTTP。
+        assert!(
+            engine
+                .prepare_fees(&fee_test_topic(), "test", "next_round")
+                .await
+        );
+        assert_eq!(
+            engine
+                .fee_context(&fee_test_topic())
+                .unwrap()
+                .context
+                .outcome_taker_rate,
+            d("0.0014")
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_fee_reasons_and_fresh_preparation_do_not_issue_http() {
+        let engine = fee_test_engine().await;
+        let topic = fee_test_topic();
+        assert_eq!(
+            engine.fee_context(&topic).err(),
+            Some(FeeLookupError::Missing)
+        );
+        engine
+            .outcome
+            .install_test_fee_snapshot(1, d("0.001344"), Decimal::ZERO);
+        let selected = engine.fee_context(&topic).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        assert!(engine.prepare_fees(&topic, "test", "initial").await);
+        let mut expired = selected.clone();
+        expired.outcome.expire_test();
+        assert_eq!(
+            engine.fees_admitted(&expired, deadline),
+            Err(FeeAdmissionError::SelectedExpired)
+        );
+        assert_eq!(
+            engine.fees_admitted(&selected, Instant::now()),
+            Err(FeeAdmissionError::DeadlineExpired)
+        );
+        assert_eq!(
+            engine.outcome.lookup_fees(999).err(),
+            Some(FeeLookupError::MarketMissing)
+        );
+        engine
+            .outcome
+            .install_test_fee_snapshot(1, d("0.003"), Decimal::ZERO);
+        assert_eq!(
+            engine.fees_admitted(&selected, deadline),
+            Err(FeeAdmissionError::RulesChanged)
+        );
+        engine.outcome.expire_test_fee_snapshot(1);
+        assert_eq!(
+            engine.fees_admitted(&selected, deadline),
+            Err(FeeAdmissionError::Current(FeeLookupError::Expired))
+        );
+        assert!(!engine.prepare_fees(&topic, "test", "initial").await);
+    }
+
+    #[tokio::test]
+    async fn frozen_action_estimates_are_platform_isolated_and_do_not_follow_refresh() {
         let engine = fee_test_engine().await;
         engine
             .outcome
@@ -4314,7 +4717,26 @@ mod tests {
             .install_test_fee_snapshot(1, d("0.003"), d("0.002"));
         let after = estimate(POLYMARKET);
         assert_eq!(before, after);
-        assert_eq!(after["action"]["settlement_reserve"], "0.04032");
+        assert_eq!(after["fee_model"], "pm_taker_v1");
+        assert_eq!(
+            after["polymarket_fee_rate"],
+            frozen.context.polymarket_fee_rate.to_string()
+        );
+        assert_eq!(after["action"]["fee"], "0.0012");
+        assert!(after["action"].get("settlement_reserve").is_none());
+        assert!(after["action"].get("reserve_scope").is_none());
+        for key in [
+            "outcome_id",
+            "token_ids",
+            "taker_rate",
+            "builder_rate",
+            "account_version",
+            "user_fees_fetched_at",
+            "max_age_secs",
+        ] {
+            assert!(after.get(key).is_none(), "unexpected PM key {key}");
+        }
+        assert_eq!(estimate(OUTCOME)["action"]["settlement_reserve"], "0.04032");
         assert_eq!(estimate(OUTCOME)["action"]["fee"], "0.0012");
         assert_eq!(frozen.context.outcome_taker_rate, d("0.001344"));
     }
@@ -5823,22 +6245,52 @@ mod tests {
                     // 父单刷新失败时，提交响应与腿账务也必须一起回滚。
                     sqlx::query("CREATE FUNCTION reject_parent_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test parent failure'; END $$").execute(&store.pool).await?;
                     sqlx::query("CREATE TRIGGER reject_parent BEFORE UPDATE ON arb_orders FOR EACH ROW EXECUTE FUNCTION reject_parent_update()").execute(&store.pool).await?;
-                    assert!(persist_submit(&|_, _| None, store,id,POLYMARKET,side,&result,&fees,&response).await.is_err());
+                    assert!(persist_submit(&|_, _| None, store,id,POLYMARKET,side,&result,&fees,&crate::platforms::SubmissionResponse::Http(response.clone())).await.is_err());
                     let row:(String,Option<Decimal>,Option<Value>)=sqlx::query_as("SELECT l.status,l.actual_shares,e.submit_response FROM legs l JOIN signed_envelopes e ON e.leg_id=l.id WHERE l.id=$1").bind(id).fetch_one(&store.pool).await?;
                     assert_eq!(row.0, "pending");
                     assert!(row.1.is_none());
                     assert!(row.2.is_none());
+                    let info:Option<Value>=sqlx::query_scalar("SELECT last_order_info FROM legs WHERE id=$1").bind(id).fetch_one(&store.pool).await?;
+                    assert!(info.as_ref().and_then(|v|v.get("submit_response")).is_none());
                     sqlx::query("DROP TRIGGER reject_parent ON arb_orders").execute(&store.pool).await?;
                 } else {
                     // 先前仅观察到的部分明细不能与提交返回的总量叠加。
                     sqlx::query("INSERT INTO fills(leg_id,third_order_id,trade_id,shares,price) VALUES($1,$2,'observed',1,0.4)").bind(id).bind(&oid).execute(&store.pool).await?;
                 }
-                persist_submit(&|_, _| None, store,id,POLYMARKET,side,&result,&fees,&response).await?;
-                persist_submit(&|_, _| None, store,id,POLYMARKET,side,&result,&fees,&response).await?;
+                persist_submit(&|_, _| None, store,id,POLYMARKET,side,&result,&fees,&crate::platforms::SubmissionResponse::Http(response.clone())).await?;
+                persist_submit(&|_, _| None, store,id,POLYMARKET,side,&result,&fees,&crate::platforms::SubmissionResponse::Http(response.clone())).await?;
                 let row:(String,Decimal,Decimal,Decimal,Value)=sqlx::query_as("SELECT status,actual_shares,actual_price,actual_fee,last_order_info FROM legs WHERE id=$1").bind(id).fetch_one(&store.pool).await?;
                 assert_eq!((row.0.as_str(),row.1,row.2,row.3),("matched",d("3"),d("0.4"),d("0.0504")));
                 assert_eq!(row.4["submission"]["fill"]["source"],"submit_response");
                 assert_eq!(row.4["fee_sources"],json!(["estimated"]));
+                assert!(row.4.get("submit_response").is_none());
+                let before:Value=sqlx::query_scalar("SELECT to_jsonb(l) FROM legs l WHERE id=$1").bind(id).fetch_one(&store.pool).await?;
+                let parent_before:Value=sqlx::query_scalar("SELECT to_jsonb(a) FROM arb_orders a WHERE id=$1").bind(parent).fetch_one(&store.pool).await?;
+                let diagnostic=json!({"kind":"transport","error":"local failure"});
+                store.record_submission_with_fill(&|_, _| None,id,"unknown",None,&json!({"kind":"unknown"}),&crate::platforms::SubmissionResponse::NoResponse(diagnostic.clone()),None).await?;
+                let after:Value=sqlx::query_scalar("SELECT to_jsonb(l) FROM legs l WHERE id=$1").bind(id).fetch_one(&store.pool).await?;
+                let expected=before;
+                assert_eq!(after,expected);
+                let envelope:Value=sqlx::query_scalar("SELECT submit_response FROM signed_envelopes WHERE leg_id=$1").bind(id).fetch_one(&store.pool).await?;
+                assert_eq!(envelope,response);
+                // 仅测试夹具重置为 SQL NULL，覆盖本地诊断/真实响应的先后次序。
+                sqlx::query("UPDATE signed_envelopes SET submit_response=NULL WHERE leg_id=$1").bind(id).execute(&store.pool).await?;
+                let first=json!({"kind":"transport","received":false,"error":"first local failure"});
+                for incoming in [first.clone(), json!({"kind":"timeout","received":false,"error":"later"})] {
+                    store.record_submission_with_fill(&|_, _| None,id,"unknown",None,&json!({"kind":"unknown"}),&crate::platforms::SubmissionResponse::NoResponse(incoming),None).await?;
+                    let saved:Value=sqlx::query_scalar("SELECT submit_response FROM signed_envelopes WHERE leg_id=$1").bind(id).fetch_one(&store.pool).await?;
+                    assert_eq!(saved,first);
+                }
+                for http in [Value::Null, json!({"http_status":500,"body":{"long":"x".repeat(4096)}}), json!({"http_status":200,"body":"not json","body_format":"non_json"}), json!({"http_status":200,"body_read_error":"incomplete"}), response.clone()] {
+                    store.record_submission_with_fill(&|_, _| None,id,"unknown",None,&json!({"kind":"unknown"}),&crate::platforms::SubmissionResponse::Http(http.clone()),None).await?;
+                    store.record_submission_with_fill(&|_, _| None,id,"unknown",None,&json!({"kind":"unknown"}),&crate::platforms::SubmissionResponse::NoResponse(first.clone()),None).await?;
+                    let saved:Value=sqlx::query_scalar("SELECT submit_response FROM signed_envelopes WHERE leg_id=$1").bind(id).fetch_one(&store.pool).await?;
+                    assert_eq!(saved,http);
+                }
+                let unchanged:Value=sqlx::query_scalar("SELECT to_jsonb(l) FROM legs l WHERE id=$1").bind(id).fetch_one(&store.pool).await?;
+                assert_eq!(unchanged,expected);
+                let parent_after:Value=sqlx::query_scalar("SELECT to_jsonb(a) FROM arb_orders a WHERE id=$1").bind(parent).fetch_one(&store.pool).await?;
+                assert_eq!(parent_after,parent_before);
                 assert!(store.open_legs().await?.is_empty());
                 let positions=store.positions_for_order(parent).await?;
                 assert_eq!(position_qty(&positions,POLYMARKET,"yes"), if side==OrderSide::Buy {d("3")} else {d("-3")});

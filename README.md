@@ -58,7 +58,7 @@ PM 买入签名保持既有 maker 金额两位、taker 股数五位精度，但�
 
 ### Outcome 动态费用与估算边界
 
-启动获取 `userFees`（实际账户地址，不是agent）和 `outcomeMeta`，每300秒刷新组合内存快照，900秒过期。交易热路径不请求费用接口；刷新失败保留原快照但不延长时间。没有有效费率只暂停依赖它的新套利/止盈/再平衡，对账、结算查询和状态收尾继续。旧 `OUTCOME_TAKER_FEE_RATE` 已忽略，无固定费率兜底；无需新增env或SQL迁移。
+启动获取 `userFees`（实际账户地址，不是agent）和 `outcomeMeta`，每300秒刷新组合内存快照，900秒过期。有效缓存仅同步读取；初筛及最终盘口确认前准备阶段发现缺失或过期时，在盘口与数据库锁外等待一次有界刷新并退出当前轮，下一轮重新确认盘口、费率与资金。同一 OutcomeVenue 及其所有 clone 的按需/周期/人工刷新调用共享单飞和300秒尝试冷却（独立人工命令进程不跨进程共享），失败/取消也节流，并发或冷却跳过不算接口失败；刷新失败保留原快照但不延长时间。没有有效费率只暂停依赖它的新套利/止盈/再平衡，对账、结算查询和状态收尾继续。旧 `OUTCOME_TAKER_FEE_RATE` 已忽略，无固定费率兜底；无需新增env或SQL迁移。
 
 当前估算模型只支持已验证的 `venue=out`、`quoteToken=USDC`、顶层 `feeScale=1` 和合法逐市场 `deployerFeeScale=s`：`r = userSpotCrossRate × (1-activeReferralDiscount) × [s+max(s,1)]`。当前样本 `0.0007×0.96×2=0.001344`，即13.44bps；不额外乘固定2，不另套未经核实的staking/稳定币折扣。这是当前市场的样本支持模型，不是所有Outcome市场的通用官方费率。未知或缺失规则按不可估值处理。
 
@@ -66,7 +66,9 @@ PM 买入签名保持既有 maker 金额两位、taker 股数五位精度，但�
 
 严格互补q对的新套利暂以 `q×r` 作为未来结算准备，来源标记 `estimated_from_taker_close`，净预计收入 `q×(1-r)`；这只是所选结算假设下的情景估计，不是实际扣费或严格费用上界。准备影响profit/ROI/APR，不进入买腿req_fee、当前余额或现金budget，也不重复从profit扣减。止盈保持“两腿净卖出收入-q”门槛；再平衡卖超额取净现金，补PM或Outcome缺口均按新增配对净预计兑付减即时买成本。
 
-最终确认绑定计划、费率规则和有效期限，尚未发送就过期/变化时放弃本轮；多腿开始发送后使用冻结依据，不因后台刷新重签重发。估算在父单计划JSON及 `legs.last_order_info.fee_estimate` 留档，不进入实际成交费用。`fills.fee_rate_bps` 对Outcome仍可NULL；实际费用只取有效fill fee（包括0，已含builderFee），缺实扣证据继续等待。
+最终确认绑定计划、费率规则和有效期限，尚未发送就过期/变化时放弃本轮；多腿开始发送后使用冻结依据，不因后台刷新重签重发。最终 gate 纯同步拒绝并及时 abort/release，不在建档后等待费用 HTTP。typed reason 区分确认期限、所选快照过期、当前缓存缺失/过期、市场缺失/不支持、身份/锁错误和规则变化；prepare前后/建档后记录 action/stage、定位字段、期限与来源年龄，abort 持久化具体 reason。估算在父单计划JSON及 `legs.last_order_info.fee_estimate` 留档，不进入实际成交费用。新 PM 单腿快照仅含 PM 模型/费率及本腿 action，不含 Outcome 来源字段或结算 reserve；Outcome 沿用原 schema，父计划跨平台费用数学及历史快照均不变。`fills.fee_rate_bps` 对Outcome仍可NULL；实际费用只取有效fill fee（包括0，已含builderFee），缺实扣证据继续等待。
+
+提交审计：`legs.last_order_info.submission` 保留归类摘要，完整响应仅保存于最新 `signed_envelopes.submit_response`，不再向腿新增 `submit_response/submit_diagnostic` 镜像，也不清理历史字段或替换 `fee_estimate`。成功 JSON（含未知字段及 null）按 JSON 值保留；HTTP 失败保留状态和完整 JSON body，非 JSON/空正文与读取失败有明确标识。JSONB 不保留原文本空白或键顺序。未发请求的本地 gate 拒绝不伪造响应；无 HTTP 响应的网络错误仅在 envelope 响应为 SQL NULL 时写入显式 `received=false` 的本地诊断，不覆盖任何已有 JSON（含 JSON null 和先前诊断）；后续真实 HTTP 响应仍可写入。迟到终态回执只更新 envelope，不推进并发令牌或改变成交、收益及风险；封存保护仍拒绝写入。数据库失败仍报错并整体回滚，不保证故障时落库，不回填历史数据；完整响应不写日志。
 
 分钟统计：`outcome_fee_refresh_ok/failed` 统计完整刷新结果，`outcome_fee_unavailable` 统计费率不可用跳过。正常细节DEBUG、就绪/失效/恢复INFO、刷新失败WARN；不打印完整费用响应。
 

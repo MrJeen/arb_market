@@ -1120,7 +1120,11 @@ async fn order_events_project_atomically_and_noops_preserve_saved_estimates() ->
         ensure!(!frozen);
         let count = calls.load(Ordering::SeqCst);
         let no_cache = |_: &str, _: &str| -> Option<LatestFee> { panic!("no-op must not resolve fees") };
+        let leg_before:Value=sqlx::query_scalar("SELECT to_jsonb(l) FROM legs l WHERE id=$1").bind(leg_id).fetch_one(&s.pool).await?;
         s.record_submission(&no_cache, leg_id, "cancelled", None, &json!({"kind":"no_match","diagnostic":2}), &json!({"replay":true})).await?;
+        let leg_after:Value=sqlx::query_scalar("SELECT to_jsonb(l) FROM legs l WHERE id=$1").bind(leg_id).fetch_one(&s.pool).await?;
+        let expected=leg_before;
+        ensure!(leg_after==expected);
         s.complete_orders(&no_cache).await?;
         ensure!(order_json(s, id).await? == priced);
         ensure!(calls.load(Ordering::SeqCst) == count);

@@ -1821,7 +1821,14 @@ async fn reconciliation_rejects_stale_snapshots_and_audits_late_submission_respo
         let store = &fixture.store;
         store.migrate().await?;
         let (order_id, legs) = submitted_reconciliation_order(store, &["outcome"]).await?;
-        let stale = &legs[0];
+        let initial = &legs[0];
+        let response = json!({"error":"real platform field","unknown":{"nested":[null,42,"long".repeat(400)]}});
+        store.record_submission(&|_, _| None,initial.id,"unknown",None,&json!({"kind":"unknown"}),&response).await?;
+        let refreshed = store.open_legs().await?.into_iter().find(|leg|leg.id==initial.id).unwrap();
+        store.record_reconciliation_wait(&refreshed,"test_wait").await?;
+        let refreshed = store.open_legs().await?.into_iter().find(|leg|leg.id==initial.id).unwrap();
+        ensure!(refreshed.last_order_info.as_ref().unwrap().get("submit_response").is_none());
+        let stale = &refreshed;
         let evidence = reconciliation_evidence("durable-oid", "filled");
         let current = store
             .record_order_poll(&|_, _| None, stale, &evidence.poll)
@@ -1868,6 +1875,7 @@ async fn reconciliation_rejects_stale_snapshots_and_audits_late_submission_respo
             }
         ));
         let terminal = leg_snapshot(&store.pool, stale.id).await?;
+        ensure!(terminal["last_order_info"].get("submit_response").is_none());
         let parent = order_snapshot(&store.pool, order_id).await?;
         let fills = fill_snapshots(&store.pool, stale.id).await?;
         for (status, kind) in [
@@ -1896,9 +1904,10 @@ async fn reconciliation_rejects_stale_snapshots_and_audits_late_submission_respo
                 audited == response,
                 "late {kind} response must remain auditable"
             );
+            let expected = terminal.clone();
             ensure!(
-                leg_snapshot(&store.pool, stale.id).await? == terminal,
-                "late {kind} changed terminal leg"
+                leg_snapshot(&store.pool, stale.id).await? == expected,
+                "late {kind} changed terminal leg beyond response audit"
             );
             ensure!(order_snapshot(&store.pool, order_id).await? == parent);
             ensure!(fill_snapshots(&store.pool, stale.id).await? == fills);
@@ -2452,6 +2461,7 @@ async fn outcome_fee_estimates_survive_abort_timeout_and_lifecycle_insert() {
         let aborted = leg_snapshot(&fixture.store.pool, ids[0]).await?;
         ensure!(aborted["status"] == "failed");
         ensure!(aborted["last_order_info"]["fee_estimate"] == estimate);
+        ensure!(aborted["last_order_info"].get("submit_response").is_none());
         let signed = leg_snapshot(&fixture.store.pool, ids[1]).await?;
         ensure!(signed["status"] == "pending");
         sqlx::query("UPDATE legs SET created_at=NOW()-INTERVAL '1 hour' WHERE id=$1")

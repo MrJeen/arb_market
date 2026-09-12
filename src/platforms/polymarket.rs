@@ -706,7 +706,10 @@ impl PolymarketVenue {
     }
 
     #[tracing::instrument(name = "polymarket_submit", skip_all, fields(order_hash = %prepared.order_hash))]
-    pub async fn post_prepared(&self, prepared: &PreparedOrder) -> Result<(SubmitResult, Value)> {
+    pub async fn post_prepared(
+        &self,
+        prepared: &PreparedOrder,
+    ) -> Result<(SubmitResult, super::SubmissionResponse)> {
         let started = Instant::now();
         let funder = prepared
             .funder
@@ -715,13 +718,15 @@ impl PolymarketVenue {
         let account = self.ensure_account(funder).await?;
         let order_hash = prepared.order_hash.clone();
         let envelope = prepared.envelope.clone();
+        let mut audit = None;
         let response = self
-            .l2_json(
+            .l2_json_with_submit_response(
                 &account,
                 reqwest::Method::POST,
                 "/order",
                 &[],
                 Some(&prepared.payload),
+                Some(&mut audit),
             )
             .await;
         // 提交结果无论明确与否，都不能继续复用提交前余额。
@@ -730,10 +735,17 @@ impl PolymarketVenue {
             Ok(body) => {
                 let result = parse_submit(&body, order_hash, envelope);
                 log_submit_result(&result, &body, &prepared.order_hash, None, started);
-                Ok((result, body))
+                Ok((
+                    result,
+                    audit.ok_or_else(|| Error::msg("missing submit response evidence"))?,
+                ))
             }
             Err(err) => {
-                let response = super::submit_http_error_response(&err);
+                let response = audit.unwrap_or_else(|| {
+                    super::SubmissionResponse::NoResponse(
+                        json!({"kind":"local_error","error":err.to_string()}),
+                    )
+                });
                 let result = classify_submit_error(&err, order_hash, envelope);
                 log_submit_result(
                     &result,
@@ -948,6 +960,20 @@ impl PolymarketVenue {
         query: &[(&str, &str)],
         body: Option<&Value>,
     ) -> Result<Value> {
+        self.l2_json_with_submit_response(account, method, path, query, body, None)
+            .await
+    }
+
+    // 仅 POST /order 可使用完整审计通道；其它请求及错误摘要保持原约定。
+    async fn l2_json_with_submit_response(
+        &self,
+        account: &PolymarketAccount,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<&Value>,
+        mut audit: Option<&mut Option<super::SubmissionResponse>>,
+    ) -> Result<Value> {
         let bytes = match body {
             Some(v) => serde_json::to_vec(v)?,
             None => Vec::new(),
@@ -974,6 +1000,9 @@ impl PolymarketVenue {
         let started = Instant::now();
         let resp = req.send().await.map_err(|err| {
             if submit_request {
+                if let Some(slot) = audit.as_deref_mut() {
+                    *slot = Some(super::SubmissionResponse::transport(&err));
+                }
                 log_submit_http(
                     None,
                     started,
@@ -1000,7 +1029,17 @@ impl PolymarketVenue {
         let status = resp.status();
         let mut submit_body_failure = None;
         let text = match resp.text().await {
-            Ok(text) => text,
+            Ok(text) => {
+                if submit_request {
+                    if let Some(slot) = audit.as_deref_mut() {
+                        *slot = Some(super::SubmissionResponse::http(
+                            status.as_u16(),
+                            Ok(text.clone()),
+                        ));
+                    }
+                }
+                text
+            }
             Err(err) if poll_request => {
                 tracing::warn!(
                     service = "polymarket",
@@ -1021,6 +1060,9 @@ impl PolymarketVenue {
                     } else {
                         "response_body"
                     });
+                    if let Some(slot) = audit.as_deref_mut() {
+                        *slot = Some(super::SubmissionResponse::http(status.as_u16(), Err(err)));
+                    }
                 }
                 // POST /order 沿用读取失败时空响应的分类语义，日志不改变返回值。
                 String::new()
@@ -4314,7 +4356,11 @@ pub(crate) mod tests {
         body: &str,
         declared_length: Option<usize>,
         hold_open: bool,
-    ) -> (SubmitResult, Value, Vec<WsLogEvent>) {
+    ) -> (
+        SubmitResult,
+        super::super::SubmissionResponse,
+        Vec<WsLogEvent>,
+    ) {
         use tokio::io::AsyncReadExt;
         use tracing::instrument::WithSubscriber;
         use tracing::Instrument;
@@ -4475,7 +4521,7 @@ pub(crate) mod tests {
         for (body, classification, reason) in cases {
             let (result, raw, logs) =
                 capture_submit_response(Some(200), &body.to_string(), None, false).await;
-            assert_eq!(raw, body);
+            assert_eq!(*raw, body);
             assert_eq!(logs[1].fields["classification"], classification);
             assert_eq!(logs[1].fields["reason"], reason);
             assert_eq!(
@@ -4529,6 +4575,23 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn submit_long_json_preserves_unknown_fields_without_logging_body() {
+        let body = json!({"success":true,"orderID":format!("0x{}", "a".repeat(64)),"status":"live", "error":"a real JSON field", "unknown":{"nested":[null,42,{"secret":SUBMIT_LOG_SECRET.repeat(80)}]}});
+        for status in [200, 400, 429, 500] {
+            let (_, raw, _) =
+                capture_submit_response(Some(status), &body.to_string(), None, false).await;
+            assert!(matches!(raw, super::super::SubmissionResponse::Http(_)));
+            if status == 200 {
+                assert_eq!(*raw, body);
+            } else {
+                assert_eq!(raw["body"], body);
+                assert_eq!(raw["http_status"], status);
+            }
+            assert!(!format!("{raw:?}").contains(SUBMIT_LOG_SECRET));
+        }
+    }
+
+    #[tokio::test]
     async fn submit_logging_http_errors_preserve_classification() {
         for status in [400, 401, 408, 429, 500, 503] {
             let (result, raw, logs) =
@@ -4553,13 +4616,17 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn submit_logging_malformed_responses_preserve_raw() {
         for (body, reason, expected) in [
-            ("", "empty_body", json!({})),
-            ("null", "null_body", json!({})),
+            (
+                "",
+                "empty_body",
+                json!({"http_status":200,"body":"","body_format":"empty"}),
+            ),
+            ("null", "null_body", Value::Null),
             (" null ", "null_body", Value::Null),
             (
                 SUBMIT_LOG_SECRET,
                 "invalid_json",
-                json!({"raw":SUBMIT_LOG_SECRET}),
+                json!({"http_status":200,"body":SUBMIT_LOG_SECRET,"body_format":"non_json"}),
             ),
             ("{}", "malformed_body", json!({})),
             ("[]", "malformed_body", json!([])),
@@ -4577,7 +4644,7 @@ pub(crate) mod tests {
         ] {
             let (result, raw, logs) = capture_submit_response(Some(200), body, None, false).await;
             assert!(matches!(result, SubmitResult::Unknown { .. }));
-            assert_eq!(raw, expected);
+            assert_eq!(*raw, expected);
             assert_eq!(logs[0].fields["reason"], reason);
             assert_eq!(logs[0].level, tracing::Level::WARN);
             assert_eq!(logs[1].fields["classification"], "unknown");
@@ -4618,11 +4685,11 @@ pub(crate) mod tests {
             assert_eq!(logs[1].level, tracing::Level::WARN);
             if status == Some(400) {
                 assert!(matches!(result, SubmitResult::Failed { status: 400, .. }));
-                assert_eq!(raw, json!({"http_status":400,"body":""}));
+                assert_eq!(*raw, json!({"http_status":400,"body_error":reason}));
             } else {
                 assert!(matches!(result, SubmitResult::Unknown { .. }));
                 if status.is_some() {
-                    assert_eq!(raw, json!({}));
+                    assert_eq!(*raw, json!({"http_status":200,"body_error":reason}));
                 } else {
                     assert_eq!(logs[1].fields["reason"], reason);
                 }

@@ -69,13 +69,53 @@ pub enum SubmitResult {
     },
 }
 
-pub fn submit_http_error_response(err: &crate::error::Error) -> Value {
-    match err {
-        crate::error::Error::Http { status, message } => {
-            let body = serde_json::from_str(message).unwrap_or_else(|_| json!(message));
-            json!({ "http_status": status, "body": body })
+/// 完整响应只用于持久化；Debug 故意不输出正文或本地错误细节。
+#[derive(Clone)]
+pub enum SubmissionResponse {
+    Http(Value),
+    NoResponse(Value),
+}
+
+impl std::fmt::Debug for SubmissionResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Http(_) => "SubmissionResponse::Http(<redacted>)",
+            Self::NoResponse(_) => "SubmissionResponse::NoResponse(<redacted>)",
+        })
+    }
+}
+
+impl std::ops::Deref for SubmissionResponse {
+    type Target = Value;
+    fn deref(&self) -> &Value {
+        match self {
+            Self::Http(value) | Self::NoResponse(value) => value,
         }
-        other => json!({ "error": other.to_string() }),
+    }
+}
+
+impl SubmissionResponse {
+    pub fn transport(err: &reqwest::Error) -> Self {
+        Self::NoResponse(
+            json!({"kind": if err.is_timeout() { "timeout" } else { "transport" }, "received":false, "error":err.to_string()}),
+        )
+    }
+
+    /// JSON（包括 null）原样保留；读取失败不虚构空正文。
+    pub fn http(status: u16, text: std::result::Result<String, reqwest::Error>) -> Self {
+        let value = match text {
+            Ok(text) => match serde_json::from_str::<Value>(&text) {
+                Ok(body) if (200..300).contains(&status) => body,
+                Ok(body) => json!({"http_status":status,"body":body}),
+                Err(_) => {
+                    json!({"http_status":status,"body":text,"body_format":if text.is_empty() {"empty"} else {"non_json"}})
+                }
+            },
+            Err(err) => {
+                json!({"http_status":status,"body_error":if err.is_timeout() {"response_body_timeout"} else {"response_body"}})
+            }
+        };
+        Self::Http(value)
     }
 }
 
@@ -262,11 +302,8 @@ mod tests {
 
     #[test]
     fn submit_http_error_response_keeps_status_and_json_body() {
-        let err = crate::error::Error::Http {
-            status: 400,
-            message: r#"{"error":"Invalid order payload"}"#.into(),
-        };
-        let stored = submit_http_error_response(&err);
+        let stored =
+            SubmissionResponse::http(400, Ok(r#"{"error":"Invalid order payload"}"#.into()));
         assert_eq!(stored["http_status"], 400);
         assert_eq!(stored["body"]["error"], "Invalid order payload");
     }

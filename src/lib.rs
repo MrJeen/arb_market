@@ -89,8 +89,9 @@ pub async fn run() -> anyhow::Result<()> {
     });
 
     if cfg.platform_enabled(OUTCOME) {
-        match engine.outcome.refresh_fees().await {
-            Ok(()) => engine.stats.outcome_fee_refresh_ok(),
+        match engine.outcome.refresh_fees_coordinated().await {
+            Ok(outcome::FeeRefreshOutcome::Refreshed) => engine.stats.outcome_fee_refresh_ok(),
+            Ok(_) => {}
             Err(_) => {
                 engine.stats.outcome_fee_refresh_failed();
                 tracing::info!(
@@ -111,8 +112,9 @@ pub async fn run() -> anyhow::Result<()> {
                 tokio::select! {
                     _ = tick.tick() => {
                         tokio::select! {
-                            result = engine_fees.outcome.refresh_fees() => match result {
-                                Ok(()) => engine_fees.stats.outcome_fee_refresh_ok(),
+                            result = engine_fees.outcome.refresh_fees_coordinated() => match result {
+                                Ok(outcome::FeeRefreshOutcome::Refreshed) => engine_fees.stats.outcome_fee_refresh_ok(),
+                                Ok(_) => {},
                                 Err(_) => engine_fees.stats.outcome_fee_refresh_failed(),
                             },
                             _ = fee_shutdown.changed() => break,
