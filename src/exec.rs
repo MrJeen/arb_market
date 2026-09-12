@@ -55,6 +55,129 @@ pub struct Engine {
     pub reported_stale_unknown: Mutex<HashSet<i64>>,
 }
 
+const ACTUALS_GATE_WARN_INTERVAL: Duration = Duration::from_secs(60);
+static ACTUALS_GATE_LOG: std::sync::LazyLock<ActualsGateLog> =
+    std::sync::LazyLock::new(ActualsGateLog::default);
+
+/// 全局查询共用固定大小的进程状态，不按 topic 分配限频条目。
+#[derive(Default)]
+struct ActualsGateLog {
+    next_query: std::sync::atomic::AtomicU64,
+    observation: std::sync::Mutex<ActualsGateObservation>,
+}
+
+#[derive(Default)]
+struct ActualsGateObservation {
+    query: u64,
+    last_report: Option<Instant>,
+    blocked_since: Option<Instant>,
+    blocked_checks: u64,
+}
+
+struct ActualsGateReport {
+    event: ActualsGateEvent,
+    observed_blocked_ms: u128,
+    blocked_checks: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ActualsGateEvent {
+    Blocked,
+    StillBlocked,
+    Recovered,
+}
+
+impl ActualsGateLog {
+    fn begin_query(&self) -> u64 {
+        self.next_query
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+
+    #[cfg(test)]
+    fn observe(&self, query: u64, unknown: i64, now: Instant) -> Option<ActualsGateEvent> {
+        self.observe_report(query, unknown, now).map(|report| report.event)
+    }
+
+    fn observe_report(&self, query: u64, unknown: i64, now: Instant) -> Option<ActualsGateReport> {
+        let mut state = self.observation.lock().unwrap_or_else(|err| err.into_inner());
+        // 序号在 SQL 开始前分配；旧查询晚返回不能覆盖较新的已完成观察。
+        // 这里只决定日志，调用方始终用本次 SQL 结果执行风控。
+        if query <= state.query {
+            return None;
+        }
+        state.query = query;
+        let event = if unknown > 0 {
+            // episode 只累计已接受的有序观察；所有拒绝仍由分钟 counter 统计。
+            state.blocked_checks += 1;
+            if state.blocked_since.is_none() {
+                state.blocked_since = Some(now);
+                state.last_report = Some(now);
+                ActualsGateEvent::Blocked
+            } else if state.last_report.is_some_and(|last| {
+                now.saturating_duration_since(last) >= ACTUALS_GATE_WARN_INTERVAL
+            }) {
+                state.last_report = Some(now);
+                ActualsGateEvent::StillBlocked
+            } else {
+                return None;
+            }
+        } else if unknown == 0 && state.blocked_since.is_some() {
+            ActualsGateEvent::Recovered
+        } else {
+            return None;
+        };
+        let report = ActualsGateReport {
+            observed_blocked_ms: now.saturating_duration_since(state.blocked_since.unwrap()).as_millis(),
+            blocked_checks: state.blocked_checks,
+            event,
+        };
+        if report.event == ActualsGateEvent::Recovered {
+            state.blocked_since = None;
+            state.last_report = None;
+            state.blocked_checks = 0;
+        }
+        Some(report)
+    }
+
+    fn record(&self, stats: &MinuteStats, query: u64, unknown: i64, now: Instant) {
+        if unknown > 0 {
+            stats.actuals_gate_blocked();
+        }
+        // observe_report 返回时已释放锁；锁内没有 await 或日志 I/O。
+        let Some(report) = self.observe_report(query, unknown, now) else { return };
+        let observed_blocked_ms = report.observed_blocked_ms;
+        let blocked_checks = report.blocked_checks;
+        match report.event {
+            ActualsGateEvent::Blocked => tracing::info!(
+                scope = "global", reason = "incomplete_actuals_projection",
+                unknown_orders = unknown, observed_blocked_ms, blocked_checks,
+                "loss gate blocked by incomplete actuals projection"
+            ),
+            ActualsGateEvent::StillBlocked => tracing::warn!(
+                scope = "global", reason = "incomplete_actuals_projection",
+                unknown_orders = unknown, observed_blocked_ms, blocked_checks,
+                "loss gate still blocked by incomplete actuals projection"
+            ),
+            ActualsGateEvent::Recovered => tracing::info!(
+                scope = "global", reason = "incomplete_actuals_projection",
+                unknown_orders = unknown, observed_blocked_ms, blocked_checks,
+                "loss gate actuals projection completeness recovered"
+            ),
+        }
+    }
+}
+
+fn record_submitted_pending_promoted(stats: &MinuteStats, promoted: u64) {
+    stats.add_submitted_pending_promoted(promoted);
+    if promoted > 0 {
+        tracing::debug!(
+            promoted, reason = "pending_after_submit",
+            "submitted pending legs marked unknown for reconciliation; submission does not confirm fill"
+        );
+    }
+}
+
 /// 一个动作的估值依据；最后准入后所有腿沿用它，不追逐后台刷新。
 #[derive(Clone)]
 struct ActionFees {
@@ -190,6 +313,7 @@ impl Engine {
             return Ok(true);
         }
         if self.cfg.max_realized_loss > Decimal::ZERO {
+            let query = ACTUALS_GATE_LOG.begin_query();
             let (pnl, unknown) = self
                 .store
                 .sum_actual_profit_with_timeouts(
@@ -197,12 +321,8 @@ impl Engine {
                     self.cfg.unknown_leg_timeout,
                 )
                 .await?;
+            ACTUALS_GATE_LOG.record(&self.stats, query, unknown, Instant::now());
             if unknown > 0 {
-                tracing::warn!(
-                    topic,
-                    unknown,
-                    "loss gate blocked by incomplete actuals projection"
-                );
                 return Ok(true);
             }
             if pnl < Decimal::ZERO && -pnl >= self.cfg.max_realized_loss {
@@ -1178,12 +1298,7 @@ impl Engine {
                 self.outcome.latest_actuals_fee(wallet, token)
             })
             .await?;
-        if promoted > 0 {
-            tracing::warn!(
-                promoted,
-                "pending legs with submit timestamp marked unknown"
-            );
-        }
+        record_submitted_pending_promoted(&self.stats, promoted);
         let timed_out = self
             .store
             .stale_unknown_legs(self.cfg.unknown_leg_timeout)
@@ -3895,6 +4010,150 @@ mod tests {
     use crate::calc::estimate_taker_fee;
     use rust_decimal::prelude::FromStr;
     use serde_json::json;
+
+    #[test]
+    fn actuals_gate_observes_recovery_and_limits_warnings_to_sixty_seconds() {
+        use ActualsGateEvent::*;
+        let log = ActualsGateLog::default();
+        let start = Instant::now();
+        let observe = |unknown, millis| {
+            log.observe(log.begin_query(), unknown, start + Duration::from_millis(millis))
+        };
+        assert_eq!(observe(0, 0), None);
+        assert_eq!(observe(1, 1), Some(Blocked));
+        assert_eq!(observe(20, 60_000), None);
+        assert_eq!(observe(20, 60_001), Some(StillBlocked));
+        assert_eq!(observe(2, 120_000), None);
+        assert_eq!(observe(2, 120_001), Some(StillBlocked));
+        assert_eq!(observe(0, 120_002), Some(Recovered));
+        assert_eq!(observe(0, 120_003), None);
+        assert_eq!(observe(3, 120_004), Some(Blocked));
+        assert_eq!(observe(3, 180_003), None);
+        assert_eq!(observe(3, 180_004), Some(StillBlocked));
+    }
+
+    #[test]
+    fn actuals_gate_rejects_late_queries_in_both_directions() {
+        use ActualsGateEvent::*;
+        let log = ActualsGateLog::default();
+        let now = Instant::now();
+        let old_block = log.begin_query();
+        let clear = log.begin_query();
+        assert_eq!(log.observe(clear, 0, now), None);
+        assert_eq!(log.observe(old_block, 1, now), None);
+        let old_clear = log.begin_query();
+        let block = log.begin_query();
+        assert_eq!(log.observe(block, 1, now), Some(Blocked));
+        assert_eq!(log.observe(old_clear, 0, now), None);
+        assert_eq!(log.observe(block, 0, now), None);
+        // 失败或取消的查询没有 observe，不能推断恢复或重置限频。
+        let _failed_query = log.begin_query();
+        assert_eq!(log.observe(log.begin_query(), 1, now), None);
+        assert_eq!(log.observe(log.begin_query(), 0, now), Some(Recovered));
+        assert!(log.observe_report(old_block, 1, now).is_none());
+        let next = log.observe_report(log.begin_query(), 1, now + Duration::from_secs(90)).unwrap();
+        assert_eq!(next.event, Blocked);
+        assert_eq!(next.blocked_checks, 1);
+        assert_eq!(next.observed_blocked_ms, 0);
+    }
+
+    #[test]
+    fn actuals_gate_concurrent_observations_select_one_event_per_transition() {
+        let log = ActualsGateLog::default();
+        let start = Instant::now();
+        for (unknown, seconds, expected) in [
+            (1, 0, Some(ActualsGateEvent::Blocked)),
+            (5, 59, None),
+            (5, 60, Some(ActualsGateEvent::StillBlocked)),
+            (0, 61, Some(ActualsGateEvent::Recovered)),
+        ] {
+            let barrier = std::sync::Barrier::new(16);
+            let events = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..16).map(|_| {
+                    let log = &log;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let query = log.begin_query();
+                        barrier.wait();
+                        log.observe(query, unknown, start + Duration::from_secs(seconds))
+                    })
+                }).collect();
+                handles.into_iter().filter_map(|handle| handle.join().unwrap()).collect::<Vec<_>>()
+            });
+            assert_eq!(events, expected.into_iter().collect::<Vec<_>>());
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct GateLogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for GateLogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn actuals_gate_logs_levels_global_scope_and_counts_suppressed_blocks() {
+        let buffer = GateLogBuffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone()).finish();
+        let stats = MinuteStats::new();
+        tracing::subscriber::with_default(subscriber, || {
+            let log = ActualsGateLog::default();
+            let now = Instant::now();
+            let old = log.begin_query();
+            log.record(&stats, log.begin_query(), 2, now);
+            log.record(&stats, old, 3, now);
+            log.record(&stats, log.begin_query(), 4, now + Duration::from_secs(59));
+            log.record(&stats, log.begin_query(), 4, now + Duration::from_secs(60));
+            log.record(&stats, log.begin_query(), 0, now + Duration::from_secs(61));
+            log.record(&stats, log.begin_query(), 0, now + Duration::from_secs(62));
+        });
+        let output = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(output.lines().count(), 3);
+        assert_eq!(output.matches("INFO").count(), 2);
+        assert_eq!(output.matches("WARN").count(), 1);
+        assert_eq!(output.matches("scope=\"global\"").count(), 3);
+        assert!(!output.contains("topic="));
+        assert!(output.contains("completeness recovered"));
+        assert_eq!(output.matches("reason=\"incomplete_actuals_projection\"").count(), 3);
+        let recovered = output.lines().find(|line| line.contains("recovered")).unwrap();
+        assert!(recovered.contains("observed_blocked_ms=61000"));
+        assert!(recovered.contains("blocked_checks=3"));
+        assert!(recovered.contains("unknown_orders=0"));
+        assert_eq!(stats.snapshot_and_reset().actuals_gate_blocked, 4);
+        assert_eq!(stats.snapshot_and_reset(), crate::stats::MinuteSnapshot::default());
+    }
+
+    #[test]
+    fn submitted_pending_promotion_logs_debug_and_counts_legs() {
+        let buffer = GateLogBuffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone()).finish();
+        let stats = MinuteStats::new();
+        tracing::subscriber::with_default(subscriber, || {
+            record_submitted_pending_promoted(&stats, 0);
+            record_submitted_pending_promoted(&stats, 2);
+            record_submitted_pending_promoted(&stats, 3);
+        });
+        let output = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(output.lines().count(), 2);
+        assert_eq!(output.matches("DEBUG").count(), 2);
+        assert!(output.contains("submission does not confirm fill"));
+        assert_eq!(output.matches("reason=\"pending_after_submit\"").count(), 2);
+        assert!(!output.contains("WARN"));
+        assert_eq!(stats.snapshot_and_reset().submitted_pending_promoted, 5);
+        assert_eq!(stats.snapshot_and_reset(), crate::stats::MinuteSnapshot::default());
+    }
 
     fn d(s: &str) -> Decimal {
         Decimal::from_str(s).unwrap()

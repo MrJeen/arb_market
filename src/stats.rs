@@ -118,6 +118,8 @@ minute_stats! {
     stale_unknown,
     max_orders,
     max_loss,
+    actuals_gate_blocked,
+    submitted_pending_promoted,
     arb_disabled,
     rebalance_disabled,
     take_profit_disabled,
@@ -278,6 +280,12 @@ impl MinuteStats {
         .fetch_add(1, Ordering::Relaxed);
         total.fetch_add(elapsed_ms, Ordering::Relaxed);
         max.fetch_max(elapsed_ms, Ordering::Relaxed);
+    }
+
+    pub fn add_submitted_pending_promoted(&self, n: u64) {
+        if n > 0 {
+            self.submitted_pending_promoted.fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     pub fn add_missing_book(&self, n: u64) {
@@ -494,6 +502,28 @@ mod tests {
         assert_eq!(s.hedge_out_book_accepted, 800);
         assert_eq!(s.hedge_out_book_elapsed_ms, 3600);
         assert_eq!(s.hedge_out_book_max_ms, 8);
+    }
+
+    #[test]
+    fn actuals_counters_accumulate_concurrently_and_reset() {
+        let stats = MinuteStats::new();
+        stats.add_submitted_pending_promoted(0);
+        assert_eq!(stats.snapshot_and_reset(), MinuteSnapshot::default());
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let stats = &stats;
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        stats.actuals_gate_blocked();
+                        stats.add_submitted_pending_promoted(3);
+                    }
+                });
+            }
+        });
+        let snapshot = stats.snapshot_and_reset();
+        assert_eq!(snapshot.actuals_gate_blocked, 800);
+        assert_eq!(snapshot.submitted_pending_promoted, 2400);
+        assert_eq!(stats.snapshot_and_reset(), MinuteSnapshot::default());
     }
 
     #[test]
