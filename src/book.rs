@@ -130,6 +130,14 @@ impl BookUpdate {
     }
 }
 
+// 两侧已排序；首个不同索引同时保留价格和数量，涵盖插入/删除及重复价位。
+fn first_level_diff<'a>(current: &'a [Level], incoming: &'a [Level]) -> Option<(usize, Option<&'a Level>, Option<&'a Level>)> {
+    (0..current.len().max(incoming.len())).find_map(|index| {
+        let (current, incoming) = (current.get(index), incoming.get(index));
+        (current != incoming).then_some((index, current, incoming))
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct RestTicket {
     pub key: TokenBookKey,
@@ -207,6 +215,7 @@ impl BookStore {
         bids: &[Level],
         asks: &[Level],
         ts: i64,
+        event: &'static str,
     ) -> Result<(), BookReject> {
         if self
             .sync
@@ -215,18 +224,47 @@ impl BookStore {
             .and_then(|tick| tick.exchange_ts_ms)
             .is_some_and(|high| ts < high)
         {
+            let state = self.sync.get(key).unwrap();
+            tracing::debug!(platform = %key.platform, token = %key.token_id,
+                event, source = if event == "rest_snapshot" { "rest" } else { "ws" },
+                reason = ?BookReject::OlderTimestamp, conflict = "tick_high_water",
+                current_exchange_ts_ms = ?self.books.get(key).map(|b| b.exchange_ts_ms),
+                tick_exchange_ts_ms = ?state.tick.and_then(|t| t.exchange_ts_ms),
+                incoming_exchange_ts_ms = ts, rest_boundary = ?state.rest_boundary,
+                epoch = self.epochs.get(&key.platform).copied().unwrap_or(0), revision = state.revision,
+                "book snapshot rejected");
             return Err(BookReject::OlderTimestamp);
         }
-        for prior in self
+        for (compared_book, prior) in self
             .books
             .get(key)
+            .map(|book| ("current", book))
             .into_iter()
-            .chain(self.sync.get(key).and_then(|state| state.rest.as_ref()))
+            .chain(self.sync.get(key).and_then(|state| state.rest.as_ref())
+                .map(|book| ("rest_candidate", book)))
         {
             if ts < prior.exchange_ts_ms {
                 return Err(BookReject::OlderTimestamp);
             }
             if ts == prior.exchange_ts_ms && (bids != prior.bids || asks != prior.asks) {
+                // 只在 debug 开启时扫描到首个差异；不序列化完整盘口。
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    let diff = first_level_diff(&prior.bids, bids)
+                        .map(|diff| ("bid", diff))
+                        .or_else(|| first_level_diff(&prior.asks, asks).map(|diff| ("ask", diff)));
+                    let state = self.sync.get(key);
+                    tracing::debug!(platform = %key.platform, token = %key.token_id,
+                        event, source = if event == "rest_snapshot" { "rest" } else { "ws" },
+                        reason = ?BookReject::TimestampConflict, conflict = "snapshot_depth",
+                        compared_book, current_source = ?state.and_then(|s| s.source),
+                        current_exchange_ts_ms = prior.exchange_ts_ms, incoming_exchange_ts_ms = ts,
+                        rest_boundary = ?state.and_then(|s| s.rest_boundary),
+                        epoch = self.epochs.get(&key.platform).copied().unwrap_or(0),
+                        revision = state.map_or(0, |s| s.revision),
+                        current_bid_count = prior.bids.len(), incoming_bid_count = bids.len(),
+                        current_ask_count = prior.asks.len(), incoming_ask_count = asks.len(),
+                        first_diff = ?diff, "book timestamp conflict");
+                }
                 return Err(BookReject::TimestampConflict);
             }
         }
@@ -265,10 +303,10 @@ impl BookStore {
             return self.invalidate_ws(platform, token_id, BookReject::InvalidPayload);
         }
         sort_levels(&mut bids, &mut asks);
-        if let Err(reason) = self.snapshot_conflict(&key, &bids, &asks, exchange_ts_ms) {
+        if let Err(reason) = self.snapshot_conflict(&key, &bids, &asks, exchange_ts_ms, "ws_snapshot") {
             // 盘口与 tick 均预检完才提交；坏快照不能借携带的新 tick 改写观察高水位。
             if reason == BookReject::TimestampConflict {
-                return self.invalidate_ws(platform, token_id, reason);
+                return self.invalidate_ws_event(platform, token_id, reason, "ws_snapshot", Some(exchange_ts_ms));
             }
             return BookUpdate::Rejected(reason);
         }
@@ -282,9 +320,15 @@ impl BookStore {
                 .get(&key)
                 .is_some_and(|state| state.ws_epoch == Some(epoch))
         {
+            let state = self.sync.get(&key).unwrap();
+            tracing::debug!(platform, token = token_id, event = "ws_snapshot", source = "ws",
+                reason = ?BookReject::TimestampConflict, conflict = "stale_same_epoch",
+                current_exchange_ts_ms = exchange_ts_ms, incoming_exchange_ts_ms = exchange_ts_ms,
+                rest_boundary = ?state.rest_boundary, epoch, revision = state.revision,
+                "book timestamp conflict");
             return BookUpdate::Rejected(BookReject::TimestampConflict);
         }
-        let tick_changed = match self.check_snapshot_tick(&key, tick, exchange_ts_ms) {
+        let tick_changed = match self.check_snapshot_tick(&key, tick, exchange_ts_ms, "ws_snapshot") {
             Ok(changed) => changed,
             Err(reason) => return BookUpdate::Rejected(reason),
         };
@@ -376,7 +420,7 @@ impl BookStore {
             .max()
             .unwrap_or(0);
         if exchange_ts_ms < high {
-            return self.invalidate_ws(platform, token_id, BookReject::OlderTimestamp);
+            return self.invalidate_ws_event(platform, token_id, BookReject::OlderTimestamp, "ws_delta", Some(exchange_ts_ms));
         }
         let rest_observed = self.sync.get(&key).is_some_and(|state| state.rest_version.is_some());
         // 先归并再预检，拒绝歧义批次时不能局部提交或借 no-op 消除 REST 边界。
@@ -394,7 +438,26 @@ impl BookStore {
                 })
             })
         {
-            return self.invalidate_ws(platform, token_id, BookReject::TimestampConflict);
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let book = self.books.get(&key).unwrap();
+                let state = self.sync.get(&key).unwrap();
+                let diff = final_updates.iter().find_map(|(&(is_bid, price), &size)| {
+                    let levels = if is_bid { &book.bids } else { &book.asks };
+                    let current = levels.iter().find(|level| level.price == price)
+                        .map_or(Decimal::ZERO, |level| level.size);
+                    (current != size).then_some((if is_bid { "bid" } else { "ask" }, price, current, size))
+                });
+                if let Some((side, price, current_size, incoming_size)) = diff {
+                    tracing::debug!(platform, token = token_id, event = "ws_delta", source = "ws",
+                        reason = ?BookReject::TimestampConflict, conflict = "rest_boundary",
+                        current_source = ?state.source, current_exchange_ts_ms = book.exchange_ts_ms,
+                        incoming_exchange_ts_ms = exchange_ts_ms, rest_boundary = ?state.rest_boundary,
+                        epoch = self.epochs.get(platform).copied().unwrap_or(0), revision = state.revision,
+                        side, %price, %current_size, %incoming_size, update_count = final_updates.len(),
+                        "book timestamp conflict");
+                }
+            }
+            return self.invalidate_ws_event(platform, token_id, BookReject::TimestampConflict, "ws_delta", Some(exchange_ts_ms));
         }
         let book = self
             .books
@@ -511,13 +574,28 @@ impl BookStore {
         key: &TokenBookKey,
         tick: Option<Decimal>,
         ts: i64,
+        event: &'static str,
     ) -> Result<bool, BookReject> {
         let Some(tick) = tick else {
             return Ok(false);
         };
         let result = self.check_tick(key, tick, ts);
+        if let Err(reason) = result {
+            let state = self.sync.get(key);
+            let prior = state.and_then(|s| s.tick);
+            tracing::debug!(platform = %key.platform, token = %key.token_id,
+                event, source = if event == "rest_snapshot" { "rest" } else { "ws" },
+                ?reason, conflict = "tick_observation",
+                current_exchange_ts_ms = ?self.books.get(key).map(|b| b.exchange_ts_ms),
+                rest_exchange_ts_ms = ?state.and_then(|s| s.rest.as_ref()).map(|b| b.exchange_ts_ms),
+                tick_exchange_ts_ms = ?prior.and_then(|t| t.exchange_ts_ms), incoming_exchange_ts_ms = ts,
+                current_tick = ?prior.map(|t| t.value), incoming_tick = %tick,
+                tick_trusted = ?prior.map(|t| t.trusted), rest_boundary = ?state.and_then(|s| s.rest_boundary),
+                epoch = self.epochs.get(&key.platform).copied().unwrap_or(0),
+                revision = state.map_or(0, |s| s.revision), "tick observation rejected");
+        }
         if result == Err(BookReject::TimestampConflict) {
-            self.conflict_tick(key);
+            self.conflict_tick(key, event, ts, tick);
         }
         result
     }
@@ -532,7 +610,7 @@ impl BookStore {
         }
     }
 
-    fn conflict_tick(&mut self, key: &TokenBookKey) {
+    fn conflict_tick(&mut self, key: &TokenBookKey, event: &'static str, incoming_exchange_ts_ms: i64, incoming_tick: Decimal) {
         let Some(tick) = self.sync.get_mut(key).and_then(|state| state.tick.as_mut()) else {
             return;
         };
@@ -541,10 +619,14 @@ impl BookStore {
         }
         tick.trusted = false;
         let ts = tick.exchange_ts_ms;
+        let current_tick = tick.value;
         self.sync_tick_views(key);
         self.changed(key);
         let current = self.begin_rest(&key.platform, &key.token_id);
         tracing::warn!(platform = %key.platform, token = %key.token_id, timestamp = ?ts,
+            event, source = if event == "rest_snapshot" { "rest" } else { "ws" },
+            current_exchange_ts_ms = ?ts, incoming_exchange_ts_ms, %current_tick, %incoming_tick,
+            rest_boundary = ?self.sync.get(key).and_then(|s| s.rest_boundary),
             epoch = current.epoch, revision = current.revision,
             reason = "same timestamp has conflicting tick values", "tick trust lost");
     }
@@ -577,7 +659,7 @@ impl BookStore {
         ts: i64,
     ) -> BookUpdate {
         let key = TokenBookKey::new(platform, token_id);
-        match self.check_snapshot_tick(&key, Some(tick), ts) {
+        match self.check_snapshot_tick(&key, Some(tick), ts, "ws_tick") {
             Ok(true) => {
                 self.commit_tick(&key, tick, Some(ts));
                 self.changed(&key);
@@ -589,19 +671,7 @@ impl BookStore {
                 }
                 BookUpdate::VerifiedUnchanged
             },
-            Err(reason) => {
-                let current = self.begin_rest(platform, token_id);
-                tracing::debug!(
-                    platform,
-                    token = token_id,
-                    timestamp = ts,
-                    ?reason,
-                    epoch = current.epoch,
-                    revision = current.revision,
-                    "tick observation rejected"
-                );
-                BookUpdate::Rejected(reason)
-            }
+            Err(reason) => BookUpdate::Rejected(reason),
         }
     }
 
@@ -626,7 +696,15 @@ impl BookStore {
         token_id: &str,
         reason: BookReject,
     ) -> BookUpdate {
+        self.invalidate_ws_event(platform, token_id, reason, "ws_invalid", None)
+    }
+
+    fn invalidate_ws_event(
+        &mut self, platform: &str, token_id: &str, reason: BookReject,
+        event: &'static str, incoming_exchange_ts_ms: Option<i64>,
+    ) -> BookUpdate {
         let key = TokenBookKey::new(platform, token_id);
+        let state = self.sync.get(&key);
         let book = self
             .books
             .entry(key.clone())
@@ -635,7 +713,12 @@ impl BookStore {
             tracing::warn!(
                 platform,
                 token = token_id,
-                ?reason,
+                ?reason, event, source = "ws",
+                current_exchange_ts_ms = book.exchange_ts_ms, ?incoming_exchange_ts_ms,
+                rest_boundary = ?state.and_then(|s| s.rest_boundary),
+                tick_exchange_ts_ms = ?state.and_then(|s| s.tick).and_then(|t| t.exchange_ts_ms),
+                epoch = self.epochs.get(platform).copied().unwrap_or(0),
+                revision = state.map_or(0, |s| s.revision),
                 "book WS completeness lost"
             );
         }
@@ -691,8 +774,8 @@ impl BookStore {
                 return Err(BookReject::InvalidPayload);
             }
             sort_levels(&mut bids, &mut asks);
-            self.snapshot_conflict(&ticket.key, &bids, &asks, exchange_ts_ms)?;
-            let tick_changed = self.check_snapshot_tick(&ticket.key, tick, exchange_ts_ms)?;
+            self.snapshot_conflict(&ticket.key, &bids, &asks, exchange_ts_ms, "rest_snapshot")?;
+            let tick_changed = self.check_snapshot_tick(&ticket.key, tick, exchange_ts_ms, "rest_snapshot")?;
             if tick_changed {
                 self.commit_tick(&ticket.key, tick.unwrap(), Some(exchange_ts_ms));
             }
@@ -727,8 +810,15 @@ impl BookStore {
             Ok(book)
         })();
         if let Err(reason) = result {
+            let state = self.sync.get(&ticket.key);
             tracing::debug!(platform = %ticket.key.platform, token = %ticket.key.token_id,
-                epoch = ticket.epoch, revision = ticket.revision, ?reason, "REST book rejected");
+                event = "rest_snapshot", source = "rest", ?reason,
+                epoch = self.epochs.get(&ticket.key.platform).copied().unwrap_or(0),
+                revision = state.map_or(0, |s| s.revision),
+                ticket_epoch = ticket.epoch, ticket_revision = ticket.revision,
+                current_exchange_ts_ms = ?self.books.get(&ticket.key).map(|b| b.exchange_ts_ms),
+                incoming_exchange_ts_ms = exchange_ts_ms,
+                rest_boundary = ?state.and_then(|s| s.rest_boundary), "REST book rejected");
         }
         result
     }

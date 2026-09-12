@@ -2652,6 +2652,101 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn timestamp_conflict_diagnostics_preserve_pm_behavior() {
+        use crate::book::{BookReject, BookUpdate};
+        use tracing_subscriber::prelude::*;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let subscriber = tracing_subscriber::registry().with(WsLogCapture(tx));
+        tracing::subscriber::with_default(subscriber, || {
+            let now = Instant::now();
+            let mut books = BookStore::default();
+            let snapshot = json!({"event_type":"book", "asset_id":"t", "timestamp":"100",
+                "bids":[], "asks":[{"price":"0.5", "size":"3"}]});
+            assert_eq!(apply_ws_message(&mut books, &snapshot, now).len(), 1);
+            let before = books.begin_rest(POLYMARKET, "t");
+            let mut conflicting = snapshot.clone();
+            conflicting["asks"][0]["size"] = json!("4");
+            assert!(apply_ws_message(&mut books, &conflicting, now).is_empty());
+            assert!(books.get(POLYMARKET, "t").unwrap().stale);
+            assert_eq!(books.get(POLYMARKET, "t").unwrap().asks[0].size, Decimal::from(3));
+            assert_eq!(books.begin_rest(POLYMARKET, "t").revision, before.revision + 1);
+            // 相同内容也不能恢复本 epoch 已失效的同毫秒基线。
+            assert!(apply_ws_message(&mut books, &snapshot, now).is_empty());
+            let ticket = books.begin_rest(POLYMARKET, "t");
+            let asks = books.get(POLYMARKET, "t").unwrap().asks.clone();
+            books.accept_rest(&ticket, vec![], asks.clone(), 101, now, None).unwrap();
+            let delta = json!({"event_type":"price_change", "timestamp":"101",
+                "price_changes":[{"asset_id":"t", "side":"SELL", "price":"0.5", "size":"4"}]});
+            assert!(apply_ws_message(&mut books, &delta, now).is_empty());
+            let ticket = books.begin_rest(POLYMARKET, "t");
+            let mut changed_asks = asks.clone();
+            changed_asks[0].size = Decimal::from(4);
+            assert_eq!(books.accept_rest(&ticket, vec![], changed_asks, 101, now, None).unwrap_err(), BookReject::TimestampConflict);
+            assert_eq!(books.begin_rest(POLYMARKET, "t").revision, ticket.revision);
+            let tick = json!({"event_type":"tick_size_change", "asset_id":"t", "timestamp":"200", "new_tick_size":"0.01"});
+            assert_eq!(apply_ws_message(&mut books, &tick, now).len(), 1);
+            let mut conflicting_tick = tick.clone();
+            conflicting_tick["new_tick_size"] = json!("0.001");
+            assert!(apply_ws_message(&mut books, &conflicting_tick, now).is_empty());
+            assert_eq!(books.tick_size(POLYMARKET, "t"), None);
+            assert_eq!(books.get(POLYMARKET, "t").unwrap().received_at, now);
+            assert_eq!(books.replace_snapshot(POLYMARKET, "t", vec![], asks.clone(), 150, now), BookUpdate::Rejected(BookReject::OlderTimestamp));
+            let ticket = books.begin_rest(POLYMARKET, "t");
+            assert_eq!(books.accept_rest(&ticket, vec![], asks.clone(), 150, now, None).unwrap_err(), BookReject::OlderTimestamp);
+            assert_eq!(books.set_tick_size_at(POLYMARKET, "t", Decimal::new(1, 2), 150), BookUpdate::Rejected(BookReject::OlderTimestamp));
+            // Outcome 的 REST candidate 仍独立比较，不能误标为当前 WS book。
+            let ticket = books.begin_rest(crate::config::OUTCOME, "candidate");
+            books.accept_rest(&ticket, vec![], asks.clone(), 300, now, None).unwrap();
+            let mut changed_asks = asks.clone();
+            changed_asks[0].size = Decimal::from(5);
+            assert_eq!(books.replace_snapshot(crate::config::OUTCOME, "candidate", vec![], changed_asks, 300, now), BookUpdate::Rejected(BookReject::TimestampConflict));
+            // 快照携带的 tick 也必须保留 WS / REST 事件来源。
+            for rest in [false, true] {
+                let mut store = BookStore::default();
+                store.set_tick_size_at(POLYMARKET, "embedded", Decimal::new(1, 2), 200);
+                if rest {
+                    let ticket = store.begin_rest(POLYMARKET, "embedded");
+                    assert_eq!(store.accept_rest(&ticket, vec![], asks.clone(), 200, now, Some(Decimal::new(1, 3))).unwrap_err(), BookReject::TimestampConflict);
+                } else {
+                    assert_eq!(store.replace_snapshot_with_tick(POLYMARKET, "embedded", vec![], asks.clone(), 200, now, Some(Decimal::new(1, 3))), BookUpdate::Rejected(BookReject::TimestampConflict));
+                }
+            }
+        });
+        let mut logs = Vec::new();
+        while let Ok(log) = rx.try_recv() { logs.push(log); }
+        for (event, conflict) in [("ws_snapshot", "snapshot_depth"), ("ws_snapshot", "stale_same_epoch"),
+            ("ws_delta", "rest_boundary"), ("rest_snapshot", "snapshot_depth"),
+            ("ws_tick", "tick_observation"), ("ws_snapshot", "tick_observation"),
+            ("rest_snapshot", "tick_observation"), ("ws_snapshot", "tick_high_water"),
+            ("rest_snapshot", "tick_high_water")] {
+            let log = logs.iter().find(|log| log.fields.get("event").is_some_and(|v| v == event)
+                && log.fields.get("conflict").is_some_and(|v| v == conflict)).unwrap();
+            assert_eq!(log.level, tracing::Level::DEBUG);
+            for field in ["platform", "token", "source", "reason", "current_exchange_ts_ms",
+                "incoming_exchange_ts_ms", "rest_boundary", "epoch", "revision"] {
+                assert!(log.fields.contains_key(field), "{event}/{conflict} missing {field}");
+            }
+        }
+        let delta = logs.iter().find(|log| log.fields.get("conflict").is_some_and(|v| v == "rest_boundary")).unwrap();
+        assert_eq!(delta.fields["side"], "ask");
+        assert_eq!(delta.fields["current_size"], "3");
+        assert_eq!(delta.fields["incoming_size"], "4");
+        let candidate = logs.iter().find(|log| log.fields.get("compared_book").is_some_and(|v| v == "rest_candidate")).unwrap();
+        assert_eq!(candidate.fields["current_exchange_ts_ms"], "300");
+        assert!(candidate.fields["first_diff"].contains("size: 5"));
+        for log in &logs {
+            assert!(!log.fields.contains_key("bids") && !log.fields.contains_key("asks"));
+            if log.fields.get("message").is_some_and(|v| v == "book WS completeness lost") {
+                assert!(log.fields.contains_key("event"));
+                assert!(log.fields.contains_key("incoming_exchange_ts_ms"));
+            }
+        }
+        assert!(!logs.iter().any(|log| log.level == tracing::Level::WARN
+            && log.fields.get("event").is_some_and(|v| v == "rest_snapshot")
+            && log.fields.get("message").is_some_and(|v| v != "tick trust lost")));
+    }
+
     struct MarketWsFixture {
         listener: tokio::net::TcpListener,
         server: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
