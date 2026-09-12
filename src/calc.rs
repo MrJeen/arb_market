@@ -1173,8 +1173,8 @@ mod tests {
                         best_plan(&sample_topic(), &books, &fees_zero(), &limits("0", "100"))
                             .is_some()
                     );
-                    let expected_state = |rest| {
-                        if rest && max_age == 5 {
+                    let expected_state = |platform, rest| {
+                        if rest && (platform == POLYMARKET || max_age == 5) {
                             CalcBookState {
                                 source: BookSource::Rest,
                                 age_ms: 10000,
@@ -1192,10 +1192,10 @@ mod tests {
                         [(POLYMARKET, "pm-yes", pm_rest), (OUTCOME, "#10", out_rest)]
                     {
                         let (book, source) = books.get_with_source(platform, id).unwrap();
-                        assert_eq!(source, expected_state(rest).source);
+                        assert_eq!(source, expected_state(platform, rest).source);
                         assert_eq!(
                             now.duration_since(book.received_at).as_millis() as u64,
-                            expected_state(rest).age_ms
+                            expected_state(platform, rest).age_ms
                         );
                     }
                     // 仅 PM 显式失效，另一侧无论来自旧 WS 还是旧 REST 都不能归为失效。
@@ -1213,11 +1213,10 @@ mod tests {
                         sample.stale,
                         Some(CalcStaleDetail {
                             pm: CalcBookState {
-                                source: BookSource::Ws,
-                                age_ms: 60000,
-                                invalid: true
+                                invalid: true,
+                                ..expected_state(POLYMARKET, pm_rest)
                             },
-                            out: expected_state(out_rest),
+                            out: expected_state(OUTCOME, out_rest),
                             threshold_ms: 1000,
                             kind: StaleKind::PmOnly,
                         })

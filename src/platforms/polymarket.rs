@@ -3402,7 +3402,19 @@ pub(crate) mod tests {
             assert_eq!(book.bids[0].size, Decimal::from(8));
             assert_eq!(book.tick_size, Some("0.01".parse().unwrap()));
             let initialized = apply_ws_message(&mut books, &snapshot, later);
-            assert_eq!(initialized.is_empty(), !use_rest);
+            assert!(initialized.is_empty());
+            // REST 已恢复同一个完整底本，重复 WS 全量不重算；后续明确增量保留空卖侧。
+            for ts in [104, 105] {
+                assert_eq!(apply_ws_message(&mut books, &json!({
+                    "event_type":"price_change", "timestamp":ts.to_string(), "price_changes":[
+                        {"asset_id":"t","side":"BUY","price":"0.40","size":ts.to_string()}
+                    ]
+                }), later), vec![("t".into(), true)]);
+                let book = books.get(POLYMARKET, "t").unwrap();
+                assert!(!book.stale);
+                assert!(book.asks.is_empty());
+                assert_eq!(book.bids[0].size, Decimal::from(ts));
+            }
         }
     }
 

@@ -3313,7 +3313,7 @@ fn validate_pm_request_tick(req: &MarketOrderRequest) -> Result<()> {
     Ok(())
 }
 
-/// 不使用全局 get 的 WS 优先策略：HTTP 硬确认只能用这次通过票据验证的完整副本。
+/// 不使用全局 get：HTTP 硬确认只能用这次通过票据验证的完整副本。
 fn accept_confirmation_books(
     books: &mut BookStore,
     pm_ticket: &crate::book::RestTicket,
@@ -5818,9 +5818,9 @@ mod tests {
     }
 
     #[test]
-    fn hard_http_confirmation_rejects_expired_missing_tick_and_delete_races() {
+    fn hard_http_confirmation_rejects_expired_missing_tick_and_observation_races() {
         let now = Instant::now();
-        for case in 0..3 {
+        for case in 0..5 {
             let mut books = BookStore::default();
             if case != 0 {
                 books.set_tick_size(POLYMARKET, "pm", d("0.01"));
@@ -5836,6 +5836,10 @@ mod tests {
             let out = books.begin_rest(OUTCOME, "out");
             if case == 2 {
                 books.apply_levels(POLYMARKET, "pm", &[(false, d("0.5"), d("0"))], 100, now);
+            } else if case == 3 {
+                books.apply_levels(POLYMARKET, "pm", &[(false, d("0.5"), d("3"))], 100, now);
+            } else if case == 4 {
+                books.replace_snapshot(POLYMARKET, "pm", vec![], level(), 100, now);
             }
             let check_at = if case == 1 {
                 now + Duration::from_secs(6)
