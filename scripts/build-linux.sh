@@ -45,4 +45,3 @@ chmod 755 "$OUT_DIR/$BIN_NAME"
 file "$OUT_DIR/$BIN_NAME" || true
 ls -lh "$OUT_DIR/$BIN_NAME"
 echo "已输出 $OUT_DIR/$BIN_NAME"
-echo "上传到服务器后执行: sudo ./scripts/install-systemd.sh"
