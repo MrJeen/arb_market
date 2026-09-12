@@ -2667,12 +2667,14 @@ pub(crate) mod tests {
             let before = books.begin_rest(POLYMARKET, "t");
             let mut conflicting = snapshot.clone();
             conflicting["asks"][0]["size"] = json!("4");
-            assert!(apply_ws_message(&mut books, &conflicting, now).is_empty());
-            assert!(books.get(POLYMARKET, "t").unwrap().stale);
-            assert_eq!(books.get(POLYMARKET, "t").unwrap().asks[0].size, Decimal::from(3));
+            assert_eq!(apply_ws_message(&mut books, &conflicting, now), vec![("t".into(), true)]);
+            assert!(!books.get(POLYMARKET, "t").unwrap().stale);
+            assert_eq!(books.get(POLYMARKET, "t").unwrap().asks[0].size, Decimal::from(4));
             assert_eq!(books.begin_rest(POLYMARKET, "t").revision, before.revision + 1);
-            // 相同内容也不能恢复本 epoch 已失效的同毫秒基线。
-            assert!(apply_ws_message(&mut books, &snapshot, now).is_empty());
+            // 同 epoch stale 可由同毫秒全量恢复，并通知计算链。
+            books.invalidate_ws(POLYMARKET, "t", BookReject::InvalidPayload);
+            assert_eq!(apply_ws_message(&mut books, &snapshot, now), vec![("t".into(), true)]);
+            assert!(!books.get(POLYMARKET, "t").unwrap().stale);
             let ticket = books.begin_rest(POLYMARKET, "t");
             let asks = books.get(POLYMARKET, "t").unwrap().asks.clone();
             books.accept_rest(&ticket, vec![], asks.clone(), 101, now, None).unwrap();
@@ -2715,7 +2717,10 @@ pub(crate) mod tests {
         });
         let mut logs = Vec::new();
         while let Ok(log) = rx.try_recv() { logs.push(log); }
-        for (event, conflict) in [("ws_snapshot", "snapshot_depth"), ("ws_snapshot", "stale_same_epoch"),
+        assert!(!logs.iter().any(|log| log.fields.get("platform").is_some_and(|v| v == POLYMARKET)
+            && log.fields.get("event").is_some_and(|v| v == "ws_snapshot")
+            && log.fields.get("conflict").is_some_and(|v| v == "snapshot_depth" || v == "stale_same_epoch")));
+        for (event, conflict) in [("ws_snapshot", "snapshot_depth"),
             ("ws_delta", "rest_boundary"), ("rest_snapshot", "snapshot_depth"),
             ("ws_tick", "tick_observation"), ("ws_snapshot", "tick_observation"),
             ("rest_snapshot", "tick_observation"), ("ws_snapshot", "tick_high_water"),
@@ -3760,11 +3765,16 @@ pub(crate) mod tests {
             {"event_type":"price_change","timestamp":"100","price_changes":[{"asset_id":"t","side":"SELL","price":"0.5","size":"0"}]},
             {"event_type":"book","asset_id":"t","timestamp":"100","bids":[],"asks":[{"price":"0.5","size":"3"}]}
         ]);
+        // 先验证增量删除顺序，再验证同帧尾部全量按接收顺序接管。
+        let prefix = Value::Array(frame.as_array().unwrap()[..3].to_vec());
+        handle_ws_text(&prefix.to_string(), &books, &tx).await;
+        assert!(books.lock().await.get(POLYMARKET, "t").unwrap().asks.is_empty());
         handle_ws_text(&frame.to_string(), &books, &tx).await;
         let books = books.lock().await;
         let book = books.get(POLYMARKET, "t").unwrap();
-        assert!(book.asks.is_empty());
-        assert!(book.stale);
+        assert_eq!(book.asks.len(), 1);
+        assert_eq!(book.asks[0].size, Decimal::from(3));
+        assert!(!book.stale);
     }
 
     #[test]

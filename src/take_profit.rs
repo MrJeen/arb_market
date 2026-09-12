@@ -492,12 +492,7 @@ mod tests {
         assert!(plan(&books).is_none());
         pm_snapshot["timestamp"] = json!("101");
         pm_snapshot["asks"] = json!([]);
-        assert!(apply_ws_message(&mut books, &pm_snapshot, now).is_empty());
-        assert!(
-            plan(&books).is_none(),
-            "same-timestamp conflict cannot repair the missing baseline"
-        );
-        pm_snapshot["timestamp"] = json!("102");
+        // 同毫秒完整 WS 快照可以恢复基线；此前的增量仍不能恢复完整性。
         assert_eq!(
             apply_ws_message(&mut books, &pm_snapshot, now),
             vec![("pm-yes".into(), true)]
