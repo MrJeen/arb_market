@@ -297,16 +297,57 @@ fn response_log(result: &SubmitResult, response: &SubmissionResponse) -> Value {
         SubmissionResponse::Http(_) => "http",
         SubmissionResponse::NoResponse(_) => "no_response",
     });
-    // 成功响应 API 不提供 HTTP status，不能猜测为 200。
+    let body = match response {
+        SubmissionResponse::Http(value) => value.get("body").unwrap_or(value),
+        SubmissionResponse::NoResponse(_) => &Value::Null,
+    };
+    log["status"] = json!(body
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|status| matches!(
+            *status,
+            "live" | "matched" | "delayed" | "unmatched" | "canceled" | "cancelled"
+        )));
+    for field in ["makingAmount", "takingAmount"] {
+        log[field] = json!(body.get(field).and_then(|value| {
+            let text = match value {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                _ => return None,
+            };
+            text.parse::<Decimal>()
+                .ok()
+                .filter(|amount| *amount >= Decimal::ZERO)
+        }));
+    }
+    // status 是交易所业务状态；成功响应不提供 HTTP status，不能猜测为 200。
     log
 }
 
+fn compare_making_amount(log: &mut Value, shares: Decimal, mode: SellMode) {
+    log["order_shares"] = json!(shares);
+    log["order_type"] = json!(mode.order_type());
+    let required = matches!(mode, SellMode::Fak { .. }) && log["status"] == "matched";
+    log["amount_comparison_required"] = json!(required);
+    // SELL 的 makingAmount 是卖出股数；仅核对已 matched 的 FAK 响应。
+    let making = required
+        .then(|| {
+            log["makingAmount"]
+                .as_str()
+                .and_then(|value| value.parse::<Decimal>().ok())
+        })
+        .flatten();
+    log["making_amount_matches_order_shares"] = json!(making.map(|amount| amount == shares));
+}
+
 fn emit(context: &Value, event: &str, details: Value, started: Instant) {
-    println!(
-        "{}",
-        json!({"platform":POLYMARKET, "event":event, "context":context,
-        "elapsed_ms":started.elapsed().as_millis(), "details":details})
-    );
+    let log = json!({"platform":POLYMARKET, "event":event, "context":context,
+        "elapsed_ms":started.elapsed().as_millis(), "details":details});
+    if matches!(event, "response" | "summary") {
+        println!("{log}");
+    } else {
+        tracing::debug!(target: "sell_token_positions", event, details = %log);
+    }
 }
 
 async fn sell_account(
@@ -315,7 +356,7 @@ async fn sell_account(
     token: &str,
     mode: SellMode,
     context: &Value,
-) -> Check<&'static str> {
+) -> Check<(&'static str, Value)> {
     let started = Instant::now();
     // connect 会认证首个账号；缩小到唯一匹配账号，禁止默认/轮转账号参与。
     let mut account_cfg = cfg.clone();
@@ -410,25 +451,24 @@ async fn sell_account(
     // 全文件唯一提交调用点。错误和 Unknown 均不重试，不轮询订单/成交。
     match venue.post_prepared(&prepared).await {
         Ok((result, response)) => {
-            let log = response_log(&result, &response);
+            let mut log = response_log(&result, &response);
+            compare_making_amount(&mut log, shares, mode);
             let classification = match result {
                 SubmitResult::Ack { .. } => "ack",
                 SubmitResult::NoMatch { .. } => "no_match",
                 SubmitResult::Unknown { .. } => "unknown",
                 SubmitResult::Failed { .. } => "failed",
             };
-            emit(context, "response", log, submit_started);
-            Ok(classification)
+            emit(context, "response", log.clone(), submit_started);
+            Ok((classification, log))
         }
         Err(_) => {
-            emit(
-                context,
-                "response",
-                json!({"classification":"unknown", "reason":"post_prepared_error",
-                "order_hash":safe_id(&prepared.order_hash), "meaning":"uncertain_do_not_resubmit"}),
-                submit_started,
-            );
-            Ok("unknown")
+            let mut log = json!({"classification":"unknown", "reason":"post_prepared_error",
+                "order_hash":safe_id(&prepared.order_hash), "meaning":"uncertain_do_not_resubmit",
+                "status":null, "makingAmount":null, "takingAmount":null});
+            compare_making_amount(&mut log, shares, mode);
+            emit(context, "response", log.clone(), submit_started);
+            Ok(("unknown", log))
         }
     }
 }
@@ -444,6 +484,13 @@ async fn sell_token_positions_live() -> Check<()> {
     let mode = sell_mode(order_type_env.as_deref(), price_env.as_deref())?;
     // 配置加载（含既有 dotenv/认证流程）仅允许出现在此 ignored 实盘入口。
     let cfg = Config::from_env().map_err(|_| "config_load_failed")?;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
     let store = Store::connect(&cfg.app_postgres_uri)
         .await
         .map_err(|_| "database_connect_failed")?;
@@ -469,6 +516,9 @@ async fn sell_token_positions_live() -> Check<()> {
         started,
     );
     let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    let mut amount_mismatches = Vec::new();
+    let mut amount_unavailable = Vec::new();
+    let mut skipped = Vec::new();
     for (index, account) in accounts.iter().enumerate() {
         let account_started = Instant::now();
         let mut context = json!({"index":index + 1, "account":account.address, "token_id":token,
@@ -478,6 +528,7 @@ async fn sell_token_positions_live() -> Check<()> {
             Err(reason) => {
                 emit(&context, "skip", json!({"reason":reason}), account_started);
                 *counts.entry("skipped").or_default() += 1;
+                skipped.push(json!({"account":account.address, "reason":reason}));
                 continue;
             }
         };
@@ -489,10 +540,21 @@ async fn sell_token_positions_live() -> Check<()> {
             account_started,
         );
         match sell_account(&cfg, funder, &token, mode, &context).await {
-            Ok(classification) => *counts.entry(classification).or_default() += 1,
+            Ok((classification, log)) => {
+                *counts.entry(classification).or_default() += 1;
+                let entry = json!({"account":account.address, "response":log});
+                match log["making_amount_matches_order_shares"].as_bool() {
+                    Some(false) => amount_mismatches.push(entry),
+                    None if log["amount_comparison_required"] == true => {
+                        amount_unavailable.push(entry)
+                    }
+                    _ => {}
+                }
+            }
             Err(reason) => {
                 emit(&context, "skip", json!({"reason":reason}), account_started);
                 *counts.entry("skipped").or_default() += 1;
+                skipped.push(json!({"account":account.address, "reason":reason}));
             }
         }
     }
@@ -500,7 +562,11 @@ async fn sell_token_positions_live() -> Check<()> {
         &root,
         "summary",
         json!({"counts":counts, "accounts":accounts.len(),
-        "missing_address_rows":missing_address_rows}),
+        "missing_address_rows":missing_address_rows,
+        "amount_mismatch_count":amount_mismatches.len(), "amount_mismatches":amount_mismatches,
+        "amount_unavailable_count":amount_unavailable.len(), "amount_unavailable":amount_unavailable,
+        "comparison_note":"FAK matched only: compare SELL makingAmount with order_shares",
+        "skipped":skipped}),
         started,
     );
     Ok(())
@@ -729,6 +795,72 @@ mod tests {
             signed_amounts(&req, &good, mode),
             Err("signed_amount_mismatch")
         );
+    }
+
+    #[test]
+    fn response_status_and_amount_comparison() {
+        let result = SubmitResult::NoMatch {
+            order_hash: "hash1".into(),
+            envelope: json!({}),
+            message: String::new(),
+        };
+        let fak = SellMode::Fak { min_price: None };
+        let gtc = SellMode::Gtc { price: d("0.92") };
+        for raw in [
+            json!({"status":"matched", "makingAmount":"30", "takingAmount":"27.6"}),
+            json!({"http_status":400,"body":{"status":"matched","makingAmount":30,"takingAmount":27.6}}),
+        ] {
+            let mut log = response_log(&result, &SubmissionResponse::Http(raw));
+            assert_eq!(log["status"], "matched");
+            assert_eq!(log["takingAmount"], "27.6");
+            assert_eq!(log["makingAmount"], "30");
+            compare_making_amount(&mut log, d("30"), fak);
+            assert_eq!(log["amount_comparison_required"], true);
+            assert_eq!(log["making_amount_matches_order_shares"], true);
+            compare_making_amount(&mut log, d("31"), fak);
+            assert_eq!(log["making_amount_matches_order_shares"], false);
+            compare_making_amount(&mut log, d("31"), gtc);
+            assert_eq!(log["amount_comparison_required"], false);
+            assert!(log["making_amount_matches_order_shares"].is_null());
+        }
+        for status in [
+            "live",
+            "delayed",
+            "unmatched",
+            "canceled",
+            "cancelled",
+            "SENSITIVE",
+        ] {
+            let mut log = response_log(
+                &result,
+                &SubmissionResponse::Http(json!({"status":status,"makingAmount":"20"})),
+            );
+            compare_making_amount(&mut log, d("30"), fak);
+            assert_eq!(log["amount_comparison_required"], false);
+            assert!(log["making_amount_matches_order_shares"].is_null());
+            assert!(!log.to_string().contains("SENSITIVE"));
+        }
+        for amount in [Value::Null, json!("SENSITIVE"), json!("-1")] {
+            let mut log = response_log(
+                &result,
+                &SubmissionResponse::Http(json!({"status":"matched","makingAmount":amount})),
+            );
+            compare_making_amount(&mut log, d("30"), fak);
+            assert_eq!(log["amount_comparison_required"], true);
+            assert!(log["makingAmount"].is_null());
+            assert!(log["making_amount_matches_order_shares"].is_null());
+            assert!(!log.to_string().contains("SENSITIVE"));
+        }
+        let mut log = response_log(
+            &result,
+            &SubmissionResponse::Http(json!({"status":"matched","makingAmount":"0"})),
+        );
+        compare_making_amount(&mut log, d("30"), fak);
+        assert_eq!(log["making_amount_matches_order_shares"], false);
+        let mut log = response_log(&result, &SubmissionResponse::NoResponse(json!({})));
+        compare_making_amount(&mut log, d("30"), fak);
+        assert_eq!(log["amount_comparison_required"], false);
+        assert!(log["making_amount_matches_order_shares"].is_null());
     }
 
     #[test]

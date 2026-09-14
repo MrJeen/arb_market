@@ -191,7 +191,7 @@ cargo run --bin place-test -- --all \
 
 **以下运行命令会真实卖出，不是 dry-run，且不受自动交易开关控制。** 每个账号串行执行：查询最新余额 → 获取最新订单簿 → 从最高买价向下累计至覆盖全部可卖数量 → 以最后一档价格提交一次 SELL/FAK。未设置 `SELL_PRICE` 时无额外价格下限，可能低价成交；设置后，最后一档价格低于下限则跳过、不下单；深度不足、零余额、粉尘或账号配置不匹配时跳过。股数向下保留两位小数；FAK 不保证全部成交或清零，未成交部分取消。
 
-输出包含账号、数据库及配置中的 service、脱敏业务请求和响应、跳过原因及汇总。不轮询成交、不重试、不写卖出 legs/fills，因此数据库持仓与收益不会自动同步；`ack` 不代表全部成交。不要与正在操作同一账号/token 的自动交易或其他手动命令同时运行，避免余额和盘口竞争。
+默认仅输出 `response` 和 `summary`；其他阶段为 debug，通过 `RUST_LOG=sell_token_positions=debug` 开启。响应包含交易所业务 `status`（不是 HTTP 状态码）、`makingAmount`（卖出股数）、`takingAmount`（收入 USDC）及下单股数。仅 FAK 且 `status=matched` 时比较 `makingAmount` 与下单股数，结果记录为 `making_amount_matches_order_shares`。汇总包含数量不相等的 `amount_mismatch_count` / `amount_mismatches`；需要比较但数量缺失或非法的记录进入 `amount_unavailable`，不按零处理。GTC、其他状态及无响应不参与比较，也不计入上述汇总；跳过账号及原因仍保留。不轮询成交、不重试、不写卖出 legs/fills，因此数据库持仓与收益不会自动同步；`ack` 不代表全部成交。不要与正在操作同一账号/token 的自动交易或其他手动命令同时运行，避免余额和盘口竞争。
 
 ### 通过 Cargo 运行
 
