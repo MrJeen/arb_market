@@ -185,6 +185,33 @@ cargo run --bin place-test -- --all \
 
 `--side` 省略时默认买卖都测。读 `.env` 与 `polymarket_funders.json`。`ACK` / `NO_MATCH` 都说明下单链路通；`FAILED` 或签名错误才是接口异常。
 
+## 按 token 串行卖出 Polymarket 持仓
+
+入口：`tests/sell_token_positions.rs`。从 `legs` 查询该 token 曾进入提交阶段或已有交易所订单 ID 的账号，按 funder（缺失时用 wallet）去重，匹配本地已配置的签名账号。service 仅作展示标签，不会调用对应的远端服务。
+
+**以下运行命令会真实卖出，不是 dry-run，且不受自动交易开关控制。** 每个账号串行执行：查询最新余额 → 获取最新订单簿 → 从最高买价向下累计至覆盖全部可卖数量 → 以最后一档价格提交一次 SELL/FAK。无额外价格下限，可能低价成交；深度不足、零余额、粉尘或账号配置不匹配时跳过。股数向下保留两位小数；FAK 不保证全部成交或清零，未成交部分取消。
+
+输出包含账号、数据库及配置中的 service、脱敏业务请求和响应、跳过原因及汇总。不轮询成交、不重试、不写卖出 legs/fills，因此数据库持仓与收益不会自动同步；`ack` 不代表全部成交。不要与正在操作同一账号/token 的自动交易或其他手动命令同时运行，避免余额和盘口竞争。
+
+### 通过 Cargo 运行
+
+【本机】在项目根目录、配置已就绪时执行：
+
+```bash
+SELL_TOKEN_ID='<pm_token_id>' SELL_LIVE_CONFIRM=YES \
+cargo test --test sell_token_positions sell_token_positions_live \
+  -- --ignored --exact --nocapture --test-threads=1
+```
+
+`SELL_TOKEN_ID` 必填，`SELL_LIVE_CONFIRM` 必须精确为 `YES`。只验证代码、不交易：
+
+```bash
+cargo test --test sell_token_positions --no-run
+cargo test --test sell_token_positions -- --skip sell_token_positions_live
+```
+
+测试整体退出成功仅表示遍历结束，账号提交失败或跳过需查看输出中的 `summary` 和各账号结果。
+
 ## 本机交叉编译
 
 【本机】macOS 编 Linux x86_64：
