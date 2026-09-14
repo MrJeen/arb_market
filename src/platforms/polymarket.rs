@@ -578,25 +578,55 @@ impl PolymarketVenue {
             .iter()
             .map(|token_id| json!({ "token_id": token_id }))
             .collect();
-        let resp = self
-            .http
-            .post(format!("{}/books", self.base))
-            .json(&body)
-            .send()
-            .await?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(Error::Http {
-                status: status.as_u16(),
-                message: redact_http(&text),
-            });
+        let mut phase = "send";
+        let mut http_status = None;
+        let result = async {
+            let resp = self
+                .http
+                .post(format!("{}/books", self.base))
+                .json(&body)
+                .send()
+                .await
+                .map_err(books_http_error)?;
+            let status = resp.status();
+            http_status = Some(status.as_u16());
+            phase = "read_body";
+            let text = resp.text().await.map_err(books_http_error)?;
+            if !status.is_success() {
+                return Err(Error::Http {
+                    status: status.as_u16(),
+                    message: "polymarket books kind=status".into(),
+                });
+            }
+            phase = "decode";
+            let parsed: Value = serde_json::from_str(&text).map_err(|error| {
+                // JSON 错误文本可能包含响应值，只保留类别及位置。
+                Error::msg(format!(
+                    "polymarket books kind=decode category={:?} line={} column={}",
+                    error.classify(),
+                    error.line(),
+                    error.column()
+                ))
+            })?;
+            parsed
+                .as_array()
+                .cloned()
+                .ok_or_else(|| Error::msg("polymarket books kind=decode reason=missing_array"))
         }
-        let parsed: Value = serde_json::from_str(&text)?;
-        let items = parsed
-            .as_array()
-            .cloned()
-            .ok_or_else(|| Error::msg("polymarket books missing array"))?;
+        .await;
+        let items = result.map_err(|error| {
+            tracing::warn!(
+                service = "polymarket",
+                interface = "/books",
+                phase,
+                ?http_status,
+                requested = token_ids.len(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                %error,
+                "polymarket books request failed"
+            );
+            error
+        })?;
         tracing::debug!(
             requested = token_ids.len(),
             returned = items.len(),
@@ -2608,6 +2638,45 @@ fn json_str(value: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
+// 与 WS 日志相同，只输出类型化原因；source 的 Display/Debug 可能含 URL、头或载荷。
+fn books_http_error(error: reqwest::Error) -> Error {
+    let kind = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_request() {
+        "request"
+    } else if error.is_builder() {
+        "builder"
+    } else if error.is_redirect() {
+        "redirect"
+    } else if error.is_status() {
+        "status"
+    } else {
+        "transport"
+    };
+    let mut io_kind = None;
+    let mut os_error = None;
+    let mut source = std::error::Error::source(&error);
+    // 有界遍历，只提取标准 I/O 枚举和数字；不格式化任何不可信 source 文本。
+    for _ in 0..16 {
+        let Some(cause) = source else { break };
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            io_kind = Some(io.kind());
+            os_error = io.raw_os_error();
+        }
+        source = cause.source();
+    }
+    Error::msg(format!(
+        "polymarket books kind={kind} timeout={} connect={} request={} body={} decode={} io_kind={io_kind:?} os_error={os_error:?}",
+        error.is_timeout(), error.is_connect(), error.is_request(), error.is_body(), error.is_decode()
+    ))
+}
+
 fn redact_http(text: &str) -> String {
     text.chars().take(300).collect()
 }
@@ -4422,6 +4491,110 @@ pub(crate) mod tests {
             },
         );
         (venue, server)
+    }
+
+    #[tokio::test]
+    async fn books_http_failures_keep_safe_root_causes() {
+        use tokio::io::AsyncReadExt;
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+
+        for case in [
+            "timeout",
+            "body_timeout",
+            "connect",
+            "body",
+            "decode",
+            "status",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = if case == "connect" {
+                drop(listener);
+                None
+            } else {
+                Some(tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut buffer = [0; 4096];
+                    socket.read(&mut buffer).await.unwrap();
+                    match case {
+                        "timeout" => tokio::time::sleep(Duration::from_secs(2)).await,
+                        "body_timeout" => {
+                            socket
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n")
+                                .await
+                                .unwrap();
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                        "body" => socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\nsecret-payload",
+                            )
+                            .await
+                            .unwrap(),
+                        "decode" | "status" => {
+                            let status = if case == "status" { 503 } else { 200 };
+                            let body = "secret-payload";
+                            socket.write_all(format!("HTTP/1.1 {status} Stub\r\nContent-Length: {}\r\nX-Secret: secret-header\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                }))
+            };
+            let mut venue = cache_test_venue();
+            venue.base = format!(
+                "http://secret-user:secret-password@{address}/secret-path?token=secret-query"
+            );
+            venue.http = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_millis(100))
+                .build()
+                .unwrap();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let subscriber = tracing_subscriber::registry()
+                .with(WsLogCapture(tx).with_filter(tracing_subscriber::filter::LevelFilter::WARN));
+            let error = venue
+                .rest_books(&["secret-token".into()])
+                .with_subscriber(subscriber)
+                .await
+                .unwrap_err();
+            let message = error.to_string();
+            let event = rx.try_recv().unwrap();
+            assert_eq!(event.level, tracing::Level::WARN);
+            assert_eq!(event.fields["interface"], "/books");
+            let phase = match case {
+                "timeout" | "connect" => "send",
+                "decode" => "decode",
+                _ => "read_body",
+            };
+            assert_eq!(event.fields["phase"], phase);
+            match case {
+                "timeout" | "body_timeout" => {
+                    assert!(message.contains("kind=timeout"), "{message}")
+                }
+                "connect" => {
+                    assert!(message.contains("kind=connect"), "{message}");
+                    assert!(message.contains("ConnectionRefused"), "{message}");
+                }
+                // reqwest 的 text/bytes 路径会将部分读取错误标为 decode，而非 body。
+                "body" => assert!(
+                    message.contains("decode=true") || message.contains("body=true"),
+                    "{message}"
+                ),
+                _ => assert!(message.contains(&format!("kind={case}")), "{message}"),
+            }
+            assert_eq!(event.fields["error"], message);
+            let all_output = format!("{error:?} {event:?}");
+            assert!(!all_output.contains("secret-"), "{all_output}");
+            if let Some(server) = server {
+                if case.contains("timeout") {
+                    server.abort();
+                    assert!(server.await.unwrap_err().is_cancelled());
+                } else {
+                    server.await.unwrap();
+                }
+            }
+        }
     }
 
     // 同时捕获 span，验证 HTTP 事件继承 order_hash 和执行层 leg_id。

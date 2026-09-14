@@ -12,7 +12,7 @@ use crate::hedge::{
     needs_rebalance, plan_hedge, HedgeSide,
 };
 use crate::notify::{
-    self, NatsNotifier, PlaceNotice, PlaceResult, SettlementNotice, TakeProfitCompletedNotice,
+    self, NatsNotifier, PlaceNotice, PlaceResult, PlaceStatus, SettlementNotice, TakeProfitCompletedNotice,
     TakeProfitTriggerNotice,
 };
 use crate::platforms::outcome::fees::FeeLookupError;
@@ -3930,29 +3930,32 @@ fn place_result(
     market: String,
     result: Result<SubmitResult>,
 ) -> PlaceResult {
-    let error = match result {
-        Ok(SubmitResult::Ack { .. }) => None,
-        Ok(SubmitResult::NoMatch { message, .. }) | Ok(SubmitResult::Unknown { message, .. }) => {
-            Some(message)
-        }
+    let (status, message) = match result {
+        Ok(SubmitResult::Ack { .. }) => (PlaceStatus::Accepted, String::new()),
+        Ok(SubmitResult::NoMatch { message, .. }) => (PlaceStatus::NoMatch, message),
+        Ok(SubmitResult::Unknown { message, .. }) => (PlaceStatus::Pending, message),
         Ok(SubmitResult::Failed {
             status, message, ..
-        }) => Some(format!("HTTP {status} {message}")),
-        Err(err) => Some(format_place_error(&err)),
+        }) => {
+            let message = if message.trim().is_empty() {
+                "提交被明确拒绝"
+            } else {
+                &message
+            };
+            (PlaceStatus::Rejected, format!("HTTP {status} {message}"))
+        }
+        // 外层错误也可能发生在提交后的持久化阶段，不能据此断言未成交。
+        Err(_) => (
+            PlaceStatus::ExecutionError,
+            "执行异常，提交结果需核实".into(),
+        ),
     };
     PlaceResult {
         platform,
         label,
         market,
-        error,
-    }
-}
-
-fn format_place_error(err: &Error) -> String {
-    match err {
-        Error::Http { status, message } => format!("HTTP {status} {message}"),
-        Error::Rejected { code, message } => format!("{code} {message}"),
-        other => other.to_string(),
+        status,
+        message,
     }
 }
 
@@ -4010,6 +4013,69 @@ mod tests {
     use crate::calc::estimate_taker_fee;
     use rust_decimal::prelude::FromStr;
     use serde_json::json;
+
+    fn place_notice_for_test(results: Vec<Result<SubmitResult>>) -> String {
+        notify::format_place_notice("【test】", &PlaceNotice {
+            order_id: 1,
+            title: "test".into(),
+            platforms: vec![],
+            results: results.into_iter().map(|result| {
+                place_result("platform".into(), "yes".into(), "market".into(), result)
+            }).collect(),
+        })
+    }
+
+    #[test]
+    fn place_notice_ack_and_delayed_unknown_are_not_failures() {
+        let parse = |status| crate::platforms::polymarket::parse_submit(
+            &json!({"success": true, "status": status, "orderID": "order", "errorMsg": ""}),
+            "hash".into(),
+            json!({"signature": "must-not-appear"}),
+        );
+        let delayed = parse("delayed");
+        assert!(matches!(&delayed, SubmitResult::Unknown { message, .. } if message.is_empty()));
+        let text = place_notice_for_test(vec![Ok(parse("live")), Ok(delayed)]);
+        assert!(text.contains("已受理: 1  待确认: 1"));
+        assert!(text.contains("提交已受理，不代表已成交"));
+        assert!(text.contains("待确认；提交结果待确认"));
+        for forbidden in ["失败", "明确拒绝", "未成交", "下单完成", "成功", "must-not-appear", "signature"] {
+            assert!(!text.contains(forbidden), "unexpected {forbidden}");
+        }
+    }
+
+    #[test]
+    fn place_notice_distinguishes_no_match_rejection_and_execution_error() {
+        let text = place_notice_for_test(vec![
+            Ok(SubmitResult::NoMatch {
+                order_hash: "hash".into(), envelope: json!({}), message: " \n\t".into(),
+            }),
+            Ok(SubmitResult::Failed {
+                order_hash: "hash".into(), envelope: json!({}), status: 400, message: " \n\t".into(),
+            }),
+            Err(Error::msg("sensitive internal response")),
+        ]);
+        assert!(text.contains("未成交: 1  明确拒绝: 1  执行异常: 1"));
+        assert!(text.contains("未成交；订单未匹配成交"));
+        assert!(text.contains("明确拒绝；HTTP 400 提交被明确拒绝"));
+        assert!(text.contains("执行异常；执行异常，提交结果需核实"));
+        assert!(!text.contains("sensitive internal response"));
+        let error_only = place_notice_for_test(vec![Err(Error::msg(""))]);
+        assert!(!error_only.contains("未成交"));
+        assert!(!error_only.contains("明确拒绝"));
+    }
+
+    #[test]
+    fn place_notice_preserves_and_escapes_nonempty_submit_messages() {
+        for result in [
+            SubmitResult::Unknown { order_id: None, order_hash: "hash".into(), envelope: json!({}), message: "pending_reason *check*".into() },
+            SubmitResult::NoMatch { order_hash: "hash".into(), envelope: json!({}), message: "no_match *check*".into() },
+            SubmitResult::Failed { order_hash: "hash".into(), envelope: json!({}), status: 400, message: "bad_request *check*".into() },
+        ] {
+            let text = place_notice_for_test(vec![Ok(result)]);
+            assert!(text.contains(r"\_"));
+            assert!(text.contains(r"\*check\*"));
+        }
+    }
 
     #[test]
     fn actuals_gate_observes_recovery_and_limits_warnings_to_sixty_seconds() {

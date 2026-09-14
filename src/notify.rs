@@ -36,7 +36,39 @@ pub struct PlaceResult {
     pub platform: String,
     pub label: String,
     pub market: String,
-    pub error: Option<String>,
+    pub status: PlaceStatus,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceStatus {
+    Accepted,
+    Pending,
+    NoMatch,
+    Rejected,
+    ExecutionError,
+}
+
+impl PlaceStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Accepted => "已受理",
+            Self::Pending => "待确认",
+            Self::NoMatch => "未成交",
+            Self::Rejected => "明确拒绝",
+            Self::ExecutionError => "执行异常",
+        }
+    }
+
+    fn fallback(self) -> &'static str {
+        match self {
+            Self::Accepted => "提交已受理，不代表已成交",
+            Self::Pending => "提交结果待确认",
+            Self::NoMatch => "订单未匹配成交",
+            Self::Rejected => "提交被明确拒绝",
+            Self::ExecutionError => "执行异常，提交结果需核实",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -99,18 +131,22 @@ pub fn format_notify_tag(cat: &str) -> String {
 }
 
 pub fn format_place_notice(tag: &str, notice: &PlaceNotice) -> String {
-    let success = notice.results.iter().filter(|r| r.error.is_none()).count();
-    let fail = notice.results.len().saturating_sub(success);
     let result_line = [
-        (success > 0).then(|| format!("✅ 成功: {success}")),
-        (fail > 0).then(|| format!("❌ 失败: {fail}")),
+        PlaceStatus::Accepted,
+        PlaceStatus::Pending,
+        PlaceStatus::NoMatch,
+        PlaceStatus::Rejected,
+        PlaceStatus::ExecutionError,
     ]
     .into_iter()
-    .flatten()
+    .filter_map(|status| {
+        let count = notice.results.iter().filter(|r| r.status == status).count();
+        (count > 0).then(|| format!("{}: {count}", status.label()))
+    })
     .collect::<Vec<_>>()
     .join("  ");
     let mut lines = vec![
-        format!("🛒 {tag}下单完成"),
+        format!("🛒 {tag}订单提交结果"),
         format!("📋 orderId: {}", notice.order_id),
         format!("📋 title: {}", escape_markdown(&notice.title)),
         format!(
@@ -126,23 +162,23 @@ pub fn format_place_notice(tag: &str, notice: &PlaceNotice) -> String {
     if !result_line.is_empty() {
         lines.push(result_line);
     }
-    let failures: Vec<String> = notice
-        .results
-        .iter()
-        .filter_map(|r| {
-            let err = r.error.as_deref()?;
-            Some(format!(
-                "- {} label={} market={}: {}",
+    if !notice.results.is_empty() {
+        lines.push("提交详情:".into());
+        lines.extend(notice.results.iter().map(|r| {
+            let message = if r.message.trim().is_empty() {
+                r.status.fallback()
+            } else {
+                &r.message
+            };
+            format!(
+                "- {} label={} market={}: {}；{}",
                 escape_markdown(&r.platform),
                 escape_markdown(&r.label),
                 escape_markdown(&r.market),
-                escape_markdown(&truncate_notify_line(err, 500))
-            ))
-        })
-        .collect();
-    if !failures.is_empty() {
-        lines.push("❌ 失败详情:".into());
-        lines.extend(failures);
+                r.status.label(),
+                escape_markdown(&truncate_notify_line(message, 500))
+            )
+        }));
     }
     lines.join("\n")
 }
@@ -401,25 +437,57 @@ mod tests {
                         platform: "polymarket (rewards-11)".into(),
                         label: "yes".into(),
                         market: "111".into(),
-                        error: None,
+                        status: PlaceStatus::Accepted,
+                        message: String::new(),
                     },
                     PlaceResult {
                         platform: "outcome".into(),
                         label: "yes".into(),
                         market: "#12270".into(),
-                        error: Some("HTTP 429 ERRBADREQUEST { error: 'toomanyrequests' }".into()),
+                        status: PlaceStatus::Rejected,
+                        message: "HTTP 429 bad_request *reason* [detail] `code`".into(),
                     },
                 ],
             },
         );
-        assert!(text.starts_with("🛒 【market-arb】下单完成"));
+        assert!(text.starts_with("🛒 【market-arb】订单提交结果"));
         assert!(text.contains("📋 orderId: 27278"));
         assert!(text.contains("Real\\_Sociedad"));
-        assert!(text.contains("✅ 成功: 1  ❌ 失败: 1"));
-        assert!(text.contains("❌ 失败详情:"));
+        assert!(text.contains("已受理: 1  明确拒绝: 1"));
+        assert!(text.contains("提交详情:"));
         assert!(text.contains("polymarket (rewards-11)"));
-        assert!(text.contains("label=yes market=#12270: HTTP 429"));
+        assert!(text.contains("label=yes market=#12270: 明确拒绝；HTTP 429"));
+        assert!(text.contains(r"bad\_request \*reason\* \[detail] \`code\`"));
         assert!(!text.contains("Real_Sociedad"));
+    }
+
+    #[test]
+    fn place_notice_blank_messages_have_category_fallbacks() {
+        for status in [
+            PlaceStatus::Accepted,
+            PlaceStatus::Pending,
+            PlaceStatus::NoMatch,
+            PlaceStatus::Rejected,
+            PlaceStatus::ExecutionError,
+        ] {
+            for message in ["", " \n\t "] {
+                let text = format_place_notice("【cat】", &PlaceNotice {
+                    order_id: 1,
+                    title: "test".into(),
+                    platforms: vec!["platform_name".into()],
+                    results: vec![PlaceResult {
+                        platform: "platform_name".into(),
+                        label: "*yes*".into(),
+                        market: "[market]".into(),
+                        status,
+                        message: message.into(),
+                    }],
+                });
+                assert!(text.contains(&format!("{}: 1", status.label())));
+                assert!(text.contains(status.fallback()));
+                assert!(text.contains(r"platform\_name label=\*yes\* market=\[market]"));
+            }
+        }
     }
 
     #[test]
