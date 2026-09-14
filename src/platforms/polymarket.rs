@@ -706,6 +706,23 @@ impl PolymarketVenue {
         funder: &str,
         req: &MarketOrderRequest,
     ) -> Result<PreparedOrder> {
+        self.prepare_order(funder, req, "FAK").await
+    }
+
+    pub async fn prepare_limit_order(
+        &self,
+        funder: &str,
+        req: &MarketOrderRequest,
+    ) -> Result<PreparedOrder> {
+        self.prepare_order(funder, req, "GTC").await
+    }
+
+    async fn prepare_order(
+        &self,
+        funder: &str,
+        req: &MarketOrderRequest,
+        order_type: &str,
+    ) -> Result<PreparedOrder> {
         require_positive(req.shares, req.cap_price)?;
         let account = self.ensure_account(funder).await?;
         let tick = match req.tick_size {
@@ -713,7 +730,15 @@ impl PolymarketVenue {
             None => self.fetch_tick_size(&req.token_id).await?,
         };
         let neg_risk = self.neg_risk(&req.token_id, req.neg_risk).await?;
-        let unsigned = build_unsigned_order(&account, req, tick)?;
+        if order_type == "GTC"
+            && (tick <= Decimal::ZERO
+                || req.cap_price < tick
+                || req.cap_price > Decimal::ONE - tick
+                || req.cap_price.checked_rem(tick) != Some(Decimal::ZERO))
+        {
+            return Err(Error::msg("polymarket limit price incompatible with tick"));
+        }
+        let unsigned = build_unsigned_order(&account, req, tick, order_type)?;
         let signed = sign_order(&account.signer, unsigned, neg_risk).map_err(Error::msg)?;
         let order_hash = order_hash_hex(&signed, neg_risk).map_err(Error::msg)?;
         let envelope = signed_envelope(
@@ -1377,6 +1402,7 @@ fn build_unsigned_order(
     account: &PolymarketAccount,
     req: &MarketOrderRequest,
     tick: Decimal,
+    order_type: &str,
 ) -> Result<SignedOrder> {
     let price = if req.side == OrderSide::Buy {
         crate::calc::align_polymarket_price(req.cap_price, tick)
@@ -1389,7 +1415,20 @@ fn build_unsigned_order(
     if req.side == OrderSide::Buy && price != req.cap_price {
         return Err(Error::msg("polymarket buy cap incompatible with tick"));
     }
-    let (maker_amount, taker_amount) = market_order_base_units(req.side, req.shares, price)?;
+    let (maker_amount, taker_amount) = if order_type == "GTC" && req.side == OrderSide::Sell {
+        // 限价卖单不能沿用 FAK 的金额截断，否则实际卖价可能低于指定价格。
+        let shares = req.shares.trunc_with_scale(MARKET_MAKER_DECIMALS);
+        let taker = shares
+            .checked_mul(price)
+            .and_then(|amount| amount.checked_mul(Decimal::from(1_000_000)))
+            .filter(|amount| amount.fract().is_zero())
+            .and_then(|amount| amount.to_u128())
+            .filter(|amount| *amount > 0)
+            .ok_or_else(|| Error::msg("polymarket limit amount incompatible with precision"))?;
+        (base_units(shares), taker)
+    } else {
+        market_order_base_units(req.side, req.shares, price)?
+    };
     let maker: Address = account
         .funder
         .parse()
@@ -1405,7 +1444,7 @@ fn build_unsigned_order(
         maker,
         maker_amount,
         metadata: B256::ZERO,
-        order_type: "FAK".into(),
+        order_type: order_type.into(),
         salt: rand::random::<u64>() & ((1u64 << 53) - 1),
         side: req.side.as_str().into(),
         signature: "0x".into(),
@@ -1437,7 +1476,7 @@ fn order_submit_payload(signed: &SignedOrder, owner: &str) -> Value {
             "timestamp": signed.timestamp.to_string(),
             "tokenId": signed.token_id
         },
-        "orderType": "FAK",
+        "orderType": signed.order_type,
         "owner": owner
     })
 }
@@ -1455,7 +1494,7 @@ fn signed_envelope(
     json!({
         "order_hash": order_hash,
         "order_version": 2,
-        "order_type": "FAK",
+        "order_type": order.order_type,
         "token_id": token_id,
         "side": side.as_str(),
         "shares": shares.to_string(),
@@ -1468,7 +1507,7 @@ fn signed_envelope(
             "maker": format!("{:#x}", order.maker),
             "maker_amount": order.maker_amount,
             "metadata": format!("{:#x}", order.metadata),
-            "order_type": "FAK",
+            "order_type": order.order_type,
             "salt": order.salt,
             "side": order.side,
             "signature": order.signature,
@@ -3398,6 +3437,16 @@ pub(crate) mod tests {
         assert!(order.get("signatureType").unwrap().is_number());
         assert_eq!(order.get("side").and_then(|v| v.as_str()), Some("BUY"));
         assert_eq!(order.get("signatureType").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(payload["orderType"], "FAK");
+        let mut gtc = signed.clone();
+        gtc.order_type = "GTC".into();
+        assert_eq!(order_submit_payload(&gtc, "api-key")["orderType"], "GTC");
+        let envelope = signed_envelope(
+            &gtc, "1", OrderSide::Buy, Decimal::from(3),
+            Decimal::new(44, 2), Decimal::new(1, 2), false, "hash",
+        );
+        assert_eq!(envelope["order_type"], "GTC");
+        assert_eq!(envelope["signed_order"]["order_type"], "GTC");
     }
 
     #[test]
@@ -6097,13 +6146,27 @@ pub(crate) mod tests {
             asset_id: None,
             funder_address: None,
         };
-        assert!(build_unsigned_order(&account, &req, d("0.01")).is_err());
-        let order = build_unsigned_order(&account, &req, d("0.001")).unwrap();
+        assert!(build_unsigned_order(&account, &req, d("0.01"), "FAK").is_err());
+        let order = build_unsigned_order(&account, &req, d("0.001"), "FAK").unwrap();
         let payload = order_submit_payload(&order, "test-owner");
         assert_eq!(payload["order"]["makerAmount"], "3330000");
         assert_eq!(payload["order"]["takerAmount"], "10000000");
         req.shares = d("7");
-        assert!(build_unsigned_order(&account, &req, d("0.001")).is_err());
+        assert!(build_unsigned_order(&account, &req, d("0.001"), "FAK").is_err());
+
+        req.side = OrderSide::Sell;
+        req.shares = d("1.23");
+        req.cap_price = d("0.3333");
+        let order = build_unsigned_order(&account, &req, d("0.0001"), "GTC").unwrap();
+        assert_eq!(order.order_type, "GTC");
+        assert_eq!((order.maker_amount, order.taker_amount), (1_230_000, 409_959));
+        // 最小 tick 与最小股数的有效限价单不能被 FAK 五位金额截断误拒绝。
+        req.shares = d("0.01");
+        req.cap_price = d("0.0001");
+        let order = build_unsigned_order(&account, &req, d("0.0001"), "GTC").unwrap();
+        assert_eq!((order.maker_amount, order.taker_amount), (10_000, 1));
+        req.cap_price = d("0.00001");
+        assert!(build_unsigned_order(&account, &req, d("0.00001"), "GTC").is_err());
     }
 
     fn dummy_funder(addr: &str) -> PolymarketFunderConfig {

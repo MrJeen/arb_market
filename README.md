@@ -189,7 +189,7 @@ cargo run --bin place-test -- --all \
 
 入口：`tests/sell_token_positions.rs`。从 `legs` 查询该 token 曾进入提交阶段或已有交易所订单 ID 的账号，按 funder（缺失时用 wallet）去重，匹配本地已配置的签名账号。service 仅作展示标签，不会调用对应的远端服务。
 
-**以下运行命令会真实卖出，不是 dry-run，且不受自动交易开关控制。** 每个账号串行执行：查询最新余额 → 获取最新订单簿 → 从最高买价向下累计至覆盖全部可卖数量 → 以最后一档价格提交一次 SELL/FAK。无额外价格下限，可能低价成交；深度不足、零余额、粉尘或账号配置不匹配时跳过。股数向下保留两位小数；FAK 不保证全部成交或清零，未成交部分取消。
+**以下运行命令会真实卖出，不是 dry-run，且不受自动交易开关控制。** 每个账号串行执行：查询最新余额 → 获取最新订单簿 → 从最高买价向下累计至覆盖全部可卖数量 → 以最后一档价格提交一次 SELL/FAK。未设置 `SELL_PRICE` 时无额外价格下限，可能低价成交；设置后，最后一档价格低于下限则跳过、不下单；深度不足、零余额、粉尘或账号配置不匹配时跳过。股数向下保留两位小数；FAK 不保证全部成交或清零，未成交部分取消。
 
 输出包含账号、数据库及配置中的 service、脱敏业务请求和响应、跳过原因及汇总。不轮询成交、不重试、不写卖出 legs/fills，因此数据库持仓与收益不会自动同步；`ack` 不代表全部成交。不要与正在操作同一账号/token 的自动交易或其他手动命令同时运行，避免余额和盘口竞争。
 
@@ -203,7 +203,29 @@ cargo test --test sell_token_positions sell_token_positions_live \
   -- --ignored --exact --nocapture --test-threads=1
 ```
 
-`SELL_TOKEN_ID` 必填，`SELL_LIVE_CONFIRM` 必须精确为 `YES`。只验证代码、不交易：
+`SELL_TOKEN_ID` 必填，`SELL_LIVE_CONFIRM` 必须精确为 `YES`。命令行通过 `SELL_ORDER_TYPE=FAK|GTC` 选择下单方式，省略时默认 FAK。FAK 可选设置 `SELL_PRICE` 作为盘口价格下限（严格介于 0 和 1 之间）：覆盖全部可卖数量的最后一档买价必须大于或等于该值，否则跳过该账号，不签名、不提交；仍按盘口计算价格下单，不用 `SELL_PRICE` 替换下单价格。该阈值比较盘口价，FAK 原有金额截断规则不变，实际签名金额比价可能略低于盘口价。
+
+FAK 带价格下限示例（**会真实下单**）：
+
+```bash
+SELL_TOKEN_ID='<pm_token_id>' SELL_LIVE_CONFIRM=YES \
+SELL_ORDER_TYPE=FAK SELL_PRICE=0.65 \
+cargo test --test sell_token_positions sell_token_positions_live \
+  -- --ignored --exact --nocapture --test-threads=1
+```
+
+GTC 限价卖出示例（**会真实下单**）：
+
+```bash
+SELL_TOKEN_ID='<pm_token_id>' SELL_LIVE_CONFIRM=YES \
+SELL_ORDER_TYPE=GTC SELL_PRICE=0.65 \
+cargo test --test sell_token_positions sell_token_positions_live \
+  -- --ignored --exact --nocapture --test-threads=1
+```
+
+GTC 必须设置 `SELL_PRICE`（每股 USDC，严格介于 0 和 1 之间且符合 token 的 tick）。每个账号查询最新余额，以指定价格卖出全部可卖数量；仅获取 tick、neg-risk 等签名所需元数据，**不查询订单簿，也不检查盘口深度**。金额必须能以 USDC 最小单位精确表达，否则跳过，不会截断降低限价。GTC 不是 post-only：可能立即成交，未成交部分持续挂单，直到成交或手动取消；本工具不自动撤单，重复运行可能重复挂单。
+
+只验证代码、不交易：
 
 ```bash
 cargo test --test sell_token_positions --no-run
