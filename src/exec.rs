@@ -4060,18 +4060,10 @@ mod tests {
         let delayed = parse("delayed");
         assert!(matches!(&delayed, SubmitResult::Unknown { message, .. } if message.is_empty()));
         let text = place_notice_for_test(vec![Ok(parse("live")), Ok(delayed)]);
-        assert!(text.contains("已受理: 1  待确认: 1"));
-        assert!(text.contains("提交已受理，不代表已成交"));
-        assert!(text.contains("待确认；提交结果待确认"));
-        for forbidden in [
-            "失败",
-            "明确拒绝",
-            "未成交",
-            "下单完成",
-            "成功",
-            "must-not-appear",
-            "signature",
-        ] {
+        assert!(text.contains("✅ 成功: 1  ⏳ 待确认: 1"));
+        assert!(text.contains("⏳ 待确认详情:"));
+        assert!(text.contains("market=market: 提交结果待确认"));
+        for forbidden in ["失败", "明确拒绝", "未成交", "must-not-appear", "signature"] {
             assert!(!text.contains(forbidden), "unexpected {forbidden}");
         }
     }
@@ -4092,10 +4084,11 @@ mod tests {
             }),
             Err(Error::msg("sensitive internal response")),
         ]);
-        assert!(text.contains("未成交: 1  明确拒绝: 1  执行异常: 1"));
-        assert!(text.contains("未成交；订单未匹配成交"));
-        assert!(text.contains("明确拒绝；HTTP 400 提交被明确拒绝"));
-        assert!(text.contains("执行异常；执行异常，提交结果需核实"));
+        assert!(text.contains("❌ 失败: 2  ⚠️ 执行异常: 1"));
+        assert!(text.contains("market=market: 订单未匹配成交"));
+        assert!(text.contains("market=market: HTTP 400 提交被明确拒绝"));
+        assert!(text.contains("⚠️ 执行异常详情:"));
+        assert!(text.contains("market=market: 执行异常，提交结果需核实"));
         assert!(!text.contains("sensitive internal response"));
         let error_only = place_notice_for_test(vec![Err(Error::msg(""))]);
         assert!(!error_only.contains("未成交"));

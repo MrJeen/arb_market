@@ -50,16 +50,6 @@ pub enum PlaceStatus {
 }
 
 impl PlaceStatus {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Accepted => "已受理",
-            Self::Pending => "待确认",
-            Self::NoMatch => "未成交",
-            Self::Rejected => "明确拒绝",
-            Self::ExecutionError => "执行异常",
-        }
-    }
-
     fn fallback(self) -> &'static str {
         match self {
             Self::Accepted => "提交已受理，不代表已成交",
@@ -131,22 +121,35 @@ pub fn format_notify_tag(cat: &str) -> String {
 }
 
 pub fn format_place_notice(tag: &str, notice: &PlaceNotice) -> String {
-    let result_line = [
-        PlaceStatus::Accepted,
-        PlaceStatus::Pending,
-        PlaceStatus::NoMatch,
-        PlaceStatus::Rejected,
-        PlaceStatus::ExecutionError,
-    ]
-    .into_iter()
-    .filter_map(|status| {
-        let count = notice.results.iter().filter(|r| r.status == status).count();
-        (count > 0).then(|| format!("{}: {count}", status.label()))
-    })
-    .collect::<Vec<_>>()
-    .join("  ");
+    // 成功表示提交已受理；待确认和执行异常不能直接判定为下单失败。
+    let groups: [(&str, &str, &[PlaceStatus]); 4] = [
+        ("✅ 成功", "", &[PlaceStatus::Accepted]),
+        (
+            "❌ 失败",
+            "❌ 失败详情:",
+            &[PlaceStatus::NoMatch, PlaceStatus::Rejected],
+        ),
+        ("⏳ 待确认", "⏳ 待确认详情:", &[PlaceStatus::Pending]),
+        (
+            "⚠️ 执行异常",
+            "⚠️ 执行异常详情:",
+            &[PlaceStatus::ExecutionError],
+        ),
+    ];
+    let result_line = groups
+        .iter()
+        .filter_map(|(label, _, statuses)| {
+            let count = notice
+                .results
+                .iter()
+                .filter(|r| statuses.contains(&r.status))
+                .count();
+            (count > 0).then(|| format!("{label}: {count}"))
+        })
+        .collect::<Vec<_>>()
+        .join("  ");
     let mut lines = vec![
-        format!("🛒 {tag}订单提交结果"),
+        format!("🛒 {tag}下单完成"),
         format!("📋 orderId: {}", notice.order_id),
         format!("📋 title: {}", escape_markdown(&notice.title)),
         format!(
@@ -162,20 +165,27 @@ pub fn format_place_notice(tag: &str, notice: &PlaceNotice) -> String {
     if !result_line.is_empty() {
         lines.push(result_line);
     }
-    if !notice.results.is_empty() {
-        lines.push("提交详情:".into());
-        lines.extend(notice.results.iter().map(|r| {
+    for (_, heading, statuses) in groups.iter().skip(1) {
+        let mut results = notice
+            .results
+            .iter()
+            .filter(|r| statuses.contains(&r.status))
+            .peekable();
+        if results.peek().is_none() {
+            continue;
+        }
+        lines.push((*heading).into());
+        lines.extend(results.map(|r| {
             let message = if r.message.trim().is_empty() {
                 r.status.fallback()
             } else {
                 &r.message
             };
             format!(
-                "- {} label={} market={}: {}；{}",
+                "- {} label={} market={}: {}",
                 escape_markdown(&r.platform),
                 escape_markdown(&r.label),
                 escape_markdown(&r.market),
-                r.status.label(),
                 escape_markdown(&truncate_notify_line(message, 500))
             )
         }));
@@ -425,6 +435,56 @@ mod tests {
     }
 
     #[test]
+    fn place_notice_matches_success_and_failure_examples() {
+        let mut notice = PlaceNotice {
+            order_id: 8677,
+            title: "Bitcoin Price Movement on September 17, 2026".into(),
+            platforms: vec!["polymarket (rewards-45)".into(), "predictfun".into()],
+            results: ["polymarket (rewards-45)", "predictfun"]
+                .into_iter()
+                .map(|platform| PlaceResult {
+                    platform: platform.into(),
+                    label: "yes".into(),
+                    market: "market".into(),
+                    status: PlaceStatus::Accepted,
+                    message: String::new(),
+                })
+                .collect(),
+        };
+        assert_eq!(
+            format_place_notice("【crypto】", &notice),
+            "🛒 【crypto】下单完成\n\
+             📋 orderId: 8677\n\
+             📋 title: Bitcoin Price Movement on September 17, 2026\n\
+             🏪 polymarket (rewards-45), predictfun\n\
+             ✅ 成功: 2"
+        );
+
+        notice.order_id = 353;
+        notice.title = "Bitcoin price in September 2026".into();
+        notice.platforms[1] = "outcome".into();
+        notice.results[1] = PlaceResult {
+            platform: "outcome".into(),
+            label: "yes".into(),
+            market: "#12170".into(),
+            status: PlaceStatus::NoMatch,
+            message:
+                "Order could not immediately match against any resting orders. asset=100012170"
+                    .into(),
+        };
+        assert_eq!(
+            format_place_notice("【new-crypto】", &notice),
+            "🛒 【new-crypto】下单完成\n\
+             📋 orderId: 353\n\
+             📋 title: Bitcoin price in September 2026\n\
+             🏪 polymarket (rewards-45), outcome\n\
+             ✅ 成功: 1  ❌ 失败: 1\n\
+             ❌ 失败详情:\n\
+             - outcome label=yes market=#12170: Order could not immediately match against any resting orders. asset=100012170"
+        );
+    }
+
+    #[test]
     fn place_notice_escapes_title_and_errors() {
         let text = format_place_notice(
             "【market-arb】",
@@ -450,25 +510,25 @@ mod tests {
                 ],
             },
         );
-        assert!(text.starts_with("🛒 【market-arb】订单提交结果"));
+        assert!(text.starts_with("🛒 【market-arb】下单完成"));
         assert!(text.contains("📋 orderId: 27278"));
         assert!(text.contains("Real\\_Sociedad"));
-        assert!(text.contains("已受理: 1  明确拒绝: 1"));
-        assert!(text.contains("提交详情:"));
+        assert!(text.contains("✅ 成功: 1  ❌ 失败: 1"));
+        assert!(text.contains("❌ 失败详情:"));
         assert!(text.contains("polymarket (rewards-11)"));
-        assert!(text.contains("label=yes market=#12270: 明确拒绝；HTTP 429"));
+        assert!(!text.contains("- polymarket"));
+        assert!(text.contains("label=yes market=#12270: HTTP 429"));
         assert!(text.contains(r"bad\_request \*reason\* \[detail] \`code\`"));
         assert!(!text.contains("Real_Sociedad"));
     }
 
     #[test]
     fn place_notice_blank_messages_have_category_fallbacks() {
-        for status in [
-            PlaceStatus::Accepted,
-            PlaceStatus::Pending,
-            PlaceStatus::NoMatch,
-            PlaceStatus::Rejected,
-            PlaceStatus::ExecutionError,
+        for (status, label) in [
+            (PlaceStatus::Pending, "⏳ 待确认"),
+            (PlaceStatus::NoMatch, "❌ 失败"),
+            (PlaceStatus::Rejected, "❌ 失败"),
+            (PlaceStatus::ExecutionError, "⚠️ 执行异常"),
         ] {
             for message in ["", " \n\t "] {
                 let text = format_place_notice(
@@ -486,7 +546,7 @@ mod tests {
                         }],
                     },
                 );
-                assert!(text.contains(&format!("{}: 1", status.label())));
+                assert!(text.contains(&format!("{label}: 1")));
                 assert!(text.contains(status.fallback()));
                 assert!(text.contains(r"platform\_name label=\*yes\* market=\[market]"));
             }
