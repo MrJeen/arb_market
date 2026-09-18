@@ -12,8 +12,8 @@ use crate::hedge::{
     needs_rebalance, plan_hedge, HedgeSide,
 };
 use crate::notify::{
-    self, NatsNotifier, PlaceNotice, PlaceResult, PlaceStatus, SettlementNotice, TakeProfitCompletedNotice,
-    TakeProfitTriggerNotice,
+    self, NatsNotifier, PlaceNotice, PlaceResult, PlaceStatus, SettlementNotice,
+    TakeProfitCompletedNotice, TakeProfitTriggerNotice,
 };
 use crate::platforms::outcome::fees::FeeLookupError;
 use crate::platforms::outcome::{OutcomeFeeSnapshot, OutcomeVenue};
@@ -96,11 +96,15 @@ impl ActualsGateLog {
 
     #[cfg(test)]
     fn observe(&self, query: u64, unknown: i64, now: Instant) -> Option<ActualsGateEvent> {
-        self.observe_report(query, unknown, now).map(|report| report.event)
+        self.observe_report(query, unknown, now)
+            .map(|report| report.event)
     }
 
     fn observe_report(&self, query: u64, unknown: i64, now: Instant) -> Option<ActualsGateReport> {
-        let mut state = self.observation.lock().unwrap_or_else(|err| err.into_inner());
+        let mut state = self
+            .observation
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         // 序号在 SQL 开始前分配；旧查询晚返回不能覆盖较新的已完成观察。
         // 这里只决定日志，调用方始终用本次 SQL 结果执行风控。
         if query <= state.query {
@@ -128,7 +132,9 @@ impl ActualsGateLog {
             return None;
         };
         let report = ActualsGateReport {
-            observed_blocked_ms: now.saturating_duration_since(state.blocked_since.unwrap()).as_millis(),
+            observed_blocked_ms: now
+                .saturating_duration_since(state.blocked_since.unwrap())
+                .as_millis(),
             blocked_checks: state.blocked_checks,
             event,
         };
@@ -145,23 +151,34 @@ impl ActualsGateLog {
             stats.actuals_gate_blocked();
         }
         // observe_report 返回时已释放锁；锁内没有 await 或日志 I/O。
-        let Some(report) = self.observe_report(query, unknown, now) else { return };
+        let Some(report) = self.observe_report(query, unknown, now) else {
+            return;
+        };
         let observed_blocked_ms = report.observed_blocked_ms;
         let blocked_checks = report.blocked_checks;
         match report.event {
             ActualsGateEvent::Blocked => tracing::info!(
-                scope = "global", reason = "incomplete_actuals_projection",
-                unknown_orders = unknown, observed_blocked_ms, blocked_checks,
+                scope = "global",
+                reason = "incomplete_actuals_projection",
+                unknown_orders = unknown,
+                observed_blocked_ms,
+                blocked_checks,
                 "loss gate blocked by incomplete actuals projection"
             ),
             ActualsGateEvent::StillBlocked => tracing::warn!(
-                scope = "global", reason = "incomplete_actuals_projection",
-                unknown_orders = unknown, observed_blocked_ms, blocked_checks,
+                scope = "global",
+                reason = "incomplete_actuals_projection",
+                unknown_orders = unknown,
+                observed_blocked_ms,
+                blocked_checks,
                 "loss gate still blocked by incomplete actuals projection"
             ),
             ActualsGateEvent::Recovered => tracing::info!(
-                scope = "global", reason = "incomplete_actuals_projection",
-                unknown_orders = unknown, observed_blocked_ms, blocked_checks,
+                scope = "global",
+                reason = "incomplete_actuals_projection",
+                unknown_orders = unknown,
+                observed_blocked_ms,
+                blocked_checks,
                 "loss gate actuals projection completeness recovered"
             ),
         }
@@ -4015,30 +4032,46 @@ mod tests {
     use serde_json::json;
 
     fn place_notice_for_test(results: Vec<Result<SubmitResult>>) -> String {
-        notify::format_place_notice("【test】", &PlaceNotice {
-            order_id: 1,
-            title: "test".into(),
-            platforms: vec![],
-            results: results.into_iter().map(|result| {
-                place_result("platform".into(), "yes".into(), "market".into(), result)
-            }).collect(),
-        })
+        notify::format_place_notice(
+            "【test】",
+            &PlaceNotice {
+                order_id: 1,
+                title: "test".into(),
+                platforms: vec![],
+                results: results
+                    .into_iter()
+                    .map(|result| {
+                        place_result("platform".into(), "yes".into(), "market".into(), result)
+                    })
+                    .collect(),
+            },
+        )
     }
 
     #[test]
     fn place_notice_ack_and_delayed_unknown_are_not_failures() {
-        let parse = |status| crate::platforms::polymarket::parse_submit(
-            &json!({"success": true, "status": status, "orderID": "order", "errorMsg": ""}),
-            "hash".into(),
-            json!({"signature": "must-not-appear"}),
-        );
+        let parse = |status| {
+            crate::platforms::polymarket::parse_submit(
+                &json!({"success": true, "status": status, "orderID": "order", "errorMsg": ""}),
+                "hash".into(),
+                json!({"signature": "must-not-appear"}),
+            )
+        };
         let delayed = parse("delayed");
         assert!(matches!(&delayed, SubmitResult::Unknown { message, .. } if message.is_empty()));
         let text = place_notice_for_test(vec![Ok(parse("live")), Ok(delayed)]);
         assert!(text.contains("已受理: 1  待确认: 1"));
         assert!(text.contains("提交已受理，不代表已成交"));
         assert!(text.contains("待确认；提交结果待确认"));
-        for forbidden in ["失败", "明确拒绝", "未成交", "下单完成", "成功", "must-not-appear", "signature"] {
+        for forbidden in [
+            "失败",
+            "明确拒绝",
+            "未成交",
+            "下单完成",
+            "成功",
+            "must-not-appear",
+            "signature",
+        ] {
             assert!(!text.contains(forbidden), "unexpected {forbidden}");
         }
     }
@@ -4047,10 +4080,15 @@ mod tests {
     fn place_notice_distinguishes_no_match_rejection_and_execution_error() {
         let text = place_notice_for_test(vec![
             Ok(SubmitResult::NoMatch {
-                order_hash: "hash".into(), envelope: json!({}), message: " \n\t".into(),
+                order_hash: "hash".into(),
+                envelope: json!({}),
+                message: " \n\t".into(),
             }),
             Ok(SubmitResult::Failed {
-                order_hash: "hash".into(), envelope: json!({}), status: 400, message: " \n\t".into(),
+                order_hash: "hash".into(),
+                envelope: json!({}),
+                status: 400,
+                message: " \n\t".into(),
             }),
             Err(Error::msg("sensitive internal response")),
         ]);
@@ -4067,9 +4105,23 @@ mod tests {
     #[test]
     fn place_notice_preserves_and_escapes_nonempty_submit_messages() {
         for result in [
-            SubmitResult::Unknown { order_id: None, order_hash: "hash".into(), envelope: json!({}), message: "pending_reason *check*".into() },
-            SubmitResult::NoMatch { order_hash: "hash".into(), envelope: json!({}), message: "no_match *check*".into() },
-            SubmitResult::Failed { order_hash: "hash".into(), envelope: json!({}), status: 400, message: "bad_request *check*".into() },
+            SubmitResult::Unknown {
+                order_id: None,
+                order_hash: "hash".into(),
+                envelope: json!({}),
+                message: "pending_reason *check*".into(),
+            },
+            SubmitResult::NoMatch {
+                order_hash: "hash".into(),
+                envelope: json!({}),
+                message: "no_match *check*".into(),
+            },
+            SubmitResult::Failed {
+                order_hash: "hash".into(),
+                envelope: json!({}),
+                status: 400,
+                message: "bad_request *check*".into(),
+            },
         ] {
             let text = place_notice_for_test(vec![Ok(result)]);
             assert!(text.contains(r"\_"));
@@ -4083,7 +4135,11 @@ mod tests {
         let log = ActualsGateLog::default();
         let start = Instant::now();
         let observe = |unknown, millis| {
-            log.observe(log.begin_query(), unknown, start + Duration::from_millis(millis))
+            log.observe(
+                log.begin_query(),
+                unknown,
+                start + Duration::from_millis(millis),
+            )
         };
         assert_eq!(observe(0, 0), None);
         assert_eq!(observe(1, 1), Some(Blocked));
@@ -4117,7 +4173,9 @@ mod tests {
         assert_eq!(log.observe(log.begin_query(), 1, now), None);
         assert_eq!(log.observe(log.begin_query(), 0, now), Some(Recovered));
         assert!(log.observe_report(old_block, 1, now).is_none());
-        let next = log.observe_report(log.begin_query(), 1, now + Duration::from_secs(90)).unwrap();
+        let next = log
+            .observe_report(log.begin_query(), 1, now + Duration::from_secs(90))
+            .unwrap();
         assert_eq!(next.event, Blocked);
         assert_eq!(next.blocked_checks, 1);
         assert_eq!(next.observed_blocked_ms, 0);
@@ -4135,16 +4193,21 @@ mod tests {
         ] {
             let barrier = std::sync::Barrier::new(16);
             let events = std::thread::scope(|scope| {
-                let handles: Vec<_> = (0..16).map(|_| {
-                    let log = &log;
-                    let barrier = &barrier;
-                    scope.spawn(move || {
-                        let query = log.begin_query();
-                        barrier.wait();
-                        log.observe(query, unknown, start + Duration::from_secs(seconds))
+                let handles: Vec<_> = (0..16)
+                    .map(|_| {
+                        let log = &log;
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            let query = log.begin_query();
+                            barrier.wait();
+                            log.observe(query, unknown, start + Duration::from_secs(seconds))
+                        })
                     })
-                }).collect();
-                handles.into_iter().filter_map(|handle| handle.join().unwrap()).collect::<Vec<_>>()
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
             });
             assert_eq!(events, expected.into_iter().collect::<Vec<_>>());
         }
@@ -4167,9 +4230,12 @@ mod tests {
     fn actuals_gate_logs_levels_global_scope_and_counts_suppressed_blocks() {
         let buffer = GateLogBuffer::default();
         let writer = buffer.clone();
-        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
             .with_max_level(tracing::Level::DEBUG)
-            .with_writer(move || writer.clone()).finish();
+            .with_writer(move || writer.clone())
+            .finish();
         let stats = MinuteStats::new();
         tracing::subscriber::with_default(subscriber, || {
             let log = ActualsGateLog::default();
@@ -4189,22 +4255,36 @@ mod tests {
         assert_eq!(output.matches("scope=\"global\"").count(), 3);
         assert!(!output.contains("topic="));
         assert!(output.contains("completeness recovered"));
-        assert_eq!(output.matches("reason=\"incomplete_actuals_projection\"").count(), 3);
-        let recovered = output.lines().find(|line| line.contains("recovered")).unwrap();
+        assert_eq!(
+            output
+                .matches("reason=\"incomplete_actuals_projection\"")
+                .count(),
+            3
+        );
+        let recovered = output
+            .lines()
+            .find(|line| line.contains("recovered"))
+            .unwrap();
         assert!(recovered.contains("observed_blocked_ms=61000"));
         assert!(recovered.contains("blocked_checks=3"));
         assert!(recovered.contains("unknown_orders=0"));
         assert_eq!(stats.snapshot_and_reset().actuals_gate_blocked, 4);
-        assert_eq!(stats.snapshot_and_reset(), crate::stats::MinuteSnapshot::default());
+        assert_eq!(
+            stats.snapshot_and_reset(),
+            crate::stats::MinuteSnapshot::default()
+        );
     }
 
     #[test]
     fn submitted_pending_promotion_logs_debug_and_counts_legs() {
         let buffer = GateLogBuffer::default();
         let writer = buffer.clone();
-        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
             .with_max_level(tracing::Level::DEBUG)
-            .with_writer(move || writer.clone()).finish();
+            .with_writer(move || writer.clone())
+            .finish();
         let stats = MinuteStats::new();
         tracing::subscriber::with_default(subscriber, || {
             record_submitted_pending_promoted(&stats, 0);
@@ -4218,7 +4298,10 @@ mod tests {
         assert_eq!(output.matches("reason=\"pending_after_submit\"").count(), 2);
         assert!(!output.contains("WARN"));
         assert_eq!(stats.snapshot_and_reset().submitted_pending_promoted, 5);
-        assert_eq!(stats.snapshot_and_reset(), crate::stats::MinuteSnapshot::default());
+        assert_eq!(
+            stats.snapshot_and_reset(),
+            crate::stats::MinuteSnapshot::default()
+        );
     }
 
     fn d(s: &str) -> Decimal {

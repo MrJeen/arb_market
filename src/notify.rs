@@ -471,18 +471,21 @@ mod tests {
             PlaceStatus::ExecutionError,
         ] {
             for message in ["", " \n\t "] {
-                let text = format_place_notice("【cat】", &PlaceNotice {
-                    order_id: 1,
-                    title: "test".into(),
-                    platforms: vec!["platform_name".into()],
-                    results: vec![PlaceResult {
-                        platform: "platform_name".into(),
-                        label: "*yes*".into(),
-                        market: "[market]".into(),
-                        status,
-                        message: message.into(),
-                    }],
-                });
+                let text = format_place_notice(
+                    "【cat】",
+                    &PlaceNotice {
+                        order_id: 1,
+                        title: "test".into(),
+                        platforms: vec!["platform_name".into()],
+                        results: vec![PlaceResult {
+                            platform: "platform_name".into(),
+                            label: "*yes*".into(),
+                            market: "[market]".into(),
+                            status,
+                            message: message.into(),
+                        }],
+                    },
+                );
                 assert!(text.contains(&format!("{}: 1", status.label())));
                 assert!(text.contains(status.fallback()));
                 assert!(text.contains(r"platform\_name label=\*yes\* market=\[market]"));

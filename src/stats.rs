@@ -284,7 +284,8 @@ impl MinuteStats {
 
     pub fn add_submitted_pending_promoted(&self, n: u64) {
         if n > 0 {
-            self.submitted_pending_promoted.fetch_add(n, Ordering::Relaxed);
+            self.submitted_pending_promoted
+                .fetch_add(n, Ordering::Relaxed);
         }
     }
 

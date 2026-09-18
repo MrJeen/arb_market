@@ -131,7 +131,10 @@ impl BookUpdate {
 }
 
 // 两侧已排序；首个不同索引同时保留价格和数量，涵盖插入/删除及重复价位。
-fn first_level_diff<'a>(current: &'a [Level], incoming: &'a [Level]) -> Option<(usize, Option<&'a Level>, Option<&'a Level>)> {
+fn first_level_diff<'a>(
+    current: &'a [Level],
+    incoming: &'a [Level],
+) -> Option<(usize, Option<&'a Level>, Option<&'a Level>)> {
     (0..current.len().max(incoming.len())).find_map(|index| {
         let (current, incoming) = (current.get(index), incoming.get(index));
         (current != incoming).then_some((index, current, incoming))
@@ -240,14 +243,19 @@ impl BookStore {
             .get(key)
             .map(|book| ("current", book))
             .into_iter()
-            .chain(self.sync.get(key).and_then(|state| state.rest.as_ref())
-                .map(|book| ("rest_candidate", book)))
+            .chain(
+                self.sync
+                    .get(key)
+                    .and_then(|state| state.rest.as_ref())
+                    .map(|book| ("rest_candidate", book)),
+            )
         {
             if ts < prior.exchange_ts_ms {
                 return Err(BookReject::OlderTimestamp);
             }
             // PM WS 全量按接收顺序整体覆盖；REST 与 Outcome 仍拒绝同毫秒深度冲突。
-            if ts == prior.exchange_ts_ms && (bids != prior.bids || asks != prior.asks)
+            if ts == prior.exchange_ts_ms
+                && (bids != prior.bids || asks != prior.asks)
                 && !(key.platform == POLYMARKET && event == "ws_snapshot")
             {
                 // 只在 debug 开启时扫描到首个差异；不序列化完整盘口。
@@ -306,18 +314,27 @@ impl BookStore {
             return self.invalidate_ws(platform, token_id, BookReject::InvalidPayload);
         }
         sort_levels(&mut bids, &mut asks);
-        if let Err(reason) = self.snapshot_conflict(&key, &bids, &asks, exchange_ts_ms, "ws_snapshot") {
+        if let Err(reason) =
+            self.snapshot_conflict(&key, &bids, &asks, exchange_ts_ms, "ws_snapshot")
+        {
             // 盘口与 tick 均预检完才提交；坏快照不能借携带的新 tick 改写观察高水位。
             if reason == BookReject::TimestampConflict {
-                return self.invalidate_ws_event(platform, token_id, reason, "ws_snapshot", Some(exchange_ts_ms));
+                return self.invalidate_ws_event(
+                    platform,
+                    token_id,
+                    reason,
+                    "ws_snapshot",
+                    Some(exchange_ts_ms),
+                );
             }
             return BookUpdate::Rejected(reason);
         }
         let epoch = self.epochs.get(platform).copied().unwrap_or(0);
-        if platform != POLYMARKET && self
-            .books
-            .get(&key)
-            .is_some_and(|book| book.stale && book.exchange_ts_ms == exchange_ts_ms)
+        if platform != POLYMARKET
+            && self
+                .books
+                .get(&key)
+                .is_some_and(|book| book.stale && book.exchange_ts_ms == exchange_ts_ms)
             && self
                 .sync
                 .get(&key)
@@ -331,7 +348,8 @@ impl BookStore {
                 "book timestamp conflict");
             return BookUpdate::Rejected(BookReject::TimestampConflict);
         }
-        let tick_changed = match self.check_snapshot_tick(&key, tick, exchange_ts_ms, "ws_snapshot") {
+        let tick_changed = match self.check_snapshot_tick(&key, tick, exchange_ts_ms, "ws_snapshot")
+        {
             Ok(changed) => changed,
             Err(reason) => return BookUpdate::Rejected(reason),
         };
@@ -376,7 +394,10 @@ impl BookStore {
         state.source = Some(BookSource::Ws);
         // 同毫秒 WS 全量可接管基线，但不能消除 REST 与后续 delta 的排序歧义。
         // 仅严格更新的全量清除边界；no-op 路径继续保留边界和来源。
-        if state.rest_boundary.is_some_and(|boundary| exchange_ts_ms > boundary) {
+        if state
+            .rest_boundary
+            .is_some_and(|boundary| exchange_ts_ms > boundary)
+        {
             state.rest_boundary = None;
         }
         if restored {
@@ -427,20 +448,34 @@ impl BookStore {
             .max()
             .unwrap_or(0);
         if exchange_ts_ms < high {
-            return self.invalidate_ws_event(platform, token_id, BookReject::OlderTimestamp, "ws_delta", Some(exchange_ts_ms));
+            return self.invalidate_ws_event(
+                platform,
+                token_id,
+                BookReject::OlderTimestamp,
+                "ws_delta",
+                Some(exchange_ts_ms),
+            );
         }
-        let rest_observed = self.sync.get(&key).is_some_and(|state| state.rest_version.is_some());
+        let rest_observed = self
+            .sync
+            .get(&key)
+            .is_some_and(|state| state.rest_version.is_some());
         // 先归并再预检，拒绝歧义批次时不能局部提交或借 no-op 消除 REST 边界。
         let mut final_updates = HashMap::new();
         for &(is_bid, price, size) in updates {
             final_updates.insert((is_bid, price), size);
         }
         if platform == POLYMARKET
-            && self.sync.get(&key).is_some_and(|state| state.rest_boundary == Some(exchange_ts_ms))
+            && self
+                .sync
+                .get(&key)
+                .is_some_and(|state| state.rest_boundary == Some(exchange_ts_ms))
             && self.books.get(&key).is_some_and(|book| {
                 final_updates.iter().any(|(&(is_bid, price), &size)| {
                     let levels = if is_bid { &book.bids } else { &book.asks };
-                    levels.iter().find(|level| level.price == price)
+                    levels
+                        .iter()
+                        .find(|level| level.price == price)
                         .map_or(!size.is_zero(), |level| level.size != size)
                 })
             })
@@ -450,9 +485,16 @@ impl BookStore {
                 let state = self.sync.get(&key).unwrap();
                 let diff = final_updates.iter().find_map(|(&(is_bid, price), &size)| {
                     let levels = if is_bid { &book.bids } else { &book.asks };
-                    let current = levels.iter().find(|level| level.price == price)
+                    let current = levels
+                        .iter()
+                        .find(|level| level.price == price)
                         .map_or(Decimal::ZERO, |level| level.size);
-                    (current != size).then_some((if is_bid { "bid" } else { "ask" }, price, current, size))
+                    (current != size).then_some((
+                        if is_bid { "bid" } else { "ask" },
+                        price,
+                        current,
+                        size,
+                    ))
                 });
                 if let Some((side, price, current_size, incoming_size)) = diff {
                     tracing::debug!(platform, token = token_id, event = "ws_delta", source = "ws",
@@ -464,7 +506,13 @@ impl BookStore {
                         "book timestamp conflict");
                 }
             }
-            return self.invalidate_ws_event(platform, token_id, BookReject::TimestampConflict, "ws_delta", Some(exchange_ts_ms));
+            return self.invalidate_ws_event(
+                platform,
+                token_id,
+                BookReject::TimestampConflict,
+                "ws_delta",
+                Some(exchange_ts_ms),
+            );
         }
         let book = self
             .books
@@ -617,7 +665,13 @@ impl BookStore {
         }
     }
 
-    fn conflict_tick(&mut self, key: &TokenBookKey, event: &'static str, incoming_exchange_ts_ms: i64, incoming_tick: Decimal) {
+    fn conflict_tick(
+        &mut self,
+        key: &TokenBookKey,
+        event: &'static str,
+        incoming_exchange_ts_ms: i64,
+        incoming_tick: Decimal,
+    ) {
         let Some(tick) = self.sync.get_mut(key).and_then(|state| state.tick.as_mut()) else {
             return;
         };
@@ -677,7 +731,7 @@ impl BookStore {
                     self.changed(&key);
                 }
                 BookUpdate::VerifiedUnchanged
-            },
+            }
             Err(reason) => BookUpdate::Rejected(reason),
         }
     }
@@ -707,8 +761,12 @@ impl BookStore {
     }
 
     fn invalidate_ws_event(
-        &mut self, platform: &str, token_id: &str, reason: BookReject,
-        event: &'static str, incoming_exchange_ts_ms: Option<i64>,
+        &mut self,
+        platform: &str,
+        token_id: &str,
+        reason: BookReject,
+        event: &'static str,
+        incoming_exchange_ts_ms: Option<i64>,
     ) -> BookUpdate {
         let key = TokenBookKey::new(platform, token_id);
         let state = self.sync.get(&key);
@@ -782,7 +840,8 @@ impl BookStore {
             }
             sort_levels(&mut bids, &mut asks);
             self.snapshot_conflict(&ticket.key, &bids, &asks, exchange_ts_ms, "rest_snapshot")?;
-            let tick_changed = self.check_snapshot_tick(&ticket.key, tick, exchange_ts_ms, "rest_snapshot")?;
+            let tick_changed =
+                self.check_snapshot_tick(&ticket.key, tick, exchange_ts_ms, "rest_snapshot")?;
             if tick_changed {
                 self.commit_tick(&ticket.key, tick.unwrap(), Some(exchange_ts_ms));
             }
@@ -857,7 +916,11 @@ impl BookStore {
         let key = TokenBookKey::new(platform, token_id);
         let ws = self.books.get(&key);
         if platform == POLYMARKET {
-            let source = self.sync.get(&key).and_then(|state| state.source).unwrap_or(BookSource::Ws);
+            let source = self
+                .sync
+                .get(&key)
+                .and_then(|state| state.source)
+                .unwrap_or(BookSource::Ws);
             return ws.map(|book| (book, source));
         }
         if ws.is_some_and(|book| book.is_fresh(self.max_age, now)) {
@@ -1464,8 +1527,10 @@ mod tests {
             }
             for ts in [99, 100] {
                 if ts < 100 {
-                    assert_eq!(store.replace_snapshot(POLYMARKET, "t", vec![], asks("3"), ts, now),
-                        BookUpdate::Rejected(BookReject::OlderTimestamp));
+                    assert_eq!(
+                        store.replace_snapshot(POLYMARKET, "t", vec![], asks("3"), ts, now),
+                        BookUpdate::Rejected(BookReject::OlderTimestamp)
+                    );
                 }
                 let ticket = store.begin_rest(POLYMARKET, "t");
                 assert!(store
@@ -1489,24 +1554,61 @@ mod tests {
             let later = now + Duration::from_secs(6);
             let mut store = BookStore::default();
             store.replace_snapshot(POLYMARKET, "t", asks("8"), asks("3"), 100, now);
-            for (bids, incoming_asks) in [(asks("7"), asks("4")), (vec![], asks("4")), (vec![], vec![])] {
+            for (bids, incoming_asks) in [
+                (asks("7"), asks("4")),
+                (vec![], asks("4")),
+                (vec![], vec![]),
+            ] {
                 if stale {
                     store.invalidate_ws(POLYMARKET, "t", BookReject::InvalidPayload);
                 }
                 let ticket = store.begin_rest(POLYMARKET, "t");
-                assert_eq!(store.replace_snapshot(POLYMARKET, "t", bids.clone(), incoming_asks.clone(), 100, later), BookUpdate::Applied);
+                assert_eq!(
+                    store.replace_snapshot(
+                        POLYMARKET,
+                        "t",
+                        bids.clone(),
+                        incoming_asks.clone(),
+                        100,
+                        later
+                    ),
+                    BookUpdate::Applied
+                );
                 let book = store.get(POLYMARKET, "t").unwrap();
                 assert_eq!(book.bids, bids);
                 assert_eq!(book.asks, incoming_asks);
                 assert!(!book.stale);
                 assert_eq!(book.received_at, later);
-                assert_eq!(store.accept_rest(&ticket, vec![], asks("9"), 200, later, None).unwrap_err(), BookReject::RevisionChanged);
+                assert_eq!(
+                    store
+                        .accept_rest(&ticket, vec![], asks("9"), 200, later, None)
+                        .unwrap_err(),
+                    BookReject::RevisionChanged
+                );
                 let ticket = store.begin_rest(POLYMARKET, "t");
                 let duplicate_at = later + Duration::from_secs(6);
-                assert_eq!(store.replace_snapshot(POLYMARKET, "t", bids.clone(), incoming_asks.clone(), 100, duplicate_at), BookUpdate::VerifiedUnchanged);
+                assert_eq!(
+                    store.replace_snapshot(
+                        POLYMARKET,
+                        "t",
+                        bids.clone(),
+                        incoming_asks.clone(),
+                        100,
+                        duplicate_at
+                    ),
+                    BookUpdate::VerifiedUnchanged
+                );
                 assert_eq!(store.get(POLYMARKET, "t").unwrap().received_at, later);
-                assert_eq!(store.accept_rest(&ticket, vec![], asks("9"), 200, duplicate_at, None).unwrap_err(), BookReject::RevisionChanged);
-                assert_eq!(store.replace_snapshot(POLYMARKET, "t", asks("9"), asks("9"), 99, duplicate_at), BookUpdate::Rejected(BookReject::OlderTimestamp));
+                assert_eq!(
+                    store
+                        .accept_rest(&ticket, vec![], asks("9"), 200, duplicate_at, None)
+                        .unwrap_err(),
+                    BookReject::RevisionChanged
+                );
+                assert_eq!(
+                    store.replace_snapshot(POLYMARKET, "t", asks("9"), asks("9"), 99, duplicate_at),
+                    BookUpdate::Rejected(BookReject::OlderTimestamp)
+                );
                 assert_eq!(store.get(POLYMARKET, "t").unwrap().bids, bids);
                 assert_eq!(store.get(POLYMARKET, "t").unwrap().asks, incoming_asks);
             }
@@ -1519,23 +1621,57 @@ mod tests {
             let now = Instant::now();
             let mut store = BookStore::default();
             let ticket = store.begin_rest(POLYMARKET, "t");
-            store.accept_rest(&ticket, asks("8"), asks("3"), 100, now, None).unwrap();
+            store
+                .accept_rest(&ticket, asks("8"), asks("3"), 100, now, None)
+                .unwrap();
             if stale {
                 store.invalidate_ws(POLYMARKET, "t", BookReject::InvalidPayload);
             }
-            assert_eq!(store.replace_snapshot(POLYMARKET, "t", vec![], asks("4"), 100, now), BookUpdate::Applied);
-            assert_eq!(store.get_with_source(POLYMARKET, "t").unwrap().1, BookSource::Ws);
-            assert_eq!(store.sync.get(&ticket.key).unwrap().rest_boundary, Some(100));
+            assert_eq!(
+                store.replace_snapshot(POLYMARKET, "t", vec![], asks("4"), 100, now),
+                BookUpdate::Applied
+            );
+            assert_eq!(
+                store.get_with_source(POLYMARKET, "t").unwrap().1,
+                BookSource::Ws
+            );
+            assert_eq!(
+                store.sync.get(&ticket.key).unwrap().rest_boundary,
+                Some(100)
+            );
             let ticket = store.begin_rest(POLYMARKET, "t");
-            assert_eq!(store.accept_rest(&ticket, vec![], asks("3"), 100, now, None).unwrap_err(), BookReject::TimestampConflict);
-            assert_eq!(store.apply_levels(POLYMARKET, "t", &[(false, d("0.5"), d("4"))], 100, now), BookUpdate::VerifiedUnchanged);
-            assert_eq!(store.apply_levels(POLYMARKET, "t", &[(true, d("0.4"), d("2")), (false, d("0.5"), d("0"))], 100, now), BookUpdate::Rejected(BookReject::TimestampConflict));
+            assert_eq!(
+                store
+                    .accept_rest(&ticket, vec![], asks("3"), 100, now, None)
+                    .unwrap_err(),
+                BookReject::TimestampConflict
+            );
+            assert_eq!(
+                store.apply_levels(POLYMARKET, "t", &[(false, d("0.5"), d("4"))], 100, now),
+                BookUpdate::VerifiedUnchanged
+            );
+            assert_eq!(
+                store.apply_levels(
+                    POLYMARKET,
+                    "t",
+                    &[(true, d("0.4"), d("2")), (false, d("0.5"), d("0"))],
+                    100,
+                    now
+                ),
+                BookUpdate::Rejected(BookReject::TimestampConflict)
+            );
             let book = store.get(POLYMARKET, "t").unwrap();
             assert!(book.stale && book.bids.is_empty());
             assert_eq!(book.asks, asks("4"));
-            assert_eq!(store.replace_snapshot(POLYMARKET, "t", vec![], vec![], 101, now), BookUpdate::Applied);
+            assert_eq!(
+                store.replace_snapshot(POLYMARKET, "t", vec![], vec![], 101, now),
+                BookUpdate::Applied
+            );
             assert_eq!(store.sync.get(&ticket.key).unwrap().rest_boundary, None);
-            assert_eq!(store.apply_levels(POLYMARKET, "t", &[(false, d("0.5"), d("2"))], 101, now), BookUpdate::Applied);
+            assert_eq!(
+                store.apply_levels(POLYMARKET, "t", &[(false, d("0.5"), d("2"))], 101, now),
+                BookUpdate::Applied
+            );
         }
     }
 
@@ -1545,11 +1681,30 @@ mod tests {
             let now = Instant::now();
             let later = now + Duration::from_secs(6);
             let mut store = BookStore::default();
-            store.replace_snapshot_with_tick(POLYMARKET, "t", asks("8"), asks("3"), 100, now, Some(d("0.01")));
+            store.replace_snapshot_with_tick(
+                POLYMARKET,
+                "t",
+                asks("8"),
+                asks("3"),
+                100,
+                now,
+                Some(d("0.01")),
+            );
             if stale {
                 store.invalidate_ws(POLYMARKET, "t", BookReject::InvalidPayload);
             }
-            assert_eq!(store.replace_snapshot_with_tick(POLYMARKET, "t", vec![], asks("4"), 100, later, Some(d("0.001"))), BookUpdate::Rejected(BookReject::TimestampConflict));
+            assert_eq!(
+                store.replace_snapshot_with_tick(
+                    POLYMARKET,
+                    "t",
+                    vec![],
+                    asks("4"),
+                    100,
+                    later,
+                    Some(d("0.001"))
+                ),
+                BookUpdate::Rejected(BookReject::TimestampConflict)
+            );
             let book = store.get(POLYMARKET, "t").unwrap();
             assert_eq!(book.bids, asks("8"));
             assert_eq!(book.asks, asks("3"));
@@ -1557,7 +1712,18 @@ mod tests {
             assert_eq!(book.stale, stale);
             assert_eq!(book.tick_size, None);
             // 冲突 tick 的不可信状态不能被同时间戳全量夹带恢复。
-            assert_eq!(store.replace_snapshot_with_tick(POLYMARKET, "t", vec![], asks("4"), 100, later, Some(d("0.01"))), BookUpdate::Rejected(BookReject::TimestampConflict));
+            assert_eq!(
+                store.replace_snapshot_with_tick(
+                    POLYMARKET,
+                    "t",
+                    vec![],
+                    asks("4"),
+                    100,
+                    later,
+                    Some(d("0.01"))
+                ),
+                BookUpdate::Rejected(BookReject::TimestampConflict)
+            );
         }
     }
 
@@ -1566,12 +1732,21 @@ mod tests {
         let now = Instant::now();
         let mut store = BookStore::default();
         store.replace_snapshot(OUTCOME, "t", vec![], asks("3"), 100, now);
-        assert_eq!(store.replace_snapshot(OUTCOME, "t", vec![], asks("4"), 100, now), BookUpdate::Rejected(BookReject::TimestampConflict));
+        assert_eq!(
+            store.replace_snapshot(OUTCOME, "t", vec![], asks("4"), 100, now),
+            BookUpdate::Rejected(BookReject::TimestampConflict)
+        );
         assert!(store.get(OUTCOME, "t").unwrap().stale);
         assert_eq!(store.get(OUTCOME, "t").unwrap().asks, asks("3"));
-        assert_eq!(store.replace_snapshot(OUTCOME, "t", vec![], asks("3"), 100, now), BookUpdate::Rejected(BookReject::TimestampConflict));
+        assert_eq!(
+            store.replace_snapshot(OUTCOME, "t", vec![], asks("3"), 100, now),
+            BookUpdate::Rejected(BookReject::TimestampConflict)
+        );
         store.begin_platform_connection(OUTCOME);
-        assert_eq!(store.replace_snapshot(OUTCOME, "t", vec![], asks("3"), 100, now), BookUpdate::Applied);
+        assert_eq!(
+            store.replace_snapshot(OUTCOME, "t", vec![], asks("3"), 100, now),
+            BookUpdate::Applied
+        );
     }
 
     #[test]
@@ -1688,11 +1863,24 @@ mod tests {
         store.replace_snapshot(POLYMARKET, "t", asks("8"), asks("9"), 90, now);
         store.mark_platform_stale(POLYMARKET);
         let ticket = store.begin_rest(POLYMARKET, "t");
-        store.accept_rest(&ticket, vec![], asks("3"), 100, now, None).unwrap();
+        store
+            .accept_rest(&ticket, vec![], asks("3"), 100, now, None)
+            .unwrap();
         assert!(store.sync.get(&ticket.key).unwrap().rest.is_none());
-        assert_eq!(store.get_with_source(POLYMARKET, "t").unwrap().1, BookSource::Rest);
+        assert_eq!(
+            store.get_with_source(POLYMARKET, "t").unwrap().1,
+            BookSource::Rest
+        );
         for ts in 101..105 {
-            assert!(store.apply_levels(POLYMARKET, "t", &[(true, d("0.4"), Decimal::from(ts))], ts, now).is_applied());
+            assert!(store
+                .apply_levels(
+                    POLYMARKET,
+                    "t",
+                    &[(true, d("0.4"), Decimal::from(ts))],
+                    ts,
+                    now
+                )
+                .is_applied());
             let (book, source) = store.get_with_source(POLYMARKET, "t").unwrap();
             assert!(!book.stale);
             assert_eq!(book.asks, asks("3"));
@@ -1701,10 +1889,17 @@ mod tests {
         }
         // 旧 REST 副本不能否决已沿 WS 顺序演进后的同毫秒全量或 tick。
         let book = store.get(POLYMARKET, "t").unwrap().clone();
-        assert_eq!(store.replace_snapshot(POLYMARKET, "t", book.bids, book.asks, 104, now), BookUpdate::VerifiedUnchanged);
-        assert!(store.set_tick_size_at(POLYMARKET, "t", d("0.01"), 104).is_applied());
+        assert_eq!(
+            store.replace_snapshot(POLYMARKET, "t", book.bids, book.asks, 104, now),
+            BookUpdate::VerifiedUnchanged
+        );
+        assert!(store
+            .set_tick_size_at(POLYMARKET, "t", d("0.01"), 104)
+            .is_applied());
         let ticket = store.begin_rest(POLYMARKET, "t");
-        store.accept_rest(&ticket, vec![], vec![], 105, now, None).unwrap();
+        store
+            .accept_rest(&ticket, vec![], vec![], 105, now, None)
+            .unwrap();
         let book = store.get(POLYMARKET, "t").unwrap();
         assert!(!book.stale && book.bids.is_empty() && book.asks.is_empty());
         store.apply_levels(POLYMARKET, "t", &[(true, d("0.4"), d("1"))], 106, now);
@@ -1718,7 +1913,9 @@ mod tests {
         for observation in 0..4 {
             let mut store = BookStore::default();
             let initial = store.begin_rest(POLYMARKET, "t");
-            store.accept_rest(&initial, vec![], asks("3"), 100, now, Some(d("0.01"))).unwrap();
+            store
+                .accept_rest(&initial, vec![], asks("3"), 100, now, Some(d("0.01")))
+                .unwrap();
             let ticket = store.begin_rest(POLYMARKET, "t");
             let update = match observation {
                 0 => store.apply_levels(POLYMARKET, "t", &[(false, d("0.5"), d("3"))], 100, later),
@@ -1727,21 +1924,37 @@ mod tests {
                 _ => store.set_tick_size_at(POLYMARKET, "t", d("0.01"), 100),
             };
             assert_eq!(update, BookUpdate::VerifiedUnchanged);
-            assert_eq!(store.accept_rest(&ticket, vec![], asks("4"), 200, later, None).unwrap_err(), BookReject::RevisionChanged);
+            assert_eq!(
+                store
+                    .accept_rest(&ticket, vec![], asks("4"), 200, later, None)
+                    .unwrap_err(),
+                BookReject::RevisionChanged
+            );
             let (book, source) = store.get_with_source_at(POLYMARKET, "t", later).unwrap();
             assert_eq!(source, BookSource::Rest);
             assert_eq!(book.received_at, now);
             assert!(!book.is_fresh(Duration::from_secs(5), later));
             assert_eq!(book.asks, asks("3"));
             // 任意 no-op 都不能解除 REST 的同毫秒跨源边界。
-            assert_eq!(store.apply_levels(POLYMARKET, "t", &[(false, d("0.5"), d("0"))], 100, later), BookUpdate::Rejected(BookReject::TimestampConflict));
+            assert_eq!(
+                store.apply_levels(POLYMARKET, "t", &[(false, d("0.5"), d("0"))], 100, later),
+                BookUpdate::Rejected(BookReject::TimestampConflict)
+            );
             assert!(store.get(POLYMARKET, "t").unwrap().stale);
             assert_eq!(store.get(POLYMARKET, "t").unwrap().asks, asks("3"));
-            assert_eq!(store.replace_snapshot(POLYMARKET, "t", vec![], asks("3"), 100, later), BookUpdate::Applied);
+            assert_eq!(
+                store.replace_snapshot(POLYMARKET, "t", vec![], asks("3"), 100, later),
+                BookUpdate::Applied
+            );
             assert_eq!(store.get(POLYMARKET, "t").unwrap().received_at, later);
-            assert_eq!(store.apply_levels(POLYMARKET, "t", &[(false, d("0.5"), d("0"))], 100, later), BookUpdate::Rejected(BookReject::TimestampConflict));
+            assert_eq!(
+                store.apply_levels(POLYMARKET, "t", &[(false, d("0.5"), d("0"))], 100, later),
+                BookUpdate::Rejected(BookReject::TimestampConflict)
+            );
             store.begin_platform_connection(POLYMARKET);
-            assert!(store.replace_snapshot(POLYMARKET, "t", vec![], asks("3"), 100, later).is_applied());
+            assert!(store
+                .replace_snapshot(POLYMARKET, "t", vec![], asks("3"), 100, later)
+                .is_applied());
         }
     }
 
@@ -1752,10 +1965,18 @@ mod tests {
         let ticket = store.begin_rest(POLYMARKET, "t");
         store.replace_snapshot(POLYMARKET, "other", vec![], asks("2"), 200, now);
         store.apply_levels(POLYMARKET, "t", &[], 100, now);
-        store.accept_rest(&ticket, vec![], asks("3"), 100, now, None).unwrap();
-        assert_eq!(store.apply_levels(POLYMARKET, "t", &[(false, d("0.5"), d("3"))], 99, now), BookUpdate::Rejected(BookReject::OlderTimestamp));
+        store
+            .accept_rest(&ticket, vec![], asks("3"), 100, now, None)
+            .unwrap();
+        assert_eq!(
+            store.apply_levels(POLYMARKET, "t", &[(false, d("0.5"), d("3"))], 99, now),
+            BookUpdate::Rejected(BookReject::OlderTimestamp)
+        );
         assert!(store.get(POLYMARKET, "t").unwrap().stale);
-        assert_eq!(store.replace_snapshot(POLYMARKET, "t", vec![], asks("3"), 99, now), BookUpdate::Rejected(BookReject::OlderTimestamp));
+        assert_eq!(
+            store.replace_snapshot(POLYMARKET, "t", vec![], asks("3"), 99, now),
+            BookUpdate::Rejected(BookReject::OlderTimestamp)
+        );
     }
 
     #[test]
@@ -1818,10 +2039,7 @@ mod tests {
         store
             .accept_rest(&ticket, vec![], asks("4"), 101, later, None)
             .unwrap();
-        assert_eq!(
-            store.get_at(OUTCOME, "t", later).unwrap().asks,
-            asks("3")
-        );
+        assert_eq!(store.get_at(OUTCOME, "t", later).unwrap().asks, asks("3"));
         assert_eq!(
             store
                 .get_at(OUTCOME, "t", now + Duration::from_secs(6))
@@ -1834,11 +2052,7 @@ mod tests {
             .unwrap()
             .is_fresh(Duration::from_secs(5), now + Duration::from_secs(10)));
         store.apply_levels(OUTCOME, "t", &[(false, d("0.5"), d("0"))], 101, later);
-        assert!(store
-            .get_at(OUTCOME, "t", later)
-            .unwrap()
-            .asks
-            .is_empty());
+        assert!(store.get_at(OUTCOME, "t", later).unwrap().asks.is_empty());
     }
 
     #[test]
@@ -1850,10 +2064,7 @@ mod tests {
         let assert_selected = |store: &BookStore, at, expected| {
             let (book, source) = store.get_with_source_at(OUTCOME, "t", at).unwrap();
             assert_eq!(source, expected);
-            assert!(std::ptr::eq(
-                book,
-                store.get_at(OUTCOME, "t", at).unwrap()
-            ));
+            assert!(std::ptr::eq(book, store.get_at(OUTCOME, "t", at).unwrap()));
             let stored = match source {
                 BookSource::Ws => store.books.get(&key).unwrap(),
                 BookSource::Rest => store.sync.get(&key).unwrap().rest.as_ref().unwrap(),
