@@ -16,6 +16,8 @@ pub enum Error {
     NoOpportunity,
     #[error("order capacity reached")]
     OrderCapacityReached,
+    #[error("topic has an executing order or unfinished rebalance")]
+    OrderTopicBlocked,
     #[error("order confirmation expired before admission")]
     OrderConfirmationExpired,
     #[error("http {status}: {message}")]

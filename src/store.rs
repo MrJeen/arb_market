@@ -119,6 +119,32 @@ impl NewLeg<'_> {
     }
 }
 
+// 前置筛选与锁内建单复查使用同一口径；已结束管理的历史订单不再等待再平衡。
+async fn topic_admission_blocked<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+    key: TopicKey,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM arb_orders
+            WHERE event_id = $1 AND unified_index = $2
+              AND (
+                status IN ('pending','actived')
+                OR (
+                    status = 'completed'
+                    AND rebalance_status <> 'completed'
+                    AND settled_at IS NULL
+                    AND position_status IN ('watching','settlement_pending')
+                )
+              )
+        )",
+    )
+    .bind(key.event_id)
+    .bind(key.unified_index)
+    .fetch_one(executor)
+    .await?)
+}
+
 impl Store {
     pub async fn connect(uri: &str) -> Result<Self> {
         let pool = PgPoolOptions::new().max_connections(8).connect(uri).await?;
@@ -133,18 +159,9 @@ impl Store {
         Ok(())
     }
 
+    /// 同市场仍在执行或尚未完成再平衡的在管订单都会阻止新套利。
     pub async fn has_active_topic(&self, key: TopicKey) -> Result<bool> {
-        let exists: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM arb_orders
-             WHERE event_id = $1 AND unified_index = $2
-               AND status IN ('pending','actived')
-             LIMIT 1",
-        )
-        .bind(key.event_id)
-        .bind(key.unified_index)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(exists.is_some())
+        topic_admission_blocked(&self.pool, key).await
     }
 
     /// 父单、市场标识与初始交易腿必须一次落库并直接进入 `actived`。
@@ -217,6 +234,9 @@ impl Store {
                 if count as u64 >= max_active_orders as u64 {
                     return Err(Error::OrderCapacityReached);
                 }
+            }
+            if topic_admission_blocked(&mut *tx, key).await? {
+                return Err(Error::OrderTopicBlocked);
             }
             Ok::<_, Error>(())
         }

@@ -843,6 +843,11 @@ impl Engine {
                 tracing::info!(topic = %topic.key.as_str(), limit = self.cfg.max_active_orders, "order admission capacity reached");
                 return Ok(());
             }
+            Err(Error::OrderTopicBlocked) => {
+                self.stats.active_topic();
+                tracing::info!(topic = %topic.key.as_str(), "order admission blocked by executing order or unfinished rebalance");
+                return Ok(());
+            }
             Err(Error::OrderConfirmationExpired) => {
                 tracing::info!(topic = %topic.key.as_str(), "order confirmation expired while awaiting admission");
                 return Ok(());

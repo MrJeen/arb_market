@@ -2651,6 +2651,135 @@ async fn admission_order(
         .await
 }
 
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn admission_waits_for_rebalance_and_releases_after_zero_fill_cancel() {
+    use market_arb::error::Error;
+    use std::time::{Duration, Instant};
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let exercised: Result<()> = async {
+        fixture.store.migrate().await?;
+        let key = TopicKey::new(Uuid::new_v4(), 0);
+        let previous: i64 = sqlx::query_scalar(
+            "INSERT INTO arb_orders(event_id,unified_index,status) VALUES ($1,$2,'completed') RETURNING id",
+        )
+        .bind(key.event_id)
+        .bind(key.unified_index)
+        .fetch_one(&fixture.store.pool)
+        .await?;
+        let deadline = || Instant::now() + Duration::from_secs(30);
+        for status in ["pending", "actived"] {
+            // An old completion timestamp must not bypass the current rebalance state.
+            sqlx::query("UPDATE arb_orders SET rebalance_status=$2,rebalanced_at=NOW() WHERE id=$1")
+                .bind(previous)
+                .bind(status)
+                .execute(&fixture.store.pool)
+                .await?;
+            ensure!(fixture.store.has_active_topic(key).await?);
+            let rejected = admission_order(&fixture.store, key, 0, deadline(), &[identity_probe_leg()]).await;
+            ensure!(matches!(rejected, Err(Error::OrderTopicBlocked)));
+            let counts: (i64, i64, i64) = sqlx::query_as(
+                "SELECT (SELECT COUNT(*) FROM arb_orders),(SELECT COUNT(*) FROM legs),(SELECT COUNT(*) FROM arb_order_market_identities)",
+            )
+            .fetch_one(&fixture.store.pool)
+            .await?;
+            ensure!(counts == (1, 0, 0), "blocked admission must leave no records");
+        }
+        ensure!(fixture.store.mark_rebalance(previous, "completed").await?.is_some());
+        ensure!(!fixture.store.has_active_topic(key).await?);
+        let (next, legs) = admission_order(&fixture.store, key, 0, deadline(), &[identity_probe_leg()]).await?;
+        ensure!(next > previous && fixture.store.has_active_topic(key).await?);
+        fixture.store.abort_unsubmitted_legs(&|_, _| None, &legs, "test cancellation").await?;
+        let state: (String, String, bool) = sqlx::query_as(
+            "SELECT status,rebalance_status,rebalanced_at IS NOT NULL FROM arb_orders WHERE id=$1",
+        )
+        .bind(next)
+        .fetch_one(&fixture.store.pool)
+        .await?;
+        ensure!(state == ("cancelled".into(), "completed".into(), true));
+        ensure!(!fixture.store.has_active_topic(key).await?);
+        Ok(())
+    }.await;
+    fixture.cleanup().await.expect("clean up admission schema");
+    exercised.expect("rebalance and cancellation control topic admission");
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn admission_scopes_unfinished_rebalance_to_managed_topic_orders() {
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let exercised: Result<()> = async {
+        fixture.store.migrate().await?;
+        let key = TopicKey::new(Uuid::new_v4(), 0);
+        let previous: i64 = sqlx::query_scalar(
+            "INSERT INTO arb_orders(event_id,unified_index,status) VALUES ($1,$2,'completed') RETURNING id",
+        )
+        .bind(key.event_id)
+        .bind(key.unified_index)
+        .fetch_one(&fixture.store.pool)
+        .await?;
+        // A newer balanced order must not hide an older unfinished one.
+        sqlx::query("INSERT INTO arb_orders(event_id,unified_index,status,rebalance_status) VALUES ($1,$2,'completed','completed')")
+            .bind(key.event_id).bind(key.unified_index).execute(&fixture.store.pool).await?;
+        ensure!(fixture.store.has_active_topic(key).await?);
+        ensure!(!fixture.store.has_active_topic(TopicKey::new(key.event_id, 1)).await?);
+        ensure!(!fixture.store.has_active_topic(TopicKey::new(Uuid::new_v4(), 0)).await?);
+        for (status, rebalance, position, settled, blocked) in [
+            ("pending", "completed", "watching", false, true),
+            ("actived", "completed", "watching", false, true),
+            ("completed", "pending", "watching", false, true),
+            ("completed", "actived", "settlement_pending", false, true),
+            ("completed", "completed", "watching", false, false),
+            ("completed", "pending", "closed", false, false),
+            ("completed", "actived", "settled", true, false),
+            ("completed", "pending", "watching", true, false),
+            ("cancelled", "pending", "watching", false, false),
+            ("failed", "pending", "watching", false, false),
+        ] {
+            sqlx::query("UPDATE arb_orders SET status=$2,rebalance_status=$3,position_status=$4,settled_at=CASE WHEN $5 THEN NOW() ELSE NULL END WHERE id=$1")
+                .bind(previous).bind(status).bind(rebalance).bind(position).bind(settled)
+                .execute(&fixture.store.pool).await?;
+            ensure!(fixture.store.has_active_topic(key).await? == blocked,
+                "unexpected admission for {status}/{rebalance}/{position}, settled={settled}");
+        }
+        Ok(())
+    }.await;
+    fixture.cleanup().await.expect("clean up admission schema");
+    exercised.expect("topic isolation and terminal order admission");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn admission_serializes_same_topic_without_capacity_limit() {
+    use market_arb::error::Error;
+    use std::time::{Duration, Instant};
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let exercised: Result<()> = async {
+        fixture.store.migrate().await?;
+        let key = TopicKey::new(Uuid::new_v4(), 0);
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let attempt = || {
+            let store = fixture.store.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                admission_order(&store, key, 0, Instant::now() + Duration::from_secs(30), &[identity_probe_leg()]).await
+            })
+        };
+        let (a, b) = tokio::join!(attempt(), attempt());
+        let results = [a?, b?];
+        ensure!(results.iter().filter(|r| r.is_ok()).count() == 1);
+        ensure!(results.iter().filter(|r| matches!(r, Err(Error::OrderTopicBlocked))).count() == 1);
+        let counts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM arb_orders),(SELECT COUNT(*) FROM legs),(SELECT COUNT(*) FROM arb_order_market_identities)",
+        ).fetch_one(&fixture.store.pool).await?;
+        ensure!(counts == (1, 1, 1));
+        Ok(())
+    }.await;
+    fixture.cleanup().await.expect("clean up admission schema");
+    exercised.expect("atomic topic admission without capacity limit");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
 async fn admission_serializes_last_slot_and_preserves_counting_policy() {
@@ -2759,7 +2888,11 @@ async fn admission_rolls_back_failed_legs_and_preserves_topic_uniqueness() {
         let key=TopicKey::new(Uuid::new_v4(),0);
         admission_order(&fixture.store,key,1,deadline(),&[identity_probe_leg()]).await?;
         let duplicate=admission_order(&fixture.store,key,0,deadline(),&[identity_probe_leg()]).await;
-        ensure!(matches!(duplicate,Err(Error::Sqlx(sqlx::Error::Database(ref db))) if db.code().as_deref()==Some("23505")));
+        ensure!(matches!(duplicate, Err(Error::OrderTopicBlocked)));
+        // The existing unique index remains a backstop for writes outside Store admission.
+        let duplicate_insert = sqlx::query("INSERT INTO arb_orders(event_id,unified_index,status) VALUES ($1,$2,'actived')")
+            .bind(key.event_id).bind(key.unified_index).execute(&fixture.store.pool).await;
+        ensure!(matches!(duplicate_insert, Err(sqlx::Error::Database(ref db)) if db.code().as_deref() == Some("23505")));
         ensure!(fixture.store.count_active_orders().await?==1);
         let counts:(i64,i64)=sqlx::query_as("SELECT (SELECT COUNT(*) FROM legs),(SELECT COUNT(*) FROM arb_order_market_identities)")
             .fetch_one(&fixture.store.pool).await?;
