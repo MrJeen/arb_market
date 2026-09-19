@@ -2218,9 +2218,28 @@ async fn refresh_parent_in_tx(
     // Completion follows terminal execution evidence, not availability of frozen estimates.
     let completed = sqlx::query("UPDATE arb_orders SET status=CASE WHEN EXISTS(SELECT 1 FROM legs WHERE order_id=$1 AND actual_shares>0) THEN 'completed' ELSE 'cancelled' END,completed_at=NOW(),updated_at=NOW() WHERE id=$1 AND status='actived' AND settled_at IS NULL AND position_status IN ('watching','settlement_pending') AND EXISTS(SELECT 1 FROM legs WHERE order_id=$1) AND NOT EXISTS(SELECT 1 FROM legs WHERE order_id=$1 AND status NOT IN ('matched','completed','failed','cancelled'))")
         .bind(order_id).execute(&mut **tx).await?.rows_affected() == 1;
-    sqlx::query("UPDATE arb_orders SET rebalance_status='completed',rebalanced_at=COALESCE(rebalanced_at,NOW()) WHERE id=$1 AND rebalance_status IS DISTINCT FROM 'completed' AND status='cancelled' AND settled_at IS NULL AND position_status IN ('watching','settlement_pending') AND NOT EXISTS(SELECT 1 FROM legs WHERE order_id=$1 AND (status NOT IN ('matched','completed','cancelled','failed') OR actual_shares IS NULL OR actual_shares<>0))")
-        .bind(order_id).execute(&mut **tx).await?;
-    if changed || completed {
+    // 零成交取消不进入 completed 持仓扫描，必须在本事务内收尾；缺失数量不能视为零。
+    let closed = sqlx::query(
+        "UPDATE arb_orders
+         SET rebalance_status='completed', rebalanced_at=COALESCE(rebalanced_at,NOW()),
+             position_status='closed', actual_cost=0, actual_rev=0, actual_profit=0,
+             actuals_projection=jsonb_build_object('version',1,'status','final','basis','zero_position',
+                 'estimated_fee','0','stale',false,'computed_at',NOW()), updated_at=NOW()
+         WHERE id=$1 AND status='cancelled' AND settled_at IS NULL
+           AND position_status IN ('watching','settlement_pending')
+           AND lifecycle_action IS NULL AND lifecycle_claim_id IS NULL AND lifecycle_claimed_at IS NULL
+           AND EXISTS(SELECT 1 FROM legs WHERE order_id=$1)
+           AND NOT EXISTS(
+               SELECT 1 FROM legs WHERE order_id=$1
+                 AND (status NOT IN ('matched','completed','cancelled','failed')
+                      OR actual_shares IS NULL OR actual_shares<>0)
+           )",
+    )
+    .bind(order_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected() == 1;
+    if !closed && (changed || completed) {
         project_in_tx_with_fallback(tx, order_id, resolver).await?;
     }
     Ok(())

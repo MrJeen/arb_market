@@ -705,6 +705,9 @@ async fn reconciliation_pm_accumulates_pages_and_only_accounts_confirmed_trades(
             LegResolution::Terminal {status:"failed", shares, fee, ..} if shares.is_zero() && fee.is_zero()));
         let parent = order_snapshot(&store.pool, failed_parent).await?;
         ensure!(parent["status"] == "cancelled" && parent["actual_cost"] == json!(0.0));
+        ensure!(parent["position_status"] == "closed");
+        ensure!(parent["actuals_projection"]["status"] == "final");
+        ensure!(parent["actuals_projection"]["basis"] == "zero_position");
         Ok(())
     }.await;
     fixture
@@ -2697,11 +2700,62 @@ async fn admission_waits_for_rebalance_and_releases_after_zero_fill_cancel() {
         .fetch_one(&fixture.store.pool)
         .await?;
         ensure!(state == ("cancelled".into(), "completed".into(), true));
+        let closed = order_snapshot(&fixture.store.pool, next).await?;
+        ensure!(closed["position_status"] == "closed" && closed["settled_at"].is_null());
+        ensure!(closed["actuals_projection"]["status"] == "final");
+        ensure!(closed["actuals_projection"]["basis"] == "zero_position");
+        ensure!(closed["actuals_projection"]["stale"] == false);
+        for field in ["actual_cost", "actual_rev", "actual_profit"] {
+            ensure!(closed[field].as_f64() == Some(0.0));
+        }
+        fixture.store.complete_orders(&|_, _| None).await?;
+        ensure!(order_snapshot(&fixture.store.pool, next).await? == closed);
         ensure!(!fixture.store.has_active_topic(key).await?);
         Ok(())
     }.await;
     fixture.cleanup().await.expect("clean up admission schema");
     exercised.expect("rebalance and cancellation control topic admission");
+}
+
+#[tokio::test]
+#[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+async fn zero_fill_cancellation_requires_terminal_evidence_and_no_lifecycle_claim() {
+    use std::time::{Duration, Instant};
+    let fixture = MigrationFixture::new().await.expect(POSTGRES_REQUIRED);
+    let exercised: Result<()> = async {
+        fixture.store.migrate().await?;
+        for (status, shares, claim, parent_status) in [
+            ("failed", None, false, "cancelled"),
+            ("failed", Some(-1), false, "cancelled"),
+            ("failed", Some(1), false, "completed"),
+            ("pending", Some(0), false, "actived"),
+            ("unknown", Some(0), false, "actived"),
+            ("failed", Some(0), true, "cancelled"),
+        ] {
+            let (id, legs) = admission_order(
+                &fixture.store, TopicKey::new(Uuid::new_v4(), 0), 0,
+                Instant::now() + Duration::from_secs(30), &[identity_probe_leg()],
+            ).await?;
+            sqlx::query("UPDATE legs SET status=$2,actual_shares=$3,actual_price=1,actual_fee=0 WHERE id=$1")
+                .bind(legs[0]).bind(status).bind(shares.map(Decimal::from))
+                .execute(&fixture.store.pool).await?;
+            if claim {
+                sqlx::query("UPDATE arb_orders SET lifecycle_action='rebalance',lifecycle_claim_id=$2,lifecycle_claimed_at=NOW() WHERE id=$1")
+                    .bind(id).bind(Uuid::new_v4()).execute(&fixture.store.pool).await?;
+            }
+            fixture.store.complete_orders(&|_, _| None).await?;
+            let parent = order_snapshot(&fixture.store.pool, id).await?;
+            ensure!(parent["status"] == parent_status);
+            ensure!(parent["position_status"] == "watching", "must not close {status}/{shares:?}, claim={claim}");
+            ensure!(parent["actuals_projection"]["status"] != "final");
+            if claim {
+                ensure!(!parent["lifecycle_claim_id"].is_null());
+            }
+        }
+        Ok(())
+    }.await;
+    fixture.cleanup().await.expect("clean up zero-fill schema");
+    exercised.expect("unsafe zero-fill evidence cannot close a position");
 }
 
 #[tokio::test]
