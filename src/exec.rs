@@ -1097,6 +1097,7 @@ impl Engine {
                 tracing::info!(
                     topic = %topic.key.as_str(),
                     profit = %confirmed.profit,
+                    worst_profit = %confirmed.worst_profit,
                     cost = %confirmed.total_cost,
                     roi = %confirmed.roi,
                     apr = %confirmed.apr,

@@ -240,6 +240,8 @@ impl Acc {
         let settlement_reserve = &s * &rules.out_rate;
         let expected_revenue = &s - &settlement_reserve;
         let profit = &expected_revenue - &total;
+        let (worst_total, worst_profit) =
+            worst_case_metrics(&self.shares, self.pm_cap, self.out_cap, rules);
         Values {
             s,
             pm_cost: self.pm_cost.clone(),
@@ -250,8 +252,27 @@ impl Acc {
             expected_revenue,
             total,
             profit,
+            worst_total,
+            worst_profit,
         }
     }
+}
+
+fn worst_case_metrics(shares: &BigInt, pm_cap: Decimal, out_cap: Decimal, rules: &Rules) -> (Q, Q) {
+    let s = integer(shares);
+    if s.is_zero() {
+        return (Q::zero(), Q::zero());
+    }
+    let p_pm = rational(pm_cap);
+    let p_out = rational(out_cap);
+    let worst_pm_cost = &s * &p_pm;
+    let worst_pm_fee = &rules.pm_rate * (&worst_pm_cost - &worst_pm_cost * &p_pm);
+    let worst_out_cost = &s * &p_out;
+    let worst_out_fee = &rules.builder_rate * &worst_out_cost;
+    let worst_total = worst_pm_cost + worst_pm_fee + worst_out_cost + worst_out_fee;
+    let expected_revenue = &s * (Q::one() - &rules.out_rate);
+    let worst_profit = &expected_revenue - &worst_total;
+    (worst_total, worst_profit)
 }
 
 #[derive(Debug, Clone)]
@@ -265,14 +286,19 @@ struct Values {
     expected_revenue: Q,
     total: Q,
     profit: Q,
+    worst_total: Q,
+    worst_profit: Q,
 }
 
 impl Values {
     fn profit_passes(&self, rules: &Rules) -> bool {
-        self.profit >= rules.profit
+        self.profit >= rules.profit && self.worst_profit >= Q::zero()
     }
     fn apr_passes(&self, rules: &Rules) -> bool {
         &self.profit * Q::from_integer(365.into()) >= &rules.apr_days * &self.total
+    }
+    fn in_budget(&self, rules: &Rules) -> bool {
+        self.total <= rules.budget
     }
     fn reason(&self, rules: &Rules) -> Result<(), &'static str> {
         if self.total > rules.budget {
@@ -309,12 +335,12 @@ fn interval(
     rules: &Rules,
 ) -> (Option<BigInt>, bool, &'static str) {
     let full = acc.plus(&quote.max_net, quote, out);
-    let full_in_budget = full.metrics(rules).total <= rules.budget;
+    let full_in_budget = full.metrics(rules).in_budget(rules);
     let mut upper = if full_in_budget {
         quote.max_net.clone()
     } else {
         last_true(BigInt::zero(), quote.max_net.clone(), |n| {
-            acc.plus(n, quote, out).metrics(rules).total <= rules.budget
+            acc.plus(n, quote, out).metrics(rules).in_budget(rules)
         })
     };
     if upper.is_zero() {
@@ -412,6 +438,13 @@ pub(super) fn search(
                 .min((Q::one() - &tick).max(tick));
             let pm_cap = project(&cap, false).ok_or("unrepresentable")?;
             let out_cap = align_outcome_price(final_acc.out_cap);
+            let (aligned_worst_total, aligned_worst_profit) =
+                worst_case_metrics(&n, pm_cap, out_cap, &rules);
+            let _ = aligned_worst_total;
+            if aligned_worst_profit < Q::zero() {
+                reason = "unprofitable";
+                break;
+            }
             return make_plan(
                 &final_acc, &rules, limits, pm_token, out_token, pm_cap, out_cap,
             )
@@ -539,6 +572,8 @@ struct DisplayValues {
     expected_revenue: Decimal,
     total: Decimal,
     profit: Decimal,
+    worst_profit: Decimal,
+    worst_cost: Decimal,
     roi: Decimal,
     apr: Decimal,
 }
@@ -566,6 +601,8 @@ fn display(v: &Values, days: i64) -> Option<DisplayValues> {
             let expected_revenue = at_scale(&revenue_q, scale, false)?;
             let profit_q = &revenue_q - &total_q;
             let profit = at_scale(&profit_q, scale, false)?;
+            let worst_profit = at_scale(&v.worst_profit, scale, false)?;
+            let worst_cost = at_scale(&v.worst_total, scale, true)?;
             if !total_q.is_positive() {
                 return None;
             }
@@ -583,6 +620,8 @@ fn display(v: &Values, days: i64) -> Option<DisplayValues> {
                 expected_revenue,
                 total,
                 profit,
+                worst_profit,
+                worst_cost,
                 roi,
                 apr,
             })
@@ -603,7 +642,13 @@ fn make_plan(
     pm_cap: Decimal,
     out_cap: Decimal,
 ) -> Option<ArbPlan> {
-    let values = acc.metrics(rules);
+    let mut aligned_acc = acc.clone();
+    aligned_acc.pm_cap = pm_cap;
+    aligned_acc.out_cap = out_cap;
+    let values = aligned_acc.metrics(rules);
+    if values.worst_profit < Q::zero() {
+        return None;
+    }
     let shares = at_scale(&values.s, 0, false)?;
     let d = display(&values, limits.days)?;
     project(&(&values.pm_cost + &values.pm_fee), true)?;
@@ -645,6 +690,8 @@ fn make_plan(
         settlement_reserve: d.settlement_reserve,
         total_cost: d.total,
         profit: d.profit,
+        worst_profit: d.worst_profit,
+        worst_cost: d.worst_cost,
         roi: d.roi,
         apr: d.apr,
         exact,
@@ -780,11 +827,19 @@ mod tests {
             let fee = &s * rational(fees.polymarket_fee_rate) * &avg * (Q::one() - avg);
             let c = &pc + &oc + fee + &oc * rational(fees.outcome_builder_rate);
             let profit = &s * (Q::one() - rational(fees.outcome_taker_rate)) - &c;
+            let worst_pm_c = &s * &p[pe].0;
+            let worst_pm_fee =
+                rational(fees.polymarket_fee_rate) * (&worst_pm_c - &worst_pm_c * &p[pe].0);
+            let worst_out_c = &s * &o[oe].0;
+            let worst_out_fee = rational(fees.outcome_builder_rate) * &worst_out_c;
+            let worst_cost = worst_pm_c + worst_pm_fee + worst_out_c + worst_out_fee;
+            let worst_gain = &s * (Q::one() - rational(fees.outcome_taker_rate)) - worst_cost;
             if n >= 5
                 && pc >= Q::one()
                 && &s * &o[oe].0 >= Q::one()
                 && c <= rational(bounds.cost_limit)
                 && profit >= rational(bounds.min_profit)
+                && worst_gain >= Q::zero()
                 && &profit * Q::from_integer(365.into())
                     >= rational(bounds.min_apr) * Q::from_integer(bounds.days.max(1).into()) * c
             {
@@ -862,13 +917,28 @@ mod tests {
         assert!(run(&pm, &out, &fees, &strict).is_none());
 
         let topic = sample_topic();
-        let mut capped = plan.clone();
-        capped.outcome.cap_price = d("0.9");
+        let mut bad_cap = plan.clone();
+        bad_cap.outcome.cap_price = d("0.9");
         let changed = FeeContext {
             outcome_taker_rate: d("0.002"),
             outcome_builder_rate: d("0.0003"),
             ..fees_zero()
         };
+        assert_eq!(
+            confirm(
+                &bad_cap,
+                &pm,
+                &out,
+                &topic.tokens[0],
+                &topic.tokens[2],
+                &changed,
+                &limits("0", "24.0036"),
+            )
+            .unwrap_err(),
+            "unprofitable"
+        );
+        let mut capped = plan.clone();
+        capped.outcome.cap_price = d("0.55");
         assert!(confirm(
             &capped,
             &pm,
@@ -898,10 +968,10 @@ mod tests {
             refreshed.expected_revenue - refreshed.total_cost,
             refreshed.profit
         );
-        assert_eq!(refreshed.outcome_required(), Some(d("27.0081")));
-        assert!(!refreshed.outcome_balance_sufficient(d("27.0036")));
-        assert!(!refreshed.outcome_balance_sufficient(d("27.00809999")));
-        assert!(refreshed.outcome_balance_sufficient(d("27.0081")));
+        assert_eq!(refreshed.outcome_required(), Some(d("16.50495")));
+        assert!(!refreshed.outcome_balance_sufficient(d("16.5036")));
+        assert!(!refreshed.outcome_balance_sufficient(d("16.50494999")));
+        assert!(refreshed.outcome_balance_sufficient(d("16.50495")));
     }
 
     #[test]
@@ -929,19 +999,19 @@ mod tests {
 
     #[test]
     fn original_fee_regression_fourteen_and_exact_legacy_counterexample() {
-        let pm = book_levels(&[("0.30", "4.5"), ("0.61", "100")]);
+        let bad_pm = book_levels(&[("0.30", "4.5"), ("0.61", "100")]);
         let out = book_levels(&[("0.40", "200")]);
         let fees = FeeContext {
             polymarket_fee_rate: d("0.07"),
             outcome_taker_rate: Decimal::ZERO,
             outcome_builder_rate: Decimal::ZERO,
         };
-        assert_eq!(
-            run(&pm, &out, &fees, &limits("1", "100"))
-                .unwrap()
-                .net_shares,
-            d("14")
+        assert!(
+            run(&bad_pm, &out, &fees, &limits("1", "100")).is_none(),
+            "0.61 + 0.40 = 1.01 破坏最坏情况，必须拒绝"
         );
+        let pm = book_levels(&[("0.30", "4.5"), ("0.55", "100")]);
+        assert!(run(&pm, &out, &fees, &limits("1", "100")).is_some());
         let bounds = ArbLimits {
             days: 365,
             ..limits("0.000000000000000000000000013", "100")
@@ -1025,6 +1095,8 @@ mod tests {
             out_fee: Q::zero(),
             total: &max / Q::from_integer(2.into()),
             profit: &max / Q::from_integer(2.into()),
+            worst_total: &max / Q::from_integer(2.into()),
+            worst_profit: &max / Q::from_integer(2.into()),
         };
         let shown = display(&v, 365).unwrap();
         assert_eq!(shown.pm_cost.scale(), 0);
@@ -1327,11 +1399,18 @@ mod tests {
                                 + &s * rational(d(pm_rate)) * &avg * (Q::one() - avg)
                                 + oc * rational(d("0.0003"));
                             let gain = &s * (Q::one() - rational(d("0.001344"))) - &c;
+                            let worst_c = &s * rational(d("0.4"))
+                                + &s * rational(d(pm_rate))
+                                    * rational(d("0.4"))
+                                    * (Q::one() - rational(d("0.4")))
+                                + &s * rational(d(out_px)) * (Q::one() + rational(d("0.0003")));
+                            let worst_gain = &s * (Q::one() - rational(d("0.001344"))) - worst_c;
                             *n >= 5
                                 && pc >= Q::one()
                                 && &s * rational(d(out_px)) >= Q::one()
                                 && c <= rational(b.cost_limit)
                                 && gain >= rational(b.min_profit)
+                                && worst_gain >= Q::zero()
                                 && &gain * Q::from_integer(365.into())
                                     >= rational(b.min_apr) * Q::from_integer(365.into()) * c
                         });
@@ -1348,9 +1427,12 @@ mod tests {
 
     #[test]
     fn bridge_discount_survives_next_ordinary_quote() {
-        let pm = book_levels(&[("0.2", "0.5"), ("0.3", "3.5"), ("0.65", "50")]);
+        let invalid_pm = book_levels(&[("0.2", "0.5"), ("0.3", "3.5"), ("0.65", "50")]);
         let out = book_levels(&[("0.4", "100")]);
         let b = limits("0.5", "100");
+        assert!(run(&invalid_pm, &out, &fees_zero(), &b).is_none());
+
+        let pm = book_levels(&[("0.2", "0.5"), ("0.3", "3.5"), ("0.55", "50")]);
         let expected = oracle(&pm, &out, &fees_zero(), &b).unwrap();
         assert_eq!(
             run(&pm, &out, &fees_zero(), &b)
@@ -1389,6 +1471,8 @@ mod tests {
             out_fee: Q::zero(),
             total: &s / Q::from_integer(2.into()),
             profit: &s / Q::from_integer(2.into()),
+            worst_total: &s / Q::from_integer(2.into()),
+            worst_profit: &s / Q::from_integer(2.into()),
         };
         assert!(display(&v, 365).is_none());
         let rules = Rules::new(&fees_zero(), &limits("0", "100")).unwrap();

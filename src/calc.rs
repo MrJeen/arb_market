@@ -50,6 +50,10 @@ pub struct ArbPlan {
     pub settlement_reserve: Decimal,
     pub total_cost: Decimal,
     pub profit: Decimal,
+    /// 最坏成交情况下的保底净利润（两腿均按 cap 成交）。
+    pub worst_profit: Decimal,
+    /// 最坏成交情况下的总现金支出（两腿均按 cap 成交）。
+    pub worst_cost: Decimal,
     pub roi: Decimal,
     pub apr: Decimal,
     // 精确快照仅 calc 持有；公开金额只是展示/存储投影。
@@ -1559,24 +1563,34 @@ mod tests {
 
     #[test]
     fn known_regression_fractional_profit_boundary_original_example() {
-        let plan = assert_fractional_plan(
+        let now = Instant::now();
+        let mut books = BookStore::default();
+        books.replace_snapshot(
+            POLYMARKET,
+            "pm-yes",
+            vec![],
             levels(&[("0.30", "4.5"), ("0.61", "100")]),
-            levels(&[("0.40", "200")]),
-            &fees_zero(),
-            &limits("1", "100"),
-            d("39"),
-            d("22.395"),
-            d("0.61"),
+            1,
+            now,
         );
-        assert_eq!(plan.profit, d("1.005"));
-        let cost_40 = take_asks_cost(
-            &levels(&[("0.30", "4.5"), ("0.61", "100")]),
-            d("40"),
-            d("0.61"),
-            false,
-        )
-        .unwrap();
-        assert_eq!(d("40") - cost_40 - d("16"), d("0.995"));
+        books.set_tick_size(POLYMARKET, "pm-yes", d("0.01"));
+        books.replace_snapshot(OUTCOME, "#10", vec![], levels(&[("0.40", "200")]), 1, now);
+        let topic = sample_topic();
+        let pm = books.get(POLYMARKET, "pm-yes").unwrap();
+        let out = books.get(OUTCOME, "#10").unwrap();
+        assert!(
+            plan_arbitrage(
+                &topic,
+                pm,
+                out,
+                &topic.tokens[0],
+                &topic.tokens[2],
+                &fees_zero(),
+                &limits("1", "100"),
+            )
+            .is_none(),
+            "0.61 + 0.40 = 1.01 最坏情况必亏，必须拒绝"
+        );
     }
 
     #[test]
@@ -2593,5 +2607,84 @@ mod tests {
         assert_eq!(sample.pm_ask, Some(d("0.40")));
         assert_eq!(sample.pm_sz, Some(d("2")));
         assert_eq!(sample.stale, None);
+    }
+
+    #[test]
+    fn regression_order_75_rejects_plan_when_thin_depth_pushes_outcome_cap_above_break_even() {
+        let now = Instant::now();
+        let mut books = BookStore::default();
+        snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.95", "100")], now);
+        books.set_tick_size(POLYMARKET, "pm-yes", d("0.01"));
+        snapshot(
+            &mut books,
+            OUTCOME,
+            "#10",
+            vec![("0.03", "10"), ("0.06", "10")],
+            now,
+        );
+        let topic = sample_topic();
+        let pm = books.get(POLYMARKET, "pm-yes").unwrap();
+        let out = books.get(OUTCOME, "#10").unwrap();
+        let fees = FeeContext {
+            polymarket_fee_rate: d("0.05"),
+            outcome_taker_rate: d("0.001344"),
+            outcome_builder_rate: Decimal::ZERO,
+        };
+        let plan = plan_arbitrage(
+            &topic,
+            pm,
+            out,
+            &topic.tokens[0],
+            &topic.tokens[2],
+            &fees,
+            &limits("0.01", "100"),
+        );
+        if let Some(p) = plan {
+            assert!(
+                p.outcome.cap_price <= d("0.046"),
+                "outcome cap 必须在保底安全线内，当前为 {}",
+                p.outcome.cap_price
+            );
+            assert!(
+                p.worst_profit >= Decimal::ZERO,
+                "最坏利润必须非负，当前为 {}",
+                p.worst_profit
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_plan_when_depth_within_safe_cap() {
+        let now = Instant::now();
+        let mut books = BookStore::default();
+        snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.95", "100")], now);
+        books.set_tick_size(POLYMARKET, "pm-yes", d("0.01"));
+        snapshot(
+            &mut books,
+            OUTCOME,
+            "#10",
+            vec![("0.03", "50"), ("0.04", "50")],
+            now,
+        );
+        let topic = sample_topic();
+        let pm = books.get(POLYMARKET, "pm-yes").unwrap();
+        let out = books.get(OUTCOME, "#10").unwrap();
+        let fees = FeeContext {
+            polymarket_fee_rate: d("0.05"),
+            outcome_taker_rate: d("0.001344"),
+            outcome_builder_rate: Decimal::ZERO,
+        };
+        let plan = plan_arbitrage(
+            &topic,
+            pm,
+            out,
+            &topic.tokens[0],
+            &topic.tokens[2],
+            &fees,
+            &limits("0.01", "100"),
+        )
+        .expect("安全价格必须生成 plan");
+        assert!(plan.worst_profit >= Decimal::ZERO);
+        assert!(plan.outcome.cap_price <= d("0.04"));
     }
 }
