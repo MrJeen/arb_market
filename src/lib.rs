@@ -72,6 +72,7 @@ pub async fn run() -> anyhow::Result<()> {
         settlement_scan_cursor: Mutex::new(0),
         last_settlement_sweep: Mutex::new(None),
         reported_stale_unknown: Mutex::new(Default::default()),
+        rebalance_loss_cooldown: Mutex::new(HashMap::new()),
     });
     engine.refresh_discovery().await?;
 

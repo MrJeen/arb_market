@@ -7,3 +7,10 @@
 - 格式化后检查 Git 差异，确认纯格式变化没有改变业务逻辑，并保留用户已有改动。
 - 若格式化涉及历史未格式化文件，应明确区分纯格式变化与业务改动，不混淆两者。
 - 对 rustfmt 无法充分整理的宏内部代码（例如 `tokio::select!`），手动展开为可读结构，不改变条件、执行顺序、错误处理或并发行为。
+
+## 测试数据库连接
+
+```
+COMMON_POSTGRES_URI=postgres://root:root@localhost:5432/aimarket
+APP_POSTGRES_URI=postgres://root:root@localhost:5432/arb_crypto
+```

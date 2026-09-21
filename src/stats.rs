@@ -122,6 +122,7 @@ minute_stats! {
     submitted_pending_promoted,
     arb_disabled,
     rebalance_disabled,
+    rebalance_loss_cooldown,
     take_profit_disabled,
     pm_bal,
     pm_balance_call,

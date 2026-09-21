@@ -53,7 +53,11 @@ pub struct Engine {
     pub last_settlement_sweep: Mutex<Option<Instant>>,
     /// 已告警过的超时 unknown 腿；超时腿留在库里持续重试，告警只推一次。
     pub reported_stale_unknown: Mutex<HashSet<i64>>,
+    /// 再平衡实际收益为负的 topic 冷却期截止时间（5分钟内禁止套利计算）
+    pub rebalance_loss_cooldown: Mutex<HashMap<TopicKey, Instant>>,
 }
+
+pub const REBALANCE_LOSS_COOLDOWN: Duration = Duration::from_secs(300);
 
 const ACTUALS_GATE_WARN_INTERVAL: Duration = Duration::from_secs(60);
 static ACTUALS_GATE_LOG: std::sync::LazyLock<ActualsGateLog> =
@@ -496,6 +500,23 @@ impl Engine {
             self.stats.no_topic();
             return Ok(());
         };
+        {
+            let mut cooldowns = self.rebalance_loss_cooldown.lock().await;
+            let now = Instant::now();
+            if let Some(&until) = cooldowns.get(&topic_key) {
+                if now < until {
+                    self.stats.rebalance_loss_cooldown();
+                    tracing::debug!(
+                        topic = %topic_key.as_str(),
+                        remaining_secs = (until - now).as_secs(),
+                        "arb evaluation skipped due to rebalance loss cooldown"
+                    );
+                    return Ok(());
+                } else {
+                    cooldowns.remove(&topic_key);
+                }
+            }
+        }
         if self.store.has_active_topic(topic_key).await? {
             self.stats.active_topic();
             return Ok(());
@@ -1772,7 +1793,7 @@ impl Engine {
             }
             Some(false) => {
                 if order.rebalance_status != "completed" {
-                    self.complete_rebalance(order.id).await?;
+                    self.complete_rebalance(order.id, key).await?;
                 }
                 return Ok(());
             }
@@ -1811,7 +1832,7 @@ impl Engine {
                 )
             };
             if untradeable {
-                self.complete_rebalance(order.id).await?;
+                self.complete_rebalance(order.id, key).await?;
             }
             return Ok(());
         }
@@ -2824,7 +2845,7 @@ impl Engine {
         Ok(())
     }
 
-    async fn complete_rebalance(&self, order_id: i64) -> Result<()> {
+    async fn complete_rebalance(&self, order_id: i64, key: TopicKey) -> Result<()> {
         let Some(projection) = self.store.mark_rebalance(order_id, "completed").await? else {
             return Ok(());
         };
@@ -2841,6 +2862,17 @@ impl Engine {
             actual_cost = %actual_cost,
             "rebalance completed"
         );
+        if actual_profit < Decimal::ZERO {
+            let until = Instant::now() + REBALANCE_LOSS_COOLDOWN;
+            self.rebalance_loss_cooldown.lock().await.insert(key, until);
+            tracing::warn!(
+                order_id,
+                topic = %key.as_str(),
+                actual_profit = %actual_profit,
+                cooldown_secs = REBALANCE_LOSS_COOLDOWN.as_secs(),
+                "rebalance completed with negative profit; arb evaluation paused for 5m"
+            );
+        }
         if let Some(notify) = &self.notify {
             notify.publish_order_actuals(order_id, actual_profit, actual_cost);
         }
@@ -4382,6 +4414,7 @@ mod tests {
             settlement_scan_cursor: Mutex::new(0),
             last_settlement_sweep: Mutex::new(None),
             reported_stale_unknown: Mutex::new(HashSet::new()),
+            rebalance_loss_cooldown: Mutex::new(HashMap::new()),
         }
     }
 
@@ -5321,6 +5354,7 @@ mod tests {
             settlement_scan_cursor: Mutex::new(0),
             last_settlement_sweep: Mutex::new(None),
             reported_stale_unknown: Mutex::new(HashSet::new()),
+            rebalance_loss_cooldown: Mutex::new(HashMap::new()),
         };
         let mut identity = MarketIdentity::new(POLYMARKET, "test-condition").unwrap();
         identity.insert(OUTCOME, "1211").unwrap();
@@ -5480,6 +5514,7 @@ mod tests {
             settlement_scan_cursor: Mutex::new(0),
             last_settlement_sweep: Mutex::new(None),
             reported_stale_unknown: Mutex::new(HashSet::new()),
+            rebalance_loss_cooldown: Mutex::new(HashMap::new()),
         };
         let mut identity = MarketIdentity::new(POLYMARKET, "test-condition").unwrap();
         identity.insert(OUTCOME, "1211").unwrap();
@@ -5630,6 +5665,7 @@ mod tests {
                 settlement_scan_cursor: Mutex::new(0),
                 last_settlement_sweep: Mutex::new(None),
                 reported_stale_unknown: Mutex::new(HashSet::new()),
+                rebalance_loss_cooldown: Mutex::new(HashMap::new()),
             };
             let token = |platform: &str, id: &str, label: &str| crate::domain::TokenRef {
                 platform: platform.into(),
@@ -6235,7 +6271,9 @@ mod tests {
                 topics: Arc::new(RwLock::new(HashMap::new())), pm, outcome,
                 pm_sub_tx, out_sub_tx, notify: None, stats: Arc::new(MinuteStats::new()),
                 position_scan_cursor: Mutex::new(0), settlement_scan_cursor: Mutex::new(0),
-                last_settlement_sweep: Mutex::new(None), reported_stale_unknown: Mutex::new(HashSet::new()),
+                last_settlement_sweep: Mutex::new(None),
+                reported_stale_unknown: Mutex::new(HashSet::new()),
+                rebalance_loss_cooldown: Mutex::new(HashMap::new()),
             };
             let missing = engine.pm_reconciliation_fee_snapshot(&leg).await?;
             assert_eq!(missing["source"], "env");
@@ -7146,5 +7184,84 @@ mod tests {
             .unwrap()
             .insert("yes".into(), Decimal::ONE);
         assert!(has_position(&positions));
+    }
+
+    #[test]
+    fn rebalance_loss_cooldown_constant_is_five_minutes() {
+        assert_eq!(REBALANCE_LOSS_COOLDOWN, Duration::from_secs(300));
+    }
+
+    #[tokio::test]
+    async fn rebalance_loss_cooldown_inserted_with_correct_deadline() {
+        let cooldowns = Mutex::new(HashMap::<TopicKey, Instant>::new());
+        let key = TopicKey::new(uuid::Uuid::new_v4(), 0);
+        let actual_profit = Decimal::new(-5, 1);
+        let before = Instant::now();
+        if actual_profit < Decimal::ZERO {
+            let until = Instant::now() + REBALANCE_LOSS_COOLDOWN;
+            cooldowns.lock().await.insert(key, until);
+        }
+        let after = Instant::now();
+
+        let map = cooldowns.lock().await;
+        let until = *map.get(&key).expect("topic must be in cooldown");
+        assert!(until >= before + REBALANCE_LOSS_COOLDOWN);
+        assert!(until <= after + REBALANCE_LOSS_COOLDOWN);
+    }
+
+    #[tokio::test]
+    async fn evaluate_topic_blocked_when_rebalance_loss_cooldown_active() {
+        let engine = fee_test_engine().await;
+        let topic = fee_test_topic();
+        let key = topic.key;
+        engine.topics.write().await.insert(key, topic);
+
+        // 设置处于冷却期内
+        let now = Instant::now();
+        engine
+            .rebalance_loss_cooldown
+            .lock()
+            .await
+            .insert(key, now + Duration::from_secs(300));
+
+        let res = engine.evaluate_topic(key).await;
+        assert!(res.is_ok());
+
+        // 验证统计指标计数增加且冷却记录仍在
+        let stats = engine.stats.snapshot_and_reset();
+        assert_eq!(stats.rebalance_loss_cooldown, 1);
+        assert!(engine
+            .rebalance_loss_cooldown
+            .lock()
+            .await
+            .contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn evaluate_topic_clears_expired_rebalance_loss_cooldown() {
+        let engine = fee_test_engine().await;
+        let topic = fee_test_topic();
+        let key = topic.key;
+        engine.topics.write().await.insert(key, topic);
+
+        // 设置已过期的时间戳
+        let now = Instant::now();
+        engine
+            .rebalance_loss_cooldown
+            .lock()
+            .await
+            .insert(key, now - Duration::from_secs(1));
+
+        // 运行 evaluate_topic，即使后续因为未连接 db 失败，冷却条目在前期已被惰性清理
+        let _ = engine.evaluate_topic(key).await;
+
+        // 验证过期条目已被清理，且拦截计数未增加
+        assert!(!engine
+            .rebalance_loss_cooldown
+            .lock()
+            .await
+            .contains_key(&key));
+        let stats = engine.stats.snapshot_and_reset();
+        assert_eq!(stats.rebalance_loss_cooldown, 0);
     }
 }
