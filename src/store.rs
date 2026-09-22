@@ -613,10 +613,23 @@ impl Store {
                 .await?;
             }
         }
-        if !parent_open || !leg_open(&current.status) {
+        let allow_matched_recovery =
+            matched_fill.is_some() && current.platform == POLYMARKET && current.status != "matched";
+        if !parent_open || (!leg_open(&current.status) && !allow_matched_recovery) {
             // 回执只写 envelope；终态腿及其风控基线不再变化。
             tx.commit().await?;
             return Ok(());
+        }
+        if !leg_open(&current.status) && matched_fill.is_some() {
+            tracing::warn!(
+                service = "polymarket",
+                operation = "submit_fill",
+                endpoint = "/order",
+                leg_id,
+                order_id,
+                previous_status = %current.status,
+                "terminal leg recovered by matched submission fill"
+            );
         }
         let has_observation: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM fills WHERE leg_id = $1)")
@@ -643,7 +656,9 @@ impl Store {
         }
         let terminal = status == "cancelled" || status == "failed";
         // 找到订单或已有撮合证据后，晚到的拒单不能证明零成交。
-        let next_status = if terminal
+        let next_status = if matched_fill.is_some() {
+            "matched"
+        } else if terminal
             && (has_observation || has_known_execution || current.status == "actived")
         {
             current.status.as_str()
@@ -679,6 +694,17 @@ impl Store {
         if matched_fill.is_some() {
             info["fee_sources"] = serde_json::json!(["estimated"]);
             info["waiting_reason"] = Value::Null;
+            if let Some(obj) = info.as_object_mut() {
+                obj.remove("reason");
+                if obj
+                    .get("order_poll")
+                    .and_then(|p| p.get("found"))
+                    .is_some_and(|f| f == false)
+                {
+                    obj.remove("order_poll");
+                }
+                obj.remove("fill_progress");
+            }
         }
         sqlx::query(
             "UPDATE legs SET status = $2, third_order_id = COALESCE($3,third_order_id),
@@ -1777,16 +1803,56 @@ impl Store {
     pub async fn promote_submitted_pending_to_unknown(
         &self,
         resolver: &actuals::FeeResolver<'_>,
+        grace_period: Duration,
     ) -> Result<u64> {
-        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM legs WHERE status='pending' AND submitted_at IS NOT NULL ORDER BY order_id,id")
-            .fetch_all(&self.pool).await?;
+        let secs = grace_period.as_secs() as i64;
+        let ids: Vec<i64> = if secs > 0 {
+            sqlx::query_scalar(
+                "SELECT id FROM legs
+                 WHERE status='pending' AND submitted_at IS NOT NULL
+                   AND submitted_at < NOW() - make_interval(secs => $1)
+                 ORDER BY order_id,id",
+            )
+            .bind(secs)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                "SELECT id FROM legs
+                 WHERE status='pending' AND submitted_at IS NOT NULL
+                 ORDER BY order_id,id",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
         let mut count = 0;
         for id in ids {
             let mut tx = self.pool.begin().await?;
             let (parent_id, open) = lock_leg_parent(&mut tx, id).await?;
             if open {
-                let changed = sqlx::query("UPDATE legs SET status='unknown',updated_at=clock_timestamp(),last_order_info=COALESCE(last_order_info,'{}'::jsonb)||jsonb_build_object('reason','pending_after_submit') WHERE id=$1 AND status='pending' AND submitted_at IS NOT NULL")
-                    .bind(id).execute(&mut *tx).await?.rows_affected();
+                let changed = if secs > 0 {
+                    sqlx::query(
+                        "UPDATE legs SET status='unknown',updated_at=clock_timestamp(),
+                                last_order_info=COALESCE(last_order_info,'{}'::jsonb)||jsonb_build_object('reason','pending_after_submit')
+                         WHERE id=$1 AND status='pending' AND submitted_at IS NOT NULL
+                           AND submitted_at < NOW() - make_interval(secs => $2)",
+                    )
+                    .bind(id)
+                    .bind(secs)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected()
+                } else {
+                    sqlx::query(
+                        "UPDATE legs SET status='unknown',updated_at=clock_timestamp(),
+                                last_order_info=COALESCE(last_order_info,'{}'::jsonb)||jsonb_build_object('reason','pending_after_submit')
+                         WHERE id=$1 AND status='pending' AND submitted_at IS NOT NULL",
+                    )
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected()
+                };
                 if changed == 1 {
                     refresh_parent_in_tx(&mut tx, parent_id, resolver, true).await?;
                     count += 1;

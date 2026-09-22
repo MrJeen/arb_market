@@ -58,6 +58,7 @@ pub struct Engine {
 }
 
 pub const REBALANCE_LOSS_COOLDOWN: Duration = Duration::from_secs(300);
+pub const SUBMITTED_PENDING_GRACE_PERIOD: Duration = Duration::from_secs(20);
 
 const ACTUALS_GATE_WARN_INTERVAL: Duration = Duration::from_secs(60);
 static ACTUALS_GATE_LOG: std::sync::LazyLock<ActualsGateLog> =
@@ -1338,9 +1339,10 @@ impl Engine {
         }
         let promoted = self
             .store
-            .promote_submitted_pending_to_unknown(&|wallet, token| {
-                self.outcome.latest_actuals_fee(wallet, token)
-            })
+            .promote_submitted_pending_to_unknown(
+                &|wallet, token| self.outcome.latest_actuals_fee(wallet, token),
+                SUBMITTED_PENDING_GRACE_PERIOD,
+            )
             .await?;
         record_submitted_pending_promoted(&self.stats, promoted);
         let timed_out = self
@@ -1365,6 +1367,9 @@ impl Engine {
         }
         let legs = self.store.open_legs().await?;
         for leg in legs {
+            if leg.status == "pending" {
+                continue;
+            }
             if let Err(err) = self.reconcile_leg(&leg).await {
                 tracing::warn!(leg_id = leg.id, error = %err, "reconcile failed");
             }
@@ -6758,6 +6763,168 @@ mod tests {
             store.pool.close().await;
             Ok(())
         }.await;
+        let cleanup = sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&admin)
+            .await;
+        admin.close().await;
+        cleanup.unwrap();
+        exercised.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires APP_POSTGRES_URI; run manually against a test database"]
+    async fn pm_matched_submission_recovers_premature_failed_leg() {
+        let uri = std::env::var("APP_POSTGRES_URI").expect("requires a test database");
+        let admin = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&uri)
+            .await
+            .unwrap();
+        let schema = format!("pm_recover_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let search_path = schema.clone();
+        let exercised: anyhow::Result<()> = async {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(2)
+                .after_connect(move |conn, _| {
+                    let path = search_path.clone();
+                    Box::pin(async move {
+                        sqlx::query("SELECT set_config('search_path', $1, false)")
+                            .bind(path)
+                            .execute(conn)
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .connect(&uri)
+                .await?;
+            let mut engine = fee_test_engine().await;
+            engine.store = Store { pool };
+            let store = &engine.store;
+            store.migrate().await?;
+            let fees = FeeContext {
+                polymarket_fee_rate: d("0.03"),
+                outcome_taker_rate: Decimal::ZERO,
+                outcome_builder_rate: Decimal::ZERO,
+            };
+
+            let identity = MarketIdentity::new(POLYMARKET, "test-condition")?;
+            let (_parent, ids) = store
+                .insert_actived_order_with_legs(
+                    &|_, _| None,
+                    TopicKey::new(uuid::Uuid::new_v4(), 0),
+                    &identity,
+                    "PM recover test",
+                    "PM recover test",
+                    None,
+                    d("20"),
+                    d("2"),
+                    d("18"),
+                    &json!([]),
+                    &[NewLeg {
+                        platform: POLYMARKET,
+                        token_id: "yes",
+                        label: "yes",
+                        side: "SELL",
+                        intent: "take_profit",
+                        funder: Some("test-funder"),
+                        wallet: None,
+                        service: None,
+                        req_price: d("0.48"),
+                        req_shares: d("37"),
+                        req_fee: d("0.28"),
+                        client_order_id: None,
+                        fee_estimate: None,
+                    }],
+                    0,
+                    Instant::now() + Duration::from_secs(30),
+                )
+                .await?;
+            let leg_id = ids[0];
+            let oid = format!("oid-{leg_id}");
+            store
+                .insert_envelope(&|_, _| None, leg_id, &oid, &json!({}), &json!({}), None)
+                .await?;
+
+            // 模拟竞态条件：在途网络请求未返回时，对账抢先将该腿置为 failed
+            let poll = OrderPoll {
+                found: false,
+                status: "not_found".into(),
+                order_id: Some(oid.clone()),
+                raw: json!({"lookup_missing": "null_body"}),
+                ..OrderPoll::default()
+            };
+            let info = json!({
+                "reason": "pending_after_submit",
+                "order_poll": poll,
+            });
+            sqlx::query(
+                "UPDATE legs SET status = 'failed', actual_shares = 0, actual_price = 0,
+                        actual_fee = 0, last_order_info = $2
+                 WHERE id = $1",
+            )
+            .bind(leg_id)
+            .bind(info)
+            .execute(&store.pool)
+            .await?;
+
+            // 交易所返回真实的 matched 撮合响应
+            let response = json!({
+                "success": true,
+                "status": "matched",
+                "orderID": oid,
+                "makingAmount": "37",
+                "takingAmount": "17.76",
+                "transactionsHashes": ["0x467a7025dea66ac5050e1d12922db7de1e395ccb5a43215db64a2eae750f299c"]
+            });
+            let result = crate::platforms::polymarket::parse_submit(&response, oid.clone(), json!({}));
+
+            // persist_submit 必须成功将 failed 恢复为 matched，并入账真实数据
+            persist_submit(
+                &|_, _| None,
+                store,
+                leg_id,
+                POLYMARKET,
+                OrderSide::Sell,
+                &result,
+                &fees,
+                &crate::platforms::SubmissionResponse::Http(response.clone()),
+            )
+            .await?;
+
+            let row: (String, Decimal, Decimal, Decimal, Value) = sqlx::query_as(
+                "SELECT status, actual_shares, actual_price, actual_fee, last_order_info
+                 FROM legs WHERE id = $1",
+            )
+            .bind(leg_id)
+            .fetch_one(&store.pool)
+            .await?;
+
+            assert_eq!(row.0, "matched");
+            assert_eq!(row.1, d("37"));
+            assert_eq!(row.2, d("0.48"));
+            assert_eq!(row.3, d("0.277056"));
+            assert_eq!(row.4["submission"]["kind"], "ack");
+            assert!(row.4.get("reason").is_none());
+            assert!(row.4.get("order_poll").is_none());
+
+            let env: Value = sqlx::query_scalar(
+                "SELECT submit_response FROM signed_envelopes WHERE leg_id = $1",
+            )
+            .bind(leg_id)
+            .fetch_one(&store.pool)
+            .await?;
+            assert_eq!(env["status"], "matched");
+            assert_eq!(env["makingAmount"], "37");
+
+            store.pool.close().await;
+            Ok(())
+        }
+        .await;
+
         let cleanup = sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
             .execute(&admin)
             .await;

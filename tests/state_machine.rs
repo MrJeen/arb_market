@@ -303,6 +303,8 @@ async fn submitted_reconciliation_order(
             req_fee: Decimal::from(99),
             funder: (*platform == "polymarket")
                 .then_some("0x0000000000000000000000000000000000000001"),
+            wallet: (*platform == "outcome")
+                .then_some("0x0000000000000000000000000000000000000002"),
             ..identity_probe_leg()
         })
         .collect();
@@ -2200,7 +2202,7 @@ async fn reconciliation_timeouts_use_first_submission_and_history_stays_frozen()
         sqlx::query("UPDATE legs SET created_at=NOW()-INTERVAL '2 hours' WHERE order_id=$1")
             .bind(recent_id).execute(&store.pool).await?;
         ensure!(store.fail_stale_pending_unsubmitted(&|_, _| None, std::time::Duration::from_secs(60)).await? == 0);
-        ensure!(store.promote_submitted_pending_to_unknown(&|_, _| None, ).await? == 1);
+        ensure!(store.promote_submitted_pending_to_unknown(&|_, _| None, std::time::Duration::ZERO).await? == 1);
         let before: Vec<_> = store.open_legs().await?;
         let timeout = std::time::Duration::from_secs(60);
         let stale = store.stale_unknown_legs(timeout).await?;
