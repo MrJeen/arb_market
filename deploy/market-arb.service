@@ -2,6 +2,8 @@
 Description=Polymarket ↔ Outcome market-order arbitrage
 After=network-online.target
 Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=120
 
 [Service]
 Type=simple
@@ -12,8 +14,6 @@ WorkingDirectory=/var/www/arb_market
 ExecStart=/var/www/arb_market/dist/market-arb
 Restart=on-failure
 RestartSec=5
-StartLimitBurst=5
-StartLimitIntervalSec=120
 TimeoutStopSec=20
 KillSignal=SIGTERM
 Environment=RUST_LOG=info
