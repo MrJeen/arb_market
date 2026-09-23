@@ -207,7 +207,7 @@ pub fn format_take_profit_completed_notice(
     notice: &TakeProfitCompletedNotice,
 ) -> String {
     format!(
-        "✅ {tag}止盈完成\n📋 orderId: {}\n📋 title: {}\n💰 actual profit: {}\n💰 actual cost: {}\nℹ️ 入账口径可能含标记的手续费估算",
+        "✅ {tag}止盈完成\n📋 orderId: {}\n📋 title: {}\n💰 actual profit: {}\n💰 actual cost: {}",
         notice.order_id,
         escape_markdown(&notice.title),
         notice.actual_profit.normalize(),
@@ -224,7 +224,6 @@ pub fn format_settlement_notice(tag: &str, notice: &SettlementNotice) -> String 
     ];
     if let Some(actual_profit) = notice.actual_profit {
         lines.push(format!("💰 actual profit: {}", actual_profit.normalize()));
-        lines.push("ℹ️ 入账口径可能含标记的手续费估算".into());
     }
     lines.join("\n")
 }
@@ -236,7 +235,7 @@ pub fn format_order_actuals_notice(
     actual_cost: Decimal,
 ) -> String {
     format!(
-        "{tag}订单 {order_id} 入账收益 {}，入账成本 {}（可能含标记的手续费估算）",
+        "{tag}订单 {order_id} 入账收益 {}，入账成本 {}",
         actual_profit.normalize(),
         actual_cost.normalize(),
     )

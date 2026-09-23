@@ -149,6 +149,7 @@ fn take_profit_notices_escape_title_and_include_amounts() {
     assert!(completed.contains("止盈完成"));
     assert!(completed.contains("actual profit: 1.1"));
     assert!(completed.contains("actual cost: 25"));
+    assert!(!completed.contains("手续费估算"));
 }
 
 #[test]
@@ -165,6 +166,7 @@ fn settlement_notice_escapes_fields_and_supports_unavailable_profit() {
     assert!(text.contains(r"Event\_\[A]"));
     assert!(text.contains(r"status: settled\_final"));
     assert!(text.contains("actual profit: -0.5"));
+    assert!(!text.contains("手续费估算"));
 
     let unavailable = format_settlement_notice(
         "【cat】",
@@ -182,7 +184,7 @@ fn settlement_notice_escapes_fields_and_supports_unavailable_profit() {
 fn order_actuals_notice_contains_profit_and_cost() {
     assert_eq!(
         format_order_actuals_notice("【cat】", 8353, Decimal::new(-29, 2), Decimal::new(29, 2),),
-        "【cat】订单 8353 入账收益 -0.29，入账成本 0.29（可能含标记的手续费估算）"
+        "【cat】订单 8353 入账收益 -0.29，入账成本 0.29"
     );
 }
 
