@@ -1,0 +1,1860 @@
+use super::*;
+use crate::book::{BookStore, Level};
+use crate::domain::{TokenRef, Topic, TopicKey};
+use std::time::Instant;
+use uuid::Uuid;
+
+pub(super) fn d(s: &str) -> Decimal {
+    Decimal::from_str(s).unwrap()
+}
+
+fn token(platform: &str, id: &str, label: &str) -> TokenRef {
+    TokenRef {
+        platform: platform.into(),
+        token_id: id.into(),
+        label: label.into(),
+        option_id: "1".into(),
+        condition_id: None,
+        asset_id: None,
+        side_index: None,
+        neg_risk: None,
+        fees_enabled: None,
+        fee_rate: None,
+    }
+}
+
+pub(super) fn sample_topic() -> Topic {
+    Topic {
+        key: TopicKey::new(Uuid::nil(), 0),
+        title: "t".into(),
+        market_title: "m".into(),
+        end_date: None,
+        tokens: vec![
+            token(POLYMARKET, "pm-yes", "yes"),
+            token(POLYMARKET, "pm-no", "no"),
+            token(OUTCOME, "#10", "no"),
+            token(OUTCOME, "#11", "yes"),
+        ],
+    }
+}
+
+pub(super) fn fees_zero() -> FeeContext {
+    FeeContext {
+        polymarket_fee_rate: Decimal::ZERO,
+        outcome_taker_rate: Decimal::ZERO,
+        outcome_builder_rate: Decimal::ZERO,
+    }
+}
+
+pub(super) fn limits(min_profit: &str, cost_limit: &str) -> ArbLimits {
+    ArbLimits {
+        cost_limit: d(cost_limit),
+        min_profit: d(min_profit),
+        min_apr: Decimal::ZERO,
+        days: 1,
+    }
+}
+
+fn snapshot(
+    books: &mut BookStore,
+    platform: &str,
+    token_id: &str,
+    asks: Vec<(&str, &str)>,
+    now: Instant,
+) {
+    books.replace_snapshot(
+        platform,
+        token_id,
+        vec![],
+        asks.into_iter()
+            .map(|(p, s)| Level {
+                price: d(p),
+                size: d(s),
+            })
+            .collect(),
+        1,
+        now,
+    );
+    if platform == POLYMARKET {
+        books.set_tick_size(platform, token_id, d("0.01"));
+    }
+}
+
+fn plan_with(books: &BookStore, limits: &ArbLimits) -> ArbPlan {
+    best_plan(&sample_topic(), books, &fees_zero(), limits).expect("plan")
+}
+
+#[test]
+fn venue_mins_match_fak_and_outcome_rules() {
+    assert!(below_venue_mins(POLYMARKET, true, d("4"), d("2")));
+    assert!(below_venue_mins(POLYMARKET, true, d("5"), d("0.9")));
+    assert!(!below_venue_mins(POLYMARKET, true, d("5"), d("1")));
+    assert!(!below_venue_mins(POLYMARKET, false, d("1"), d("0.01")));
+    assert!(below_venue_mins(OUTCOME, true, d("20"), d("0.99")));
+    assert!(below_venue_mins(OUTCOME, false, d("1"), d("0.5")));
+    assert!(!below_venue_mins(OUTCOME, true, d("2"), d("1")));
+    assert!(!below_venue_mins(OUTCOME, false, d("1"), d("1")));
+}
+
+fn inspect_reasons(books: &BookStore, now: Instant, limits: &ArbLimits) -> Vec<&'static str> {
+    inspect_calc(
+        &sample_topic(),
+        books,
+        &fees_zero(),
+        limits,
+        now,
+        std::time::Duration::from_secs(5),
+    )
+    .1
+    .into_iter()
+    .map(|p| {
+        assert_eq!(p.stale, None);
+        p.reason
+    })
+    .collect()
+}
+
+#[test]
+fn inspect_stale_kinds_and_per_side_reasons() {
+    let now = Instant::now();
+    // 年龄不影响候选准入，包括长期静止；显式失效仍须拒绝。
+    let states = [
+        (false, 1),
+        (false, 5),
+        (false, 6),
+        (false, 86400),
+        (true, 1),
+        (true, 86400),
+    ];
+    for (pm_invalid, pm_age) in states {
+        for (out_invalid, out_age) in states {
+            let mut books = BookStore::default();
+            snapshot(
+                &mut books,
+                POLYMARKET,
+                "pm-yes",
+                vec![("0.40", "50")],
+                now - std::time::Duration::from_secs(pm_age),
+            );
+            snapshot(
+                &mut books,
+                OUTCOME,
+                "#10",
+                vec![("0.40", "50")],
+                now - std::time::Duration::from_secs(out_age),
+            );
+            if pm_invalid {
+                books.mark_platform_stale(POLYMARKET);
+            }
+            if out_invalid {
+                books.mark_platform_stale(OUTCOME);
+            }
+            let (counts, pairs) = inspect_calc(
+                &sample_topic(),
+                &books,
+                &fees_zero(),
+                &limits("0", "100"),
+                now,
+                std::time::Duration::from_secs(5),
+            );
+            let pm_stale = pm_invalid;
+            let out_stale = out_invalid;
+            let plan = best_plan(&sample_topic(), &books, &fees_zero(), &limits("0", "100"));
+            assert_eq!(plan.is_some(), !pm_invalid && !out_invalid);
+            if let Some(plan) = plan {
+                assert_eq!(plan.net_shares, d("50"));
+                assert_eq!(plan.total_cost, d("40"));
+                assert_eq!(plan.profit, d("10"));
+            }
+            let expected = CalcSkipCounts {
+                missing_book: 1,
+                stale_book: u64::from(pm_stale || out_stale),
+                stale_pm_only: u64::from(pm_stale && !out_stale),
+                stale_out_only: u64::from(!pm_stale && out_stale),
+                stale_both: u64::from(pm_stale && out_stale),
+                stale_pm_invalid: u64::from(pm_invalid),
+                stale_out_invalid: u64::from(out_invalid),
+                ..CalcSkipCounts::default()
+            };
+            assert_eq!(counts, expected);
+            assert_eq!(
+                counts.stale_book,
+                counts.stale_pm_only + counts.stale_out_only + counts.stale_both
+            );
+            let sample = diagnose_pair(
+                &sample_topic(),
+                &books,
+                &fees_zero(),
+                &limits("0", "100"),
+                now,
+                std::time::Duration::from_secs(5),
+                "yes",
+                "no",
+            );
+            if !pm_stale && !out_stale {
+                assert_eq!(sample.reason, "ok");
+                assert_eq!(sample.stale, None);
+                assert_eq!(pairs.len(), 1);
+                continue;
+            }
+            let (kind, index, name) = match (pm_stale, out_stale) {
+                (true, false) => (StaleKind::PmOnly, 0, "pm_only"),
+                (false, true) => (StaleKind::OutOnly, 1, "out_only"),
+                _ => (StaleKind::Both, 2, "both"),
+            };
+            assert_eq!(kind.index(), index);
+            assert_eq!(kind.as_str(), name);
+            assert_eq!(sample.reason, "stale_book");
+            assert_eq!(
+                sample.stale,
+                Some(CalcStaleDetail {
+                    pm: CalcBookState {
+                        source: BookSource::Ws,
+                        age_ms: pm_age * 1000,
+                        invalid: pm_invalid
+                    },
+                    out: CalcBookState {
+                        source: BookSource::Ws,
+                        age_ms: out_age * 1000,
+                        invalid: out_invalid
+                    },
+                    threshold_ms: 5000,
+                    kind,
+                })
+            );
+            assert_eq!(
+                pairs
+                    .iter()
+                    .find(|p| p.reason == "stale_book")
+                    .unwrap()
+                    .stale,
+                sample.stale
+            );
+            assert_eq!(sample.pm_ask, None);
+            assert_eq!(sample.out_ask, None);
+        }
+    }
+}
+
+#[test]
+fn inspect_missing_books_or_tokens_do_not_count_stale() {
+    let now = Instant::now();
+    for present in [None, Some(POLYMARKET), Some(OUTCOME)] {
+        let mut books = BookStore::default();
+        if let Some(platform) = present {
+            let id = if platform == POLYMARKET {
+                "pm-yes"
+            } else {
+                "#10"
+            };
+            snapshot(
+                &mut books,
+                platform,
+                id,
+                vec![("0.40", "50")],
+                now - std::time::Duration::from_secs(60),
+            );
+            books.mark_platform_stale(platform);
+        }
+        let (counts, pairs) = inspect_calc(
+            &sample_topic(),
+            &books,
+            &fees_zero(),
+            &limits("0", "100"),
+            now,
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(
+            counts,
+            CalcSkipCounts {
+                missing_book: 2,
+                ..CalcSkipCounts::default()
+            }
+        );
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs
+            .iter()
+            .all(|p| p.reason == "missing_book" && p.stale.is_none()));
+    }
+    let mut books = BookStore::default();
+    snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+    for missing in [POLYMARKET, OUTCOME] {
+        let mut topic = sample_topic();
+        topic.tokens.retain(|t| t.platform != missing);
+        let sample = diagnose_pair(
+            &topic,
+            &books,
+            &fees_zero(),
+            &limits("0", "100"),
+            now,
+            std::time::Duration::from_secs(5),
+            "yes",
+            "no",
+        );
+        assert_eq!(sample.reason, "missing_book");
+        assert_eq!(sample.stale, None);
+    }
+}
+
+#[test]
+fn candidate_age_does_not_change_source_selection_or_invalid_diagnostics() {
+    let now = Instant::now();
+    for max_age in [5, 3600] {
+        for pm_rest in [false, true] {
+            for out_rest in [false, true] {
+                let mut books = BookStore::new(std::time::Duration::from_secs(max_age));
+                for (platform, id, rest) in
+                    [(POLYMARKET, "pm-yes", pm_rest), (OUTCOME, "#10", out_rest)]
+                {
+                    snapshot(
+                        &mut books,
+                        platform,
+                        id,
+                        vec![("0.40", "50")],
+                        now - std::time::Duration::from_secs(60),
+                    );
+                    if rest {
+                        let ticket = books.begin_rest(platform, id);
+                        books
+                            .accept_rest(
+                                &ticket,
+                                vec![],
+                                vec![Level {
+                                    price: d("0.40"),
+                                    size: d("50"),
+                                }],
+                                2,
+                                now - std::time::Duration::from_secs(10),
+                                None,
+                            )
+                            .unwrap();
+                    }
+                }
+                let (counts, pairs) = inspect_calc(
+                    &sample_topic(),
+                    &books,
+                    &fees_zero(),
+                    &limits("0", "100"),
+                    now,
+                    std::time::Duration::from_secs(1),
+                );
+                assert_eq!(
+                    counts,
+                    CalcSkipCounts {
+                        missing_book: 1,
+                        ..Default::default()
+                    }
+                );
+                assert!(pairs.iter().all(|pair| pair.stale.is_none()));
+                assert!(
+                    best_plan(&sample_topic(), &books, &fees_zero(), &limits("0", "100")).is_some()
+                );
+                let expected_state = |platform, rest| {
+                    if rest && (platform == POLYMARKET || max_age == 5) {
+                        CalcBookState {
+                            source: BookSource::Rest,
+                            age_ms: 10000,
+                            invalid: false,
+                        }
+                    } else {
+                        CalcBookState {
+                            source: BookSource::Ws,
+                            age_ms: 60000,
+                            invalid: false,
+                        }
+                    }
+                };
+                for (platform, id, rest) in
+                    [(POLYMARKET, "pm-yes", pm_rest), (OUTCOME, "#10", out_rest)]
+                {
+                    let (book, source) = books.get_with_source(platform, id).unwrap();
+                    assert_eq!(source, expected_state(platform, rest).source);
+                    assert_eq!(
+                        now.duration_since(book.received_at).as_millis() as u64,
+                        expected_state(platform, rest).age_ms
+                    );
+                }
+                // 仅 PM 显式失效，另一侧无论来自旧 WS 还是旧 REST 都不能归为失效。
+                books.mark_platform_stale(POLYMARKET);
+                let (counts, pairs) = inspect_calc(
+                    &sample_topic(),
+                    &books,
+                    &fees_zero(),
+                    &limits("0", "100"),
+                    now,
+                    std::time::Duration::from_secs(1),
+                );
+                let sample = pairs.iter().find(|p| p.reason == "stale_book").unwrap();
+                assert_eq!(
+                    sample.stale,
+                    Some(CalcStaleDetail {
+                        pm: CalcBookState {
+                            invalid: true,
+                            ..expected_state(POLYMARKET, pm_rest)
+                        },
+                        out: expected_state(OUTCOME, out_rest),
+                        threshold_ms: 1000,
+                        kind: StaleKind::PmOnly,
+                    })
+                );
+                assert_eq!(counts.stale_pm_invalid, 1);
+                assert_eq!(counts.stale_both, 0);
+                assert_eq!(counts.stale_pm_expired, 0);
+                assert_eq!(counts.stale_out_expired, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn candidate_ignores_age_at_and_beyond_freshness_boundary() {
+    let now = Instant::now();
+    let threshold = std::time::Duration::from_secs(5);
+    let mut books = BookStore::default();
+    snapshot(
+        &mut books,
+        POLYMARKET,
+        "pm-yes",
+        vec![("0.40", "50")],
+        now - threshold - std::time::Duration::from_nanos(1),
+    );
+    snapshot(
+        &mut books,
+        OUTCOME,
+        "#10",
+        vec![("0.40", "50")],
+        now - threshold,
+    );
+    let (counts, pairs) = inspect_calc(
+        &sample_topic(),
+        &books,
+        &fees_zero(),
+        &limits("0", "100"),
+        now,
+        threshold,
+    );
+    assert_eq!(
+        counts,
+        CalcSkipCounts {
+            missing_book: 1,
+            ..Default::default()
+        }
+    );
+    assert!(pairs.iter().all(|pair| pair.stale.is_none()));
+    assert!(best_plan(&sample_topic(), &books, &fees_zero(), &limits("0", "100")).is_some());
+    assert!(!books
+        .get(POLYMARKET, "pm-yes")
+        .unwrap()
+        .is_fresh(threshold, now));
+    assert!(books.get(OUTCOME, "#10").unwrap().is_fresh(threshold, now));
+}
+
+#[test]
+fn unchanged_old_ws_books_can_generate_candidates_without_renewing_ttl() {
+    let now = Instant::now();
+    let old = now - std::time::Duration::from_secs(86400);
+    let mut books = BookStore::default();
+    for (platform, id) in [(POLYMARKET, "pm-yes"), (OUTCOME, "#10")] {
+        snapshot(&mut books, platform, id, vec![("0.40", "50")], old);
+        assert_eq!(
+            books.replace_snapshot(
+                platform,
+                id,
+                vec![],
+                vec![Level {
+                    price: d("0.40"),
+                    size: d("50"),
+                }],
+                2,
+                now
+            ),
+            crate::book::BookUpdate::VerifiedUnchanged
+        );
+        let book = books.get(platform, id).unwrap();
+        assert_eq!(book.received_at, old);
+        assert!(!book.stale);
+        assert!(!book.is_fresh(std::time::Duration::from_secs(5), now));
+    }
+    let plan = plan_with(&books, &limits("0", "100"));
+    assert_eq!(plan.profit, d("10"));
+    assert_eq!(
+        inspect_reasons(&books, now, &limits("0", "100")),
+        vec!["missing_book"]
+    );
+}
+
+#[test]
+fn executable_direction_still_records_other_direction_stale_stats() {
+    let now = Instant::now();
+    let mut books = BookStore::default();
+    snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+    snapshot(
+        &mut books,
+        POLYMARKET,
+        "pm-no",
+        vec![("0.40", "50")],
+        now - std::time::Duration::from_secs(6),
+    );
+    snapshot(&mut books, OUTCOME, "#11", vec![("0.40", "50")], now);
+    let topic = sample_topic();
+    let fees = fees_zero();
+    let limits = limits("0", "100");
+    let threshold = std::time::Duration::from_secs(5);
+    let plan = best_plan(&topic, &books, &fees, &limits);
+    assert!(plan.is_some());
+    let (counts, pairs) = inspect_calc(&topic, &books, &fees, &limits, now, threshold);
+    assert_eq!(counts, CalcSkipCounts::default());
+    assert!(pairs.is_empty());
+    books.invalidate_ws(POLYMARKET, "pm-no", crate::book::BookReject::InvalidPayload);
+    let plan = best_plan(&topic, &books, &fees, &limits);
+    let executable = plan.as_ref().expect("fresh direction remains executable");
+    assert_eq!(executable.pm.label, "yes");
+    assert_eq!(executable.outcome.label, "no");
+    let (counts, pairs) = inspect_calc(&topic, &books, &fees, &limits, now, threshold);
+    assert_eq!(pairs.len(), 1);
+    assert_eq!(pairs[0].pm_label, "no");
+    assert_eq!(pairs[0].out_label, "yes");
+    assert_eq!(pairs[0].reason, "stale_book");
+    assert_eq!(pairs[0].stale.unwrap().kind, StaleKind::PmOnly);
+
+    let stats = crate::stats::MinuteStats::new();
+    stats.found();
+    stats.record_calc_skips(&counts);
+    stats.record_calc_samples(topic.key, pairs, plan.is_none());
+    assert_eq!(
+        stats.snapshot_and_reset(),
+        crate::stats::MinuteSnapshot {
+            found: 1,
+            stale_book: 1,
+            stale_pm_only: 1,
+            stale_pm_invalid: 1,
+            ..Default::default()
+        }
+    );
+    assert_eq!(stats.snapshot_and_reset(), Default::default());
+}
+
+#[test]
+fn inspect_reports_unit_cost_and_venue_min() {
+    let mut books = BookStore::default();
+    let now = Instant::now();
+    let old = now - std::time::Duration::from_secs(86400);
+    snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.60", "50")], old);
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.50", "50")], old);
+    snapshot(&mut books, POLYMARKET, "pm-no", vec![("0.40", "3")], old);
+    snapshot(&mut books, OUTCOME, "#11", vec![("0.40", "3")], old);
+    let reasons = inspect_reasons(&books, now, &limits("-1", "10"));
+    assert!(reasons.contains(&"unit_cost_ge_revenue"));
+    assert!(reasons.contains(&"venue_min"));
+}
+
+#[test]
+fn inspect_reports_no_tick() {
+    let mut books = BookStore::default();
+    let now = Instant::now();
+    books.replace_snapshot(
+        POLYMARKET,
+        "pm-yes",
+        vec![],
+        vec![Level {
+            price: d("0.40"),
+            size: d("50"),
+        }],
+        1,
+        now,
+    );
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+    snapshot(&mut books, POLYMARKET, "pm-no", vec![("0.60", "50")], now);
+    snapshot(&mut books, OUTCOME, "#11", vec![("0.50", "50")], now);
+    let reasons = inspect_reasons(&books, now, &limits("-1", "10"));
+    assert!(reasons.contains(&"no_tick"));
+}
+
+#[test]
+fn inspect_reports_cost_limit() {
+    let mut books = BookStore::default();
+    let now = Instant::now();
+    snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+    snapshot(&mut books, POLYMARKET, "pm-no", vec![("0.60", "50")], now);
+    snapshot(&mut books, OUTCOME, "#11", vec![("0.50", "50")], now);
+    let reasons = inspect_reasons(&books, now, &limits("-1", "2"));
+    assert!(reasons.contains(&"cost_limit"));
+}
+
+fn assert_fractional_plan(
+    pm_asks: Vec<Level>,
+    out_asks: Vec<Level>,
+    fees: &FeeContext,
+    limits: &ArbLimits,
+    shares: Decimal,
+    pm_cost: Decimal,
+    pm_cap: Decimal,
+) -> ArbPlan {
+    let now = Instant::now();
+    let mut books = BookStore::default();
+    books.replace_snapshot(POLYMARKET, "pm-yes", vec![], pm_asks, 1, now);
+    books.set_tick_size(POLYMARKET, "pm-yes", d("0.01"));
+    books.replace_snapshot(OUTCOME, "#10", vec![], out_asks, 1, now);
+    let topic = sample_topic();
+    let pm = books.get(POLYMARKET, "pm-yes").unwrap();
+    let out = books.get(OUTCOME, "#10").unwrap();
+    let plan = plan_arbitrage(
+        &topic,
+        pm,
+        out,
+        &topic.tokens[0],
+        &topic.tokens[2],
+        fees,
+        limits,
+    )
+    .expect("fractional depth is fillable");
+    assert_eq!(plan.net_shares, shares);
+    assert_eq!(plan.pm.shares, shares);
+    assert_eq!(plan.outcome.shares, shares);
+    assert_eq!(floor_shares(shares), shares);
+    assert_eq!(plan.pm.cost, pm_cost);
+    assert_eq!(plan.pm.cap_price, pm_cap);
+    assert_eq!(
+        take_asks_cost(&pm.asks, shares, plan.pm.cap_price, false),
+        Some(plan.pm.cost)
+    );
+    assert_eq!(
+        take_asks_cost(&out.asks, shares, plan.outcome.cap_price, true),
+        Some(plan.outcome.cost)
+    );
+    assert_eq!(
+        plan.total_cost,
+        plan.pm.cost + plan.outcome.cost + plan.pm.fee + plan.outcome.fee
+    );
+    assert!(confirm_plan(&topic, &plan, pm, out, fees, limits).is_some());
+    plan
+}
+
+pub(super) fn levels(rows: &[(&str, &str)]) -> Vec<Level> {
+    rows.iter()
+        .map(|(price, size)| Level {
+            price: d(price),
+            size: d(size),
+        })
+        .collect()
+}
+
+#[test]
+fn legacy_decimal_28_digit_flat_oracle_records_nonconvexity() {
+    let mut counterexamples = 0;
+    let mut checked_28_digit_case = false;
+    // 实数模型的边际总成本恰为1，跨档折价让收益近乎平坦；
+    // 仅保留旧 Decimal 舍入对照；不是新精确搜索的 oracle。
+    for p in [d("0.4"), d("0.5"), d("0.6")] {
+        for rate in [d("0.07"), d("0.1"), d("1")] {
+            let fees = FeeContext {
+                polymarket_fee_rate: rate,
+                outcome_taker_rate: Decimal::ZERO,
+                outcome_builder_rate: Decimal::ZERO,
+            };
+            let out_px = Decimal::ONE - p - rate * p * (Decimal::ONE - p);
+            for scale in (13..=28).rev() {
+                checked_28_digit_case |= scale == 28;
+                let discount = Decimal::new(1, scale);
+                let quote = LegacyPmQuote {
+                    max_net: d("40"),
+                    first_cost: p - discount,
+                    cap: p,
+                };
+                let acc = LegacyAcc::default();
+                let mut bounds = limits("0", "100");
+                bounds.days = 365;
+                let profits: Vec<_> = (5..=40)
+                    .map(|n| {
+                        acc.plus(Decimal::from(n), &quote, out_px)
+                            .metrics(&fees, &bounds)
+                            .profit
+                    })
+                    .collect();
+                for left in 0..profits.len() - 2 {
+                    for right in left + 2..profits.len() {
+                        for mid in left + 1..right {
+                            if profits[mid] > profits[left].max(profits[right]) {
+                                bounds.min_profit = profits[mid];
+                                let passes = |i: usize| {
+                                    acc.plus(Decimal::from(i + 5), &quote, out_px)
+                                        .passes_all(&fees, &bounds)
+                                };
+                                assert!(!passes(left));
+                                assert!(passes(mid));
+                                assert!(!passes(right));
+                                counterexamples += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked_28_digit_case);
+    assert!(counterexamples > 0, "旧 Decimal 舍入对照应保留非凸反例");
+}
+
+#[test]
+fn legacy_decimal_prefix_search_rounding_false_positive() {
+    // 正常价格/[0,1]费率/非负门槛仍可出现两端失败而中间通过。
+    // 旧 Decimal 的39股通过是舍入假阳性；新路径使用精确有理数。
+    let quote = LegacyPmQuote {
+        max_net: d("40"),
+        first_cost: d("0.39999999999999999999999999"),
+        cap: d("0.4"),
+    };
+    let fees = FeeContext {
+        polymarket_fee_rate: Decimal::ONE,
+        outcome_taker_rate: Decimal::ZERO,
+        outcome_builder_rate: Decimal::ZERO,
+    };
+    let bounds = ArbLimits {
+        days: 365,
+        ..limits("0.000000000000000000000000013", "100")
+    };
+    let acc = LegacyAcc::default();
+    for (n, profit, passes) in [
+        (5, "0.0000000000000000000000000120", false),
+        (39, "0.000000000000000000000000013", true),
+        (40, "0.000000000000000000000000012", false),
+    ] {
+        let trial = acc.plus(Decimal::from(n), &quote, d("0.36"));
+        assert!(trial.passes_mins());
+        assert_eq!(trial.metrics(&fees, &bounds).profit, d(profit));
+        assert_eq!(trial.passes_all(&fees, &bounds), passes);
+    }
+    let maximum = (5..=40).rev().find(|n| {
+        acc.plus(Decimal::from(*n), &quote, d("0.36"))
+            .passes_all(&fees, &bounds)
+    });
+    assert_eq!(maximum, Some(39));
+}
+
+#[test]
+fn known_regression_fractional_profit_boundary_original_example() {
+    let now = Instant::now();
+    let mut books = BookStore::default();
+    books.replace_snapshot(
+        POLYMARKET,
+        "pm-yes",
+        vec![],
+        levels(&[("0.30", "4.5"), ("0.61", "100")]),
+        1,
+        now,
+    );
+    books.set_tick_size(POLYMARKET, "pm-yes", d("0.01"));
+    books.replace_snapshot(OUTCOME, "#10", vec![], levels(&[("0.40", "200")]), 1, now);
+    let topic = sample_topic();
+    let pm = books.get(POLYMARKET, "pm-yes").unwrap();
+    let out = books.get(OUTCOME, "#10").unwrap();
+    assert!(
+        plan_arbitrage(
+            &topic,
+            pm,
+            out,
+            &topic.tokens[0],
+            &topic.tokens[2],
+            &fees_zero(),
+            &limits("1", "100"),
+        )
+        .is_none(),
+        "0.61 + 0.40 = 1.01 最坏情况必亏，必须拒绝"
+    );
+}
+
+#[test]
+fn fractional_first_level_fills_terminal_depth_not_just_venue_min() {
+    assert_fractional_plan(
+        levels(&[("0.30", "0.5"), ("0.40", "100")]),
+        levels(&[("0.40", "1000")]),
+        &fees_zero(),
+        &limits("0", "1000"),
+        d("100"),
+        d("39.95"),
+        d("0.40"),
+    );
+}
+
+#[test]
+fn fractional_levels_cross_to_first_feasible_physical_interval() {
+    assert_fractional_plan(
+        levels(&[
+            ("0.20", "0.2"),
+            ("0.30", "0.3"),
+            ("0.40", "0.5"),
+            ("0.45", "20"),
+        ]),
+        levels(&[("0.40", "30")]),
+        &fees_zero(),
+        &limits("1", "100"),
+        d("21"),
+        d("9.33"),
+        d("0.45"),
+    );
+}
+
+#[test]
+fn fractional_normal_level_remainder_keeps_real_cost_and_worst_cap() {
+    assert_fractional_plan(
+        levels(&[("0.30", "4.5"), ("0.40", "100")]),
+        levels(&[("0.40", "200")]),
+        &fees_zero(),
+        &limits("0", "1000"),
+        d("104"),
+        d("41.15"),
+        d("0.40"),
+    );
+    let plan = assert_fractional_plan(
+        levels(&[("0.20", "0.5"), ("0.21", "1.5"), ("0.40", "100")]),
+        levels(&[("0.40", "1000")]),
+        &fees_zero(),
+        &limits("0", "3.615"),
+        d("5"),
+        d("1.615"),
+        d("0.40"),
+    );
+    assert_eq!(plan.pm.avg_price, d("0.323"));
+}
+
+#[test]
+fn fractional_many_tiny_levels_do_not_hit_candidate_limit() {
+    let pm = (0..1000)
+        .map(|i| Level {
+            price: d("0.20") + Decimal::from(i) * d("0.0001"),
+            size: d("0.01"),
+        })
+        .collect();
+    assert_fractional_plan(
+        pm,
+        levels(&[("0.40", "10")]),
+        &fees_zero(),
+        &limits("3", "100"),
+        d("9"),
+        d("2.20455"),
+        d("0.29"),
+    );
+    let pm = (0..100)
+        .map(|i| Level {
+            price: d("0.20") + Decimal::from(i) * d("0.001"),
+            size: d("0.1"),
+        })
+        .collect();
+    assert_fractional_plan(
+        pm,
+        levels(&[("0.40", "10")]),
+        &fees_zero(),
+        &limits("3", "100"),
+        d("9"),
+        d("2.2005"),
+        d("0.29"),
+    );
+}
+
+#[test]
+fn fractional_search_can_visit_more_than_sixty_four_quotes() {
+    let pm = (0..160)
+        .map(|i| Level {
+            price: d("0.20") + Decimal::from(i) * d("0.0001"),
+            size: d("0.5"),
+        })
+        .collect();
+    assert_fractional_plan(
+        pm,
+        levels(&[("0.40", "100")]),
+        &fees_zero(),
+        &limits("27", "100"),
+        d("69"),
+        d("14.27265"),
+        d("0.22"),
+    );
+}
+
+#[test]
+fn fractional_budget_refuses_unproven_fee_monotonicity() {
+    for (pm_rate, out_rate) in [("-0.01", "0"), ("1.01", "0"), ("0", "-0.01"), ("0", "1.01")] {
+        let fees = FeeContext {
+            polymarket_fee_rate: d(pm_rate),
+            outcome_taker_rate: d(out_rate),
+            outcome_builder_rate: Decimal::ZERO,
+        };
+        assert!(search_pair(
+            &sample_topic().tokens[0],
+            &sample_topic().tokens[2],
+            &levels(&[("0.3", "0.5"), ("0.4", "100")]),
+            &levels(&[("0.4", "100")]),
+            &fees,
+            &limits("0", "100"),
+            d("0.01")
+        )
+        .is_none());
+    }
+}
+
+#[test]
+fn fractional_quotes_scale_with_levels_not_share_count() {
+    assert_fractional_plan(
+        levels(&[("0.30", "0.5"), ("0.40", "1000000000000")]),
+        levels(&[("0.40", "1000000000000")]),
+        &fees_zero(),
+        &limits("0", "1000000000000"),
+        d("1000000000000"),
+        d("399999999999.95"),
+        d("0.40"),
+    );
+}
+
+#[test]
+fn fractional_budget_exact_and_just_below_requote_cost() {
+    for (budget, shares, cost) in [("7.95", "10", "3.95"), ("7.949999", "9", "3.55")] {
+        assert_fractional_plan(
+            levels(&[("0.30", "0.5"), ("0.40", "100")]),
+            levels(&[("0.40", "200")]),
+            &fees_zero(),
+            &limits("0", budget),
+            d(shares),
+            d(cost),
+            d("0.40"),
+        );
+    }
+}
+
+#[test]
+fn fractional_budget_nonzero_fees_profit_and_apr() {
+    let fees = FeeContext {
+        polymarket_fee_rate: d("0.07"),
+        outcome_taker_rate: d("0.00035"),
+        outcome_builder_rate: Decimal::ZERO,
+    };
+    // 10 股 PM 均价0.395，费用0.1672825；Outcome 即时费0，结算准备0.0035。
+    let mut exact = limits("1.8", "8.1172825");
+    exact.days = 365;
+    exact.min_apr = d("0.23");
+    let plan = assert_fractional_plan(
+        levels(&[("0.30", "0.5"), ("0.40", "100")]),
+        levels(&[("0.40", "200")]),
+        &fees,
+        &exact,
+        d("10"),
+        d("3.95"),
+        d("0.40"),
+    );
+    assert_eq!(plan.pm.fee, d("0.1672825"));
+    assert_eq!(plan.total_cost, exact.cost_limit);
+    exact.cost_limit -= d("0.0000001");
+    exact.min_profit = d("0");
+    assert_fractional_plan(
+        levels(&[("0.30", "0.5"), ("0.40", "100")]),
+        levels(&[("0.40", "200")]),
+        &fees,
+        &exact,
+        d("9"),
+        d("3.55"),
+        d("0.40"),
+    );
+    // 已有整数累计后再桥接，预算必须包含整体均价手续费，而非仅新增报价手续费。
+    let accumulated = limits("0", "7.7102825");
+    assert_fractional_plan(
+        levels(&[("0.30", "4.5"), ("0.40", "100")]),
+        levels(&[("0.40", "200")]),
+        &fees,
+        &accumulated,
+        d("10"),
+        d("3.55"),
+        d("0.40"),
+    );
+    exact.min_profit = d("1.8");
+    assert!(search_pair(
+        &token(POLYMARKET, "pm-yes", "yes"),
+        &token(OUTCOME, "#10", "no"),
+        &levels(&[("0.30", "0.5"), ("0.40", "100")]),
+        &levels(&[("0.40", "200")]),
+        &fees,
+        &exact,
+        d("0.01")
+    )
+    .is_none());
+    exact.min_profit = Decimal::ZERO;
+    exact.min_apr = d("0.25");
+    assert!(search_pair(
+        &token(POLYMARKET, "pm-yes", "yes"),
+        &token(OUTCOME, "#10", "no"),
+        &levels(&[("0.30", "0.5"), ("0.40", "100")]),
+        &levels(&[("0.40", "200")]),
+        &fees,
+        &exact,
+        d("0.01")
+    )
+    .is_none());
+}
+
+#[test]
+fn fractional_insufficient_total_and_outcome_per_level_floor() {
+    for (pm, out) in [
+        (
+            levels(&[("0.30", "0.4"), ("0.40", "0.5")]),
+            levels(&[("0.40", "100")]),
+        ),
+        (
+            levels(&[("0.30", "4.5"), ("0.40", "0.4")]),
+            levels(&[("0.40", "100")]),
+        ),
+        (
+            levels(&[("0.30", "0.5"), ("0.40", "100")]),
+            levels(&[("0.30", "2.9"), ("0.40", "2.9")]),
+        ),
+    ] {
+        assert!(search_pair(
+            &token(POLYMARKET, "pm-yes", "yes"),
+            &token(OUTCOME, "#10", "no"),
+            &pm,
+            &out,
+            &fees_zero(),
+            &limits("0", "100"),
+            d("0.01")
+        )
+        .is_none());
+    }
+    assert_fractional_plan(
+        levels(&[("0.30", "0.5"), ("0.40", "100")]),
+        levels(&[("0.20", "0.9"), ("0.30", "2.9"), ("0.40", "3.9")]),
+        &fees_zero(),
+        &limits("0", "100"),
+        d("5"),
+        d("1.95"),
+        d("0.40"),
+    );
+}
+
+#[test]
+fn accumulates_fractional_pm_first_level() {
+    let mut books = BookStore::default();
+    let now = Instant::now();
+    snapshot(
+        &mut books,
+        POLYMARKET,
+        "pm-yes",
+        vec![("0.30", "0.5"), ("0.40", "20")],
+        now,
+    );
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "20")], now);
+    let plan = plan_with(&books, &limits("1", "100"));
+    assert_eq!(plan.net_shares, d("20"));
+    assert_eq!(plan.pm.cost, d("7.95"));
+    assert_eq!(plan.pm.cap_price, d("0.40"));
+}
+
+#[test]
+fn fills_available_depth_when_first_level_passes() {
+    let mut books = BookStore::default();
+    let now = Instant::now();
+    snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+    let plan = plan_with(&books, &limits("3", "100"));
+    // 过门槛后买满档深：50 股、成本 40，而不是刚过线的 15 股。
+    assert_eq!(plan.net_shares, d("50"));
+    assert_eq!(plan.total_cost, d("40"));
+    assert_eq!(plan.profit, d("10"));
+    assert_eq!(plan.pm.label, "yes");
+    assert_eq!(plan.outcome.label, "no");
+}
+
+#[test]
+fn fills_budget_when_first_level_is_deep() {
+    let mut books = BookStore::default();
+    let now = Instant::now();
+    snapshot(
+        &mut books,
+        POLYMARKET,
+        "pm-yes",
+        vec![("0.40", "10000")],
+        now,
+    );
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "10000")], now);
+    let plan = plan_with(&books, &limits("3", "100"));
+    assert_eq!(plan.net_shares, d("125"));
+    assert_eq!(plan.total_cost, d("100"));
+    assert_eq!(plan.profit, d("25"));
+}
+
+#[test]
+fn accumulates_next_level_when_first_level_misses_profit() {
+    // 直接保留旧计算样例；BookStore 现在拒绝快照中的重复价格。
+    let asks = levels(&[("0.45", "10"), ("0.45", "30")]);
+    let plan = search_pair(
+        &token(POLYMARKET, "pm-yes", "yes"),
+        &token(OUTCOME, "#10", "no"),
+        &asks,
+        &asks,
+        &fees_zero(),
+        &limits("3", "100"),
+        d("0.01"),
+    )
+    .expect("same integer depth plan");
+    // 单位利润 0.10；第一档 10 不够门槛，吃掉后再把第二档 30 买满 → 40 股。
+    assert_eq!(plan.net_shares, d("40"));
+    assert_eq!(plan.total_cost, d("36"));
+    assert_eq!(plan.profit, d("4"));
+}
+
+#[test]
+fn picks_higher_roi_direction() {
+    let mut books = BookStore::default();
+    let now = Instant::now();
+    snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+    let old = now - std::time::Duration::from_secs(86400);
+    snapshot(&mut books, POLYMARKET, "pm-no", vec![("0.20", "50")], old);
+    snapshot(&mut books, OUTCOME, "#11", vec![("0.30", "50")], old);
+    let plan = plan_with(&books, &limits("3", "100"));
+    // yes+no 单位成本 0.80 ROI=0.25；no+yes 单位成本 0.50 ROI=1.00。两边都买满 50。
+    assert_eq!(plan.pm.label, "no");
+    assert_eq!(plan.outcome.label, "yes");
+    assert_eq!(plan.net_shares, d("50"));
+    assert_eq!(plan.total_cost, d("25"));
+}
+
+#[test]
+fn rejects_outcome_below_min_notional() {
+    let mut books = BookStore::default();
+    let now = Instant::now();
+    snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "20")], now);
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.09", "10")], now);
+    let plan = best_plan(&sample_topic(), &books, &fees_zero(), &limits("0.1", "100"));
+    // Outcome 10 * 0.09 = 0.90 < $1，整档吃完仍不够最小名义。
+    assert!(plan.is_none());
+}
+
+#[test]
+fn floors_fractional_outcome_size() {
+    let mut books = BookStore::default();
+    let now = Instant::now();
+    snapshot(
+        &mut books,
+        POLYMARKET,
+        "pm-yes",
+        vec![("0.40", "40.9")],
+        now,
+    );
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "40.9")], now);
+    let plan = plan_with(&books, &limits("3", "100"));
+    assert_eq!(plan.outcome.shares, floor_shares(plan.outcome.shares));
+    assert_eq!(plan.net_shares, d("40"));
+}
+
+#[test]
+fn rejects_when_apr_below_min() {
+    let mut books = BookStore::default();
+    let now = Instant::now();
+    snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+    let mut limits = limits("3", "100");
+    limits.days = 365;
+    limits.min_apr = d("0.30");
+    // ROI=0.25，APR=0.25 < 0.30。
+    let plan = best_plan(&sample_topic(), &books, &fees_zero(), &limits);
+    assert!(plan.is_none());
+}
+
+#[test]
+fn days_until_ceils_fractional_day() {
+    let now = DateTime::parse_from_rfc3339("2026-09-04T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let end = DateTime::parse_from_rfc3339("2026-09-04T12:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    assert_eq!(days_until_from(Some(end), now), 1);
+    let end = DateTime::parse_from_rfc3339("2026-09-06T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    assert_eq!(days_until_from(Some(end), now), 2);
+    assert_eq!(days_until_from(None, now), 1);
+}
+
+#[test]
+fn polymarket_fee_uses_catalog_rate() {
+    let fees = FeeContext {
+        polymarket_fee_rate: d("0.07"),
+        outcome_taker_rate: Decimal::ZERO,
+        outcome_builder_rate: Decimal::ZERO,
+    };
+    // Official crypto table: 100 shares @ $0.50 → $1.75
+    assert_eq!(
+        estimate_polymarket_fee(d("100"), d("0.50"), &fees),
+        d("1.75")
+    );
+    assert_eq!(
+        estimate_polymarket_fee(d("100"), d("0.20"), &fees),
+        d("1.12")
+    );
+    assert_eq!(
+        estimate_polymarket_fee(d("100"), d("0.50"), &fees_zero()),
+        Decimal::ZERO
+    );
+}
+
+#[test]
+fn outcome_direction_and_builder_preserve_full_fee_precision() {
+    let mut fees = FeeContext {
+        outcome_taker_rate: d("0.001344"),
+        ..fees_zero()
+    };
+    assert_eq!(
+        estimate_taker_fee(OUTCOME, OrderSide::Buy, d("30"), d("0.9608"), &fees),
+        Decimal::ZERO
+    );
+    assert_eq!(
+        estimate_taker_fee(OUTCOME, OrderSide::Sell, d("30"), d("0.9608"), &fees),
+        d("0.038739456")
+    );
+    fees.outcome_builder_rate = d("0.0003");
+    let buy = estimate_taker_fee(OUTCOME, OrderSide::Buy, d("30"), d("0.9608"), &fees);
+    let sell = estimate_taker_fee(OUTCOME, OrderSide::Sell, d("30"), d("0.9608"), &fees);
+    assert_eq!(buy, d("0.0086472"));
+    assert_eq!(sell, d("0.047386656"));
+    assert_eq!(sell - buy, d("0.038739456"));
+}
+
+#[test]
+fn diagnosis_compares_cash_to_net_unit_revenue() {
+    let mut books = BookStore::default();
+    let now = Instant::now();
+    snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.50", "30")], now);
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.499", "30")], now);
+    let sample = diagnose_books(
+        &sample_topic(),
+        books.get(POLYMARKET, "pm-yes").unwrap(),
+        books.get(OUTCOME, "#10").unwrap(),
+        &FeeContext {
+            outcome_taker_rate: d("0.001344"),
+            ..fees_zero()
+        },
+        &limits("0", "100"),
+        "yes",
+        "no",
+    );
+    assert_eq!(sample.unit_cost, Some(d("0.999")));
+    assert_eq!(sample.unit_expected_revenue, Some(d("0.998656")));
+    assert_eq!(sample.reason, "unit_cost_ge_revenue");
+}
+
+#[test]
+fn outcome_fee_uses_taker_rate() {
+    let fees = FeeContext {
+        polymarket_fee_rate: Decimal::ZERO,
+        outcome_taker_rate: d("0.00035"),
+        outcome_builder_rate: Decimal::ZERO,
+    };
+    assert_eq!(
+        estimate_outcome_fee(d("100"), OrderSide::Sell, &fees),
+        d("0.035")
+    );
+    assert_eq!(
+        estimate_outcome_fee(Decimal::ZERO, OrderSide::Sell, &fees),
+        Decimal::ZERO
+    );
+    assert_eq!(
+        estimate_outcome_fee(d("100"), OrderSide::Sell, &fees_zero()),
+        Decimal::ZERO
+    );
+}
+
+#[test]
+fn skips_when_pm_tick_size_missing() {
+    let mut books = BookStore::default();
+    let now = Instant::now();
+    books.replace_snapshot(
+        POLYMARKET,
+        "pm-yes",
+        vec![],
+        vec![Level {
+            price: d("0.40"),
+            size: d("50"),
+        }],
+        1,
+        now,
+    );
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+    let plan = best_plan(&sample_topic(), &books, &fees_zero(), &limits("3", "100"));
+    assert!(plan.is_none());
+}
+
+#[test]
+fn aligns_buy_to_provided_tick() {
+    assert_eq!(align_polymarket_price(d("0.451"), d("0.001")), d("0.451"));
+    assert_eq!(align_polymarket_price(d("0.451"), d("0.01")), d("0.46"));
+    assert_eq!(
+        align_polymarket_sell_price(d("0.456"), d("0.01")),
+        d("0.45")
+    );
+}
+
+#[test]
+fn confirm_plan_rejects_when_http_books_no_longer_arb() {
+    let mut books = BookStore::default();
+    let now = Instant::now();
+    snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+    let first = plan_with(&books, &limits("3", "100"));
+    let mut http = BookStore::default();
+    snapshot(&mut http, POLYMARKET, "pm-yes", vec![("0.55", "50")], now);
+    snapshot(&mut http, OUTCOME, "#10", vec![("0.55", "50")], now);
+    assert!(confirm_plan(
+        &sample_topic(),
+        &first,
+        http.get(POLYMARKET, "pm-yes").unwrap(),
+        http.get(OUTCOME, "#10").unwrap(),
+        &fees_zero(),
+        &limits("3", "100"),
+    )
+    .is_none());
+}
+
+#[test]
+fn confirm_plan_keeps_original_size_and_cap() {
+    let mut books = BookStore::default();
+    let now = Instant::now();
+    snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+    let first = plan_with(&books, &limits("3", "100"));
+    let mut http = BookStore::default();
+    snapshot(&mut http, POLYMARKET, "pm-yes", vec![("0.39", "80")], now);
+    snapshot(&mut http, OUTCOME, "#10", vec![("0.39", "80")], now);
+    let confirmed = confirm_plan(
+        &sample_topic(),
+        &first,
+        http.get(POLYMARKET, "pm-yes").unwrap(),
+        http.get(OUTCOME, "#10").unwrap(),
+        &fees_zero(),
+        &limits("3", "100"),
+    )
+    .expect("still fillable");
+    assert_eq!(confirmed.pm.shares, first.pm.shares);
+    assert_eq!(confirmed.outcome.shares, first.outcome.shares);
+    assert_eq!(confirmed.pm.cap_price, first.pm.cap_price);
+    assert_eq!(confirmed.outcome.cap_price, first.outcome.cap_price);
+    assert_eq!(confirmed.pm.avg_price, d("0.39"));
+    assert_eq!(confirmed.outcome.avg_price, d("0.39"));
+    assert_eq!(confirmed.pm.cost, d("19.5"));
+    assert_eq!(confirmed.outcome.cost, d("19.5"));
+}
+
+#[test]
+fn confirm_plan_refreshes_cost_before_balance_check() {
+    let now = Instant::now();
+    let mut books = BookStore::default();
+    snapshot(
+        &mut books,
+        POLYMARKET,
+        "pm-yes",
+        vec![("0.30", "4.5"), ("0.40", "95.5")],
+        now,
+    );
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "200")], now);
+    let first = plan_with(&books, &limits("1", "100"));
+    assert_eq!(first.pm.shares, d("100"));
+    assert_eq!(first.pm.cost, d("39.55"));
+    let pm_balance = d("39.70");
+    assert!(first.pm.cost + first.pm.fee <= pm_balance);
+    let mut http_pm = books.get(POLYMARKET, "pm-yes").unwrap().clone();
+    http_pm.asks = levels(&[("0.40", "100")]);
+    let confirmed = confirm_plan(
+        &sample_topic(),
+        &first,
+        &http_pm,
+        books.get(OUTCOME, "#10").unwrap(),
+        &fees_zero(),
+        &limits("1", "100"),
+    )
+    .expect("original shares and cap remain fillable");
+    assert_eq!(confirmed.pm.cost, d("40"));
+    // execute_plan 的 HTTP 确认后余额判定；不启动执行器或数据库。
+    assert!(confirmed.pm.cost + confirmed.pm.fee > pm_balance);
+    assert_eq!(confirmed.pm.shares, first.pm.shares);
+    assert_eq!(confirmed.pm.cap_price, first.pm.cap_price);
+}
+
+#[test]
+fn confirm_plan_refreshes_all_financial_fields_with_fees() {
+    let now = Instant::now();
+    let mut books = BookStore::default();
+    snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+    let first = plan_with(&books, &limits("1", "100"));
+    let fees = FeeContext {
+        polymarket_fee_rate: d("0.07"),
+        outcome_taker_rate: d("0.00035"),
+        outcome_builder_rate: Decimal::ZERO,
+    };
+    for (pm_px, out_px) in [("0.39", "0.38"), ("0.40", "0.40")] {
+        let mut pm = books.get(POLYMARKET, "pm-yes").unwrap().clone();
+        let mut out = books.get(OUTCOME, "#10").unwrap().clone();
+        pm.asks = levels(&[(pm_px, "80")]);
+        out.asks = levels(&[(out_px, "80")]);
+        // 模拟原均价低于原cap，确保上升及下降两个方向都刷新。
+        let mut original = first.clone();
+        original.pm.cost = d("19.75");
+        original.outcome.cost = d("19.75");
+        original.pm.avg_price = d("0.395");
+        original.outcome.avg_price = d("0.395");
+        let bounds = ArbLimits {
+            days: 30,
+            ..limits("1", "100")
+        };
+        let confirmed =
+            confirm_plan(&sample_topic(), &original, &pm, &out, &fees, &bounds).unwrap();
+        let pm_cost = d(pm_px) * d("50");
+        let out_cost = d(out_px) * d("50");
+        let pm_fee = estimate_polymarket_fee(d("50"), d(pm_px), &fees);
+        let out_fee = estimate_outcome_fee(out_cost, OrderSide::Buy, &fees);
+        let total_cost = pm_cost + out_cost + pm_fee + out_fee;
+        assert_eq!(confirmed.pm.cost, pm_cost);
+        assert_eq!(confirmed.outcome.cost, out_cost);
+        assert_eq!(confirmed.pm.avg_price, d(pm_px));
+        assert_eq!(confirmed.outcome.avg_price, d(out_px));
+        assert_eq!(confirmed.pm.fee, pm_fee);
+        assert_eq!(confirmed.outcome.fee, out_fee);
+        assert_eq!(confirmed.net_shares, d("50"));
+        assert_eq!(confirmed.total_cost, total_cost);
+        assert_eq!(
+            confirmed.expected_revenue,
+            d("50") * (Decimal::ONE - fees.outcome_taker_rate)
+        );
+        assert_eq!(
+            confirmed.settlement_reserve,
+            d("50") * fees.outcome_taker_rate
+        );
+        assert_eq!(confirmed.profit, confirmed.expected_revenue - total_cost);
+        assert_eq!(
+            confirmed.roi,
+            exact::project_down(&(exact::rational(confirmed.profit) / exact::rational(total_cost)))
+                .unwrap()
+        );
+        // APR 由展示成本的精确比值独立向下投影，不复用已经舍入的 ROI。
+        assert_eq!(
+            confirmed.apr,
+            exact::project_down(
+                &(exact::rational(confirmed.profit) / exact::rational(total_cost)
+                    * exact::rational(d("365"))
+                    / exact::rational(d("30")))
+            )
+            .unwrap()
+        );
+        for (actual, before) in [
+            (&confirmed.pm, &original.pm),
+            (&confirmed.outcome, &original.outcome),
+        ] {
+            assert_eq!(actual.platform, before.platform);
+            assert_eq!(actual.token_id, before.token_id);
+            assert_eq!(actual.label, before.label);
+            assert_eq!(actual.shares, before.shares);
+            assert_eq!(actual.cap_price, before.cap_price);
+        }
+        assert_eq!(original.pm.cost, d("19.75"));
+    }
+}
+
+#[test]
+fn confirm_plan_checks_original_cap_against_current_tick_without_realigning() {
+    let now = Instant::now();
+    let mut books = BookStore::default();
+    snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+    let mut first = plan_with(&books, &limits("1", "100"));
+    first.pm.cap_price = d("0.451");
+    let mut pm = books.get(POLYMARKET, "pm-yes").unwrap().clone();
+    let out = books.get(OUTCOME, "#10").unwrap();
+    pm.tick_size = Some(d("0.001"));
+    let confirmed = confirm_plan(
+        &sample_topic(),
+        &first,
+        &pm,
+        out,
+        &fees_zero(),
+        &limits("1", "100"),
+    )
+    .unwrap();
+    assert_eq!(confirmed.pm.cap_price, d("0.451"));
+    pm.tick_size = Some(d("0.01"));
+    assert_eq!(
+        confirm_plan_reason(
+            &sample_topic(),
+            &first,
+            &pm,
+            out,
+            &fees_zero(),
+            &limits("1", "100")
+        ),
+        "pm_unfillable"
+    );
+    for tick in [None, Some(Decimal::ZERO), Some(d("-0.01")), Some(d("1.01"))] {
+        pm.tick_size = tick;
+        assert!(confirm_plan(
+            &sample_topic(),
+            &first,
+            &pm,
+            out,
+            &fees_zero(),
+            &limits("1", "100")
+        )
+        .is_none());
+    }
+    pm.tick_size = Some(d("0.01"));
+    for cap in [d("0"), d("0.001"), d("0.995"), d("1")] {
+        first.pm.cap_price = cap;
+        assert!(confirm_plan(
+            &sample_topic(),
+            &first,
+            &pm,
+            out,
+            &fees_zero(),
+            &limits("1", "100")
+        )
+        .is_none());
+    }
+}
+
+#[test]
+fn confirm_plan_preserves_financial_and_identity_rejections() {
+    let now = Instant::now();
+    let mut books = BookStore::default();
+    snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+    let first = plan_with(&books, &limits("1", "100"));
+    let pm = books.get(POLYMARKET, "pm-yes").unwrap();
+    let out = books.get(OUTCOME, "#10").unwrap();
+    for (bounds, expected) in [
+        (limits("1", "39.99"), "cost_limit"),
+        (limits("10.01", "100"), "unprofitable"),
+        (
+            ArbLimits {
+                min_apr: d("0.26"),
+                days: 365,
+                ..limits("1", "100")
+            },
+            "unprofitable",
+        ),
+    ] {
+        assert_eq!(
+            confirm_plan_reason(&sample_topic(), &first, pm, out, &fees_zero(), &bounds),
+            expected
+        );
+    }
+    let mut wrong = first.clone();
+    wrong.pm.token_id = "other".into();
+    assert_eq!(
+        confirm_plan_reason(
+            &sample_topic(),
+            &wrong,
+            pm,
+            out,
+            &fees_zero(),
+            &limits("1", "100")
+        ),
+        "token_mismatch"
+    );
+    wrong = first.clone();
+    wrong.pm.label = "unknown".into();
+    assert_eq!(
+        confirm_plan_reason(
+            &sample_topic(),
+            &wrong,
+            pm,
+            out,
+            &fees_zero(),
+            &limits("1", "100")
+        ),
+        "missing_book"
+    );
+    let mut thin = out.clone();
+    thin.asks = levels(&[("0.40", "49")]);
+    assert_eq!(
+        confirm_plan_reason(
+            &sample_topic(),
+            &first,
+            pm,
+            &thin,
+            &fees_zero(),
+            &limits("1", "100")
+        ),
+        "out_unfillable"
+    );
+    thin.asks = levels(&[("0.41", "50")]);
+    assert_eq!(
+        confirm_plan_reason(
+            &sample_topic(),
+            &first,
+            pm,
+            &thin,
+            &fees_zero(),
+            &limits("1", "100")
+        ),
+        "out_unfillable"
+    );
+    let mut cheap = pm.clone();
+    cheap.asks = levels(&[("0.01", "50")]);
+    assert_eq!(
+        confirm_plan_reason(
+            &sample_topic(),
+            &first,
+            &cheap,
+            out,
+            &fees_zero(),
+            &limits("1", "100")
+        ),
+        "venue_min"
+    );
+}
+
+#[test]
+fn confirm_plan_rejects_when_http_worse_than_cap() {
+    let mut books = BookStore::default();
+    let now = Instant::now();
+    snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+    let first = plan_with(&books, &limits("3", "100"));
+    let mut http = BookStore::default();
+    snapshot(&mut http, POLYMARKET, "pm-yes", vec![("0.42", "80")], now);
+    snapshot(&mut http, OUTCOME, "#10", vec![("0.42", "80")], now);
+    assert!(confirm_plan(
+        &sample_topic(),
+        &first,
+        http.get(POLYMARKET, "pm-yes").unwrap(),
+        http.get(OUTCOME, "#10").unwrap(),
+        &fees_zero(),
+        &limits("3", "100"),
+    )
+    .is_none());
+    assert_eq!(
+        confirm_plan_reason(
+            &sample_topic(),
+            &first,
+            http.get(POLYMARKET, "pm-yes").unwrap(),
+            http.get(OUTCOME, "#10").unwrap(),
+            &fees_zero(),
+            &limits("3", "100"),
+        ),
+        "pm_unfillable"
+    );
+}
+
+#[test]
+fn confirm_plan_rejects_when_http_depth_thin() {
+    let mut books = BookStore::default();
+    let now = Instant::now();
+    snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+    let first = plan_with(&books, &limits("3", "100"));
+    let mut http = BookStore::default();
+    snapshot(&mut http, POLYMARKET, "pm-yes", vec![("0.40", "10")], now);
+    snapshot(&mut http, OUTCOME, "#10", vec![("0.40", "10")], now);
+    assert_eq!(
+        confirm_plan_reason(
+            &sample_topic(),
+            &first,
+            http.get(POLYMARKET, "pm-yes").unwrap(),
+            http.get(OUTCOME, "#10").unwrap(),
+            &fees_zero(),
+            &limits("3", "100"),
+        ),
+        "pm_unfillable"
+    );
+}
+
+#[test]
+fn first_usable_ask_skips_zero_and_picks_cheapest() {
+    let asks = vec![
+        Level {
+            price: d("0.90"),
+            size: d("10"),
+        },
+        Level {
+            price: d("0.40"),
+            size: d("0"),
+        },
+        Level {
+            price: d("0.44"),
+            size: d("8"),
+        },
+    ];
+    assert_eq!(first_usable_ask(&asks, false), Some((d("0.44"), d("8"))));
+    assert_eq!(
+        first_usable_ask(
+            &[Level {
+                price: d("0.40"),
+                size: d("0.9"),
+            }],
+            true
+        ),
+        None
+    );
+    assert_eq!(
+        first_usable_ask(
+            &[Level {
+                price: d("0.40"),
+                size: d("1.9"),
+            }],
+            true
+        ),
+        Some((d("0.40"), d("1")))
+    );
+}
+
+#[test]
+fn confirm_plan_reads_cheapest_ask_when_unsorted() {
+    let mut books = BookStore::default();
+    let now = Instant::now();
+    snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.40", "50")], now);
+    snapshot(&mut books, OUTCOME, "#10", vec![("0.40", "50")], now);
+    let first = plan_with(&books, &limits("3", "100"));
+    let pm = OrderBook {
+        platform: POLYMARKET.to_string(),
+        token_id: "pm-yes".into(),
+        bids: vec![],
+        asks: vec![
+            Level {
+                price: d("0.90"),
+                size: d("50"),
+            },
+            Level {
+                price: d("0.40"),
+                size: d("50"),
+            },
+        ],
+        exchange_ts_ms: 1,
+        received_at: now,
+        stale: false,
+        tick_size: Some(d("0.01")),
+    };
+    let out = OrderBook {
+        platform: OUTCOME.to_string(),
+        token_id: "#10".into(),
+        bids: vec![],
+        asks: vec![Level {
+            price: d("0.40"),
+            size: d("50"),
+        }],
+        exchange_ts_ms: 1,
+        received_at: now,
+        stale: false,
+        tick_size: None,
+    };
+    let confirmed = confirm_plan(
+        &sample_topic(),
+        &first,
+        &pm,
+        &out,
+        &fees_zero(),
+        &limits("3", "100"),
+    )
+    .expect("cheap ask still fillable");
+    assert_eq!(confirmed.pm.shares, first.pm.shares);
+    assert_eq!(confirmed.pm.cap_price, first.pm.cap_price);
+    assert_eq!(confirmed.pm.avg_price, first.pm.avg_price);
+}
+
+#[test]
+fn diagnose_books_reports_venue_min_when_http_size_thin() {
+    let now = Instant::now();
+    let mut http = BookStore::default();
+    snapshot(&mut http, POLYMARKET, "pm-yes", vec![("0.40", "2")], now);
+    snapshot(&mut http, OUTCOME, "#10", vec![("0.40", "2")], now);
+    http.mark_platform_stale(POLYMARKET);
+    http.mark_platform_stale(OUTCOME);
+    let sample = diagnose_books(
+        &sample_topic(),
+        http.get(POLYMARKET, "pm-yes").unwrap(),
+        http.get(OUTCOME, "#10").unwrap(),
+        &fees_zero(),
+        &limits("0.1", "100"),
+        "yes",
+        "no",
+    );
+    assert_eq!(sample.reason, "venue_min");
+    assert_eq!(sample.pm_ask, Some(d("0.40")));
+    assert_eq!(sample.pm_sz, Some(d("2")));
+    assert_eq!(sample.stale, None);
+}
+
+#[test]
+fn regression_order_75_rejects_plan_when_thin_depth_pushes_outcome_cap_above_break_even() {
+    let now = Instant::now();
+    let mut books = BookStore::default();
+    snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.95", "100")], now);
+    books.set_tick_size(POLYMARKET, "pm-yes", d("0.01"));
+    snapshot(
+        &mut books,
+        OUTCOME,
+        "#10",
+        vec![("0.03", "10"), ("0.06", "10")],
+        now,
+    );
+    let topic = sample_topic();
+    let pm = books.get(POLYMARKET, "pm-yes").unwrap();
+    let out = books.get(OUTCOME, "#10").unwrap();
+    let fees = FeeContext {
+        polymarket_fee_rate: d("0.05"),
+        outcome_taker_rate: d("0.001344"),
+        outcome_builder_rate: Decimal::ZERO,
+    };
+    let plan = plan_arbitrage(
+        &topic,
+        pm,
+        out,
+        &topic.tokens[0],
+        &topic.tokens[2],
+        &fees,
+        &limits("0.01", "100"),
+    );
+    if let Some(p) = plan {
+        assert!(
+            p.outcome.cap_price <= d("0.046"),
+            "outcome cap 必须在保底安全线内，当前为 {}",
+            p.outcome.cap_price
+        );
+        assert!(
+            p.worst_profit >= Decimal::ZERO,
+            "最坏利润必须非负，当前为 {}",
+            p.worst_profit
+        );
+    }
+}
+
+#[test]
+fn accepts_plan_when_depth_within_safe_cap() {
+    let now = Instant::now();
+    let mut books = BookStore::default();
+    snapshot(&mut books, POLYMARKET, "pm-yes", vec![("0.95", "100")], now);
+    books.set_tick_size(POLYMARKET, "pm-yes", d("0.01"));
+    snapshot(
+        &mut books,
+        OUTCOME,
+        "#10",
+        vec![("0.03", "50"), ("0.04", "50")],
+        now,
+    );
+    let topic = sample_topic();
+    let pm = books.get(POLYMARKET, "pm-yes").unwrap();
+    let out = books.get(OUTCOME, "#10").unwrap();
+    let fees = FeeContext {
+        polymarket_fee_rate: d("0.05"),
+        outcome_taker_rate: d("0.001344"),
+        outcome_builder_rate: Decimal::ZERO,
+    };
+    let plan = plan_arbitrage(
+        &topic,
+        pm,
+        out,
+        &topic.tokens[0],
+        &topic.tokens[2],
+        &fees,
+        &limits("0.01", "100"),
+    )
+    .expect("安全价格必须生成 plan");
+    assert!(plan.worst_profit >= Decimal::ZERO);
+    assert!(plan.outcome.cap_price <= d("0.04"));
+}
