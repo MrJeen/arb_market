@@ -280,6 +280,7 @@ fn admission_test_config(base: &str) -> Config {
         app_postgres_uri: String::new(),
         enabled_platforms: [POLYMARKET.to_string(), OUTCOME.to_string()].into(),
         enable_arb: true,
+        stop_arb_before_end: false,
         enable_rebalance: false,
         enable_take_profit: false,
         take_profit_min_gain: Decimal::ZERO,
@@ -1183,6 +1184,22 @@ fn settlement_end_gate_uses_exact_time_and_queries_unknown_dates() {
         now
     ));
     assert!(settlement_check_due(None, now));
+}
+
+#[test]
+fn arb_entry_closes_inside_two_days_and_stays_open_without_end_date() {
+    let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+    let lead = chrono::TimeDelta::days(2);
+    assert!(arb_entry_closed(Some(now + lead), now));
+    assert!(!arb_entry_closed(
+        Some(now + lead + chrono::TimeDelta::seconds(1)),
+        now
+    ));
+    assert!(arb_entry_closed(
+        Some(now - chrono::TimeDelta::seconds(1)),
+        now
+    ));
+    assert!(!arb_entry_closed(None, now));
 }
 
 #[tokio::test]

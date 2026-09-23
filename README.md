@@ -28,6 +28,8 @@ cargo run --release
 
 自动交易由三个互相独立、默认关闭的执行开关控制：`ENABLE_ARB`（新套利）、`ENABLE_REBALANCE`（再平衡）、`ENABLE_TAKE_PROFIT`（止盈）。某项为 `false` 时仍扫描并计算对应机会，但不会 claim 生命周期动作、写入新订单/交易腿或提交真实交易；其他已开启流程不受影响。成交回填、结算处理也不受这些开关影响，显式人工入口 `place-test --confirm` 保持独立。旧 `ENABLE_TRADING`、`ENABLE_BUY`、`TAKE_PROFIT_ENABLED` 不再读取，升级时必须逐项配置。详见 `.env.example`。
 
+`STOP_ARB_BEFORE_END` 默认关闭。开启后，已知 `Topic.end_date` 且当前 UTC 时间达到结束前 48 小时（含刚好 48 小时和已经结束）时，该市场不再计算新套利 plan，也不做对应的费率准备。结束时间缺失时不套用该窗口。止盈、再平衡（含再平衡买入）、成交回填和结算不受影响。跳过次数记入每分钟 `minute stats` 的 `arb_skipped_before_end`；逐市场细节在 `market_arb::exec` DEBUG 的 `arb skipped before market end`。
+
 启动时会在业务初始化前自动执行嵌入二进制的数据库迁移，迁移失败不会进入业务流程。已应用的迁移文件不可原地修改；`0009_position_status_width.sql` 将 `position_status` 扩为 `VARCHAR(32)`，允许完整保存 `settlement_pending`。加宽 `varchar` 不重写表，但依赖该列的索引会重建、相关 CHECK 约束会重新校验，全程持 `ACCESS EXCLUSIVE` 锁，锁时长随 `arb_orders` 规模增长。部署时应为该锁预留窗口，并避免同时存在长事务。
 
 应用 0009 后，回退构建必须仍支持 pending 并嵌入相同内容的 0009；直接换回缺少该迁移的旧二进制会被 sqlx 版本校验拒绝。不要通过缩回列宽、删除迁移记录或绕过校验来回退。

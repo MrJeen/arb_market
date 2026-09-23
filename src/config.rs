@@ -45,6 +45,8 @@ pub struct Config {
     pub app_postgres_uri: String,
     pub enabled_platforms: HashSet<String>,
     pub enable_arb: bool,
+    /// 开启后，已知结束时间且距结束不足 48 小时时不再计算新套利。
+    pub stop_arb_before_end: bool,
     pub enable_rebalance: bool,
     pub enable_take_profit: bool,
     pub take_profit_min_gain: Decimal,
@@ -109,6 +111,7 @@ impl Config {
             app_postgres_uri: env_required("APP_POSTGRES_URI")?,
             enabled_platforms: enabled,
             enable_arb: env_bool("ENABLE_ARB", false),
+            stop_arb_before_end: env_bool("STOP_ARB_BEFORE_END", false),
             enable_rebalance: env_bool("ENABLE_REBALANCE", false),
             enable_take_profit: env_bool("ENABLE_TAKE_PROFIT", false),
             take_profit_min_gain: parse_nonnegative_decimal(

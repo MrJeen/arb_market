@@ -501,6 +501,19 @@ impl Engine {
             self.stats.no_topic();
             return Ok(());
         };
+        if self.cfg.stop_arb_before_end {
+            let checked_at = chrono::Utc::now();
+            if arb_entry_closed(topic.end_date, checked_at) {
+                self.stats.arb_skipped_before_end();
+                tracing::debug!(
+                    topic = %topic_key.as_str(),
+                    end_date = ?topic.end_date,
+                    %checked_at,
+                    "arb skipped before market end"
+                );
+                return Ok(());
+            }
+        }
         {
             let mut cooldowns = self.rebalance_loss_cooldown.lock().await;
             let now = Instant::now();
@@ -3581,6 +3594,14 @@ fn settlement_check_due(
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
     end_date.is_none_or(|end| now >= end)
+}
+
+/// 已知结束时间且当前已进入结束前 48 小时（含边界与已结束）时关闭新套利。
+fn arb_entry_closed(
+    end_date: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    end_date.is_some_and(|end| now >= end - chrono::TimeDelta::days(2))
 }
 
 fn settlement_only_scan(position_status: &str) -> bool {

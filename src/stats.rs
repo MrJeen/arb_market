@@ -121,6 +121,7 @@ minute_stats! {
     actuals_gate_blocked,
     submitted_pending_promoted,
     arb_disabled,
+    arb_skipped_before_end,
     rebalance_disabled,
     rebalance_loss_cooldown,
     take_profit_disabled,
