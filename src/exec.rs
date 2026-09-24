@@ -1362,7 +1362,7 @@ impl Engine {
             .store
             .stale_unknown_legs(self.cfg.unknown_leg_timeout)
             .await?;
-        // 超时不是零成交证据，这些腿留在 unknown 继续回填；告警按腿去重，避免每轮重复推送。
+        // 超时只告警。Outcome 缺单要等完整 userFills 覆盖后才收成失败；告警按腿去重。
         let newly_stale = self.take_unreported_stale_unknown(&timed_out).await;
         if !newly_stale.is_empty() {
             tracing::error!(
@@ -1443,6 +1443,7 @@ impl Engine {
         };
         let poll = self.outcome.poll_order(selector, &leg.token_id).await?;
         if !poll.found {
+            self.reconcile_missing_outcome_order(leg).await?;
             return Ok(());
         }
         let Some(current) = self
@@ -1480,6 +1481,90 @@ impl Engine {
             )
             .await?;
         self.apply_fill_page(&current, poll, page).await
+    }
+
+    /// `orderStatus` 查不到时，满 `unknown_leg_timeout` 后用完整 `userFills` 覆盖证明缺单。
+    /// 扫到本腿 cloid 或历史覆盖未完成时保持 `unknown`。
+    async fn reconcile_missing_outcome_order(&self, leg: &crate::store::LegRow) -> Result<()> {
+        if leg.platform != OUTCOME || leg.status != "unknown" {
+            return Ok(());
+        }
+        let Some(cloid) = leg.client_order_id.as_deref() else {
+            return Ok(());
+        };
+        let Some(submitted) = leg.submitted_at else {
+            return Ok(());
+        };
+        let timeout = chrono::Duration::from_std(self.cfg.unknown_leg_timeout)
+            .unwrap_or(chrono::Duration::MAX);
+        if chrono::Utc::now() < submitted + timeout {
+            return Ok(());
+        }
+        let deadline_ms = u64::try_from(
+            submitted
+                .timestamp_millis()
+                .saturating_add(self.cfg.unknown_leg_timeout.as_millis() as i64)
+                .max(0),
+        )
+        .unwrap_or(u64::MAX);
+        let progress = leg
+            .last_order_info
+            .as_ref()
+            .and_then(|info| info.get("fill_progress"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let page = self
+            .outcome
+            .poll_fill_page_after_terminal(
+                &leg.token_id,
+                submitted.timestamp_millis().saturating_sub(30_000).max(0),
+                &progress,
+                Some(deadline_ms),
+            )
+            .await?;
+        let matched = page
+            .fills
+            .iter()
+            .any(|fill| fill.matches(None, Some(cloid)));
+        if matched {
+            tracing::error!(
+                leg_id = leg.id,
+                order_id = leg.order_id,
+                "outcome fill matched cloid without order status; leg stays unknown"
+            );
+            self.store
+                .save_outcome_absence_progress(
+                    leg,
+                    &page.progress,
+                    "outcome_fill_found_without_order",
+                )
+                .await?;
+            return Ok(());
+        }
+        let scan: crate::platforms::outcome::FillProgress =
+            serde_json::from_value(page.progress.clone())?;
+        if scan.has_coverage() {
+            let failed = self
+                .store
+                .fail_absent_outcome_leg(
+                    &|wallet, token| self.outcome.latest_actuals_fee(wallet, token),
+                    leg,
+                    &page.progress,
+                )
+                .await?;
+            if failed {
+                tracing::info!(
+                    leg_id = leg.id,
+                    order_id = leg.order_id,
+                    "outcome order absent from user fills after timeout; leg failed"
+                );
+            }
+            return Ok(());
+        }
+        self.store
+            .save_outcome_absence_progress(leg, &page.progress, "outcome_fill_history_incomplete")
+            .await?;
+        Ok(())
     }
 
     async fn pm_reconciliation_fee_snapshot(&self, leg: &crate::store::LegRow) -> Result<Value> {

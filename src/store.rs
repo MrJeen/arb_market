@@ -885,6 +885,89 @@ impl Store {
         Ok(())
     }
 
+    /// 缺单扫描的分页进度。不改腿状态，也不把未完成的历史当成零成交。
+    pub async fn save_outcome_absence_progress(
+        &self,
+        leg: &LegRow,
+        progress: &Value,
+        reason: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let (_, parent_open) = lock_leg_parent(&mut tx, leg.id).await?;
+        let current = read_locked_leg(&mut tx, leg.id).await?;
+        if !parent_open
+            || current.status != "unknown"
+            || current.platform != OUTCOME
+            || current.updated_at != leg.updated_at
+            || current.third_order_id.is_some()
+        {
+            tx.rollback().await?;
+            return Ok(());
+        }
+        let mut info = current
+            .last_order_info
+            .unwrap_or_else(|| serde_json::json!({}));
+        info["fill_progress"] = progress.clone();
+        info["waiting_reason"] = serde_json::json!(reason);
+        sqlx::query("UPDATE legs SET last_order_info=$2,updated_at=clock_timestamp() WHERE id=$1")
+            .bind(leg.id)
+            .bind(info)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 超时后完整 `userFills` 覆盖里没有本腿 cloid，才把 `unknown` 收成零成交失败。
+    pub async fn fail_absent_outcome_leg(
+        &self,
+        resolver: &actuals::FeeResolver<'_>,
+        leg: &LegRow,
+        progress: &Value,
+    ) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let (parent_id, parent_open) = lock_leg_parent(&mut tx, leg.id).await?;
+        let current = read_locked_leg(&mut tx, leg.id).await?;
+        let has_fill: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM fills WHERE leg_id=$1)")
+                .bind(leg.id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !parent_open
+            || current.status != "unknown"
+            || current.platform != OUTCOME
+            || current.updated_at != leg.updated_at
+            || current.third_order_id.is_some()
+            || current.client_order_id.is_none()
+            || has_fill
+        {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let mut info = current
+            .last_order_info
+            .unwrap_or_else(|| serde_json::json!({}));
+        info["fill_progress"] = progress.clone();
+        info["waiting_reason"] = Value::Null;
+        info["reason"] = serde_json::json!("outcome_fill_absent_after_timeout");
+        let changed = sqlx::query(
+            "UPDATE legs SET status='failed', actual_shares=0, actual_price=0, actual_fee=0,
+             last_order_info=$2, updated_at=clock_timestamp()
+             WHERE id=$1 AND status='unknown'",
+        )
+        .bind(leg.id)
+        .bind(info)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        if changed {
+            refresh_parent_in_tx(&mut tx, parent_id, resolver, true).await?;
+        }
+        tx.commit().await?;
+        Ok(changed)
+    }
+
     /// 只恢复本页实际出现的同腿成交，不能用缓存补造扫描覆盖；末端事务仍须重新校验。
     pub async fn reconciliation_observations(
         &self,
