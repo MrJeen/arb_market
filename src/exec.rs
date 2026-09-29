@@ -1192,7 +1192,16 @@ impl Engine {
             match self.pm.balance(&current).await {
                 Ok(bal) if plan.pm_balance_sufficient(bal) => return Ok((current, bal)),
                 Ok(bal) => {
-                    tracing::warn!(funder = %current, %bal, %required, "polymarket balance low")
+                    tracing::warn!(funder = %current, %bal, %required, "polymarket balance low");
+                    if let Some(notify) = &self.notify {
+                        notify.publish_balance_insufficient(
+                            &self.polymarket_platform_label(&current),
+                            &format!("{POLYMARKET}:{}", current.to_ascii_lowercase()),
+                            bal,
+                            required,
+                            &format!("arb funder={current}"),
+                        );
+                    }
                 }
                 Err(err) => tracing::warn!(funder = %current, error = %err, "balance check failed"),
             }
@@ -1213,7 +1222,7 @@ impl Engine {
         context: &str,
     ) {
         if let Some(notify) = &self.notify {
-            notify.publish_balance_insufficient(platform, balance, required, context);
+            notify.publish_balance_insufficient(platform, platform, balance, required, context);
         }
     }
 

@@ -205,6 +205,53 @@ fn balance_insufficient_notice_contains_amounts_and_context() {
 }
 
 #[test]
+fn balance_alert_cools_down_per_platform_or_account_for_one_hour() {
+    let start = Instant::now();
+    let mut alerts = HashMap::new();
+    assert!(should_publish_balance_alert(&mut alerts, "outcome", start));
+    assert!(!should_publish_balance_alert(
+        &mut alerts,
+        "outcome",
+        start + Duration::from_secs(60)
+    ));
+    assert!(!should_publish_balance_alert(
+        &mut alerts,
+        "outcome",
+        start + BALANCE_ALERT_COOLDOWN - Duration::from_nanos(1)
+    ));
+    assert!(should_publish_balance_alert(
+        &mut alerts,
+        "polymarket:account-a",
+        start
+    ));
+    assert!(should_publish_balance_alert(
+        &mut alerts,
+        "polymarket:account-b",
+        start + Duration::from_secs(1)
+    ));
+    assert!(!should_publish_balance_alert(
+        &mut alerts,
+        "polymarket:account-a",
+        start + Duration::from_secs(2)
+    ));
+    assert!(should_publish_balance_alert(
+        &mut alerts,
+        "outcome",
+        start + BALANCE_ALERT_COOLDOWN
+    ));
+    assert!(!should_publish_balance_alert(
+        &mut alerts,
+        "outcome",
+        start + BALANCE_ALERT_COOLDOWN + Duration::from_secs(1)
+    ));
+    assert!(should_publish_balance_alert(
+        &mut HashMap::new(),
+        "outcome",
+        start + Duration::from_secs(1)
+    ));
+}
+
+#[test]
 fn unknown_timeout_notice_lists_legs() {
     let text = format_unknown_timeout_notice(
         "【market-arb】",

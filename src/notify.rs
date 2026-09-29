@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const BALANCE_ALERT_COOLDOWN: Duration = Duration::from_secs(60);
+const BALANCE_ALERT_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone)]
 pub struct NatsNotifier {
@@ -313,6 +313,19 @@ pub async fn connect(cfg: &Config) -> Option<NatsNotifier> {
     }
 }
 
+fn should_publish_balance_alert(
+    alerts: &mut HashMap<String, Instant>,
+    key: &str,
+    now: Instant,
+) -> bool {
+    alerts.retain(|_, sent_at| now.saturating_duration_since(*sent_at) < BALANCE_ALERT_COOLDOWN);
+    if alerts.contains_key(key) {
+        return false;
+    }
+    alerts.insert(key.to_owned(), now);
+    true
+}
+
 impl NatsNotifier {
     pub fn publish_place(&self, notice: PlaceNotice) {
         self.publish(format_place_notice(&self.tag, &notice));
@@ -351,31 +364,18 @@ impl NatsNotifier {
     pub fn publish_balance_insufficient(
         &self,
         platform: &str,
+        cooldown_key: &str,
         balance: Decimal,
         required: Decimal,
         context: &str,
     ) {
-        let key = format!("{platform}:{context}");
         let now = Instant::now();
         let should_publish = {
             let mut alerts = self
                 .balance_alerts
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            alerts.retain(|_, sent_at| {
-                now.saturating_duration_since(*sent_at) < BALANCE_ALERT_COOLDOWN
-            });
-            match alerts.get(&key) {
-                Some(sent_at)
-                    if now.saturating_duration_since(*sent_at) < BALANCE_ALERT_COOLDOWN =>
-                {
-                    false
-                }
-                _ => {
-                    alerts.insert(key, now);
-                    true
-                }
-            }
+            should_publish_balance_alert(&mut alerts, cooldown_key, now)
         };
         if should_publish {
             self.publish(format_balance_insufficient_notice(
