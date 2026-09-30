@@ -2142,6 +2142,138 @@ impl Store {
         tx.commit().await?;
         Ok(projection)
     }
+
+    /// 已成交持仓直接落成 completed 订单，供止盈和再平衡扫描。不创建在途腿。
+    pub async fn insert_completed_backfill(
+        &self,
+        event_id: Uuid,
+        orders: &[CompletedBackfillOrder],
+    ) -> Result<Vec<i64>> {
+        if orders.is_empty() {
+            return Err(Error::msg("backfill has no orders"));
+        }
+        let mut tx = self.pool.begin().await?;
+        settlement_fees::lock_writes(&mut tx).await?;
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM arb_orders WHERE event_id=$1)")
+                .bind(event_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if exists {
+            tx.rollback().await?;
+            return Err(Error::msg(
+                "event already has arb orders; refuse to backfill twice",
+            ));
+        }
+        let mut ids = Vec::with_capacity(orders.len());
+        for order in orders {
+            if order.event_id != event_id {
+                tx.rollback().await?;
+                return Err(Error::msg("backfill order event does not match"));
+            }
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO arb_orders (
+                    event_id, unified_index, title, market_title, end_date,
+                    estimated_rev, estimated_profit, estimated_cost, fills, status,
+                    rebalance_status, position_status, actual_cost, actual_rev, actual_profit,
+                    completed_at
+                 ) VALUES (
+                    $1,$2,$3,$4,$5,0,0,$6,$7,'completed','pending','watching',0,0,0,NOW()
+                 ) RETURNING id",
+            )
+            .bind(order.event_id)
+            .bind(order.unified_index)
+            .bind(&order.title)
+            .bind(&order.market_title)
+            .bind(order.end_date)
+            .bind(order.estimated_cost)
+            .bind(&order.fills)
+            .fetch_one(&mut *tx)
+            .await?;
+            for (platform, market_id) in [
+                ("polymarket", order.condition_id.as_str()),
+                ("outcome", order.option_id.as_str()),
+            ] {
+                sqlx::query(
+                    "INSERT INTO arb_order_market_identities (order_id, platform, market_id)
+                     VALUES ($1,$2,$3)",
+                )
+                .bind(id)
+                .bind(platform)
+                .bind(market_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            for leg in &order.legs {
+                sqlx::query(
+                    "INSERT INTO legs (
+                        order_id, platform, token_id, label, side, intent,
+                        funder_address, wallet_address, service,
+                        req_price, req_shares, req_fee,
+                        actual_price, actual_shares, actual_fee,
+                        client_order_id, status, submitted_at, last_order_info
+                     ) VALUES (
+                        $1,$2,$3,$4,'BUY','arb_buy',$5,$6,$7,$8,$9,$10,$8,$9,$10,$11,'matched',$12,$13
+                     )",
+                )
+                .bind(id)
+                .bind(&leg.platform)
+                .bind(&leg.token_id)
+                .bind(&leg.label)
+                .bind(&leg.funder)
+                .bind(&leg.wallet)
+                .bind(&leg.service)
+                .bind(leg.price)
+                .bind(leg.shares)
+                .bind(leg.fee)
+                .bind(&leg.client_order_id)
+                .bind(leg.submitted_at)
+                .bind(&leg.last_order_info)
+                .execute(&mut *tx)
+                .await?;
+            }
+            let projection = project_in_tx_with_fallback(&mut tx, id, &|_, _| None).await?;
+            if let actuals::Projection::Unknown { reason } = projection {
+                tx.rollback().await?;
+                return Err(Error::msg(format!(
+                    "backfill order {id} actuals projection unknown: {reason}"
+                )));
+            }
+            ids.push(id);
+        }
+        tx.commit().await?;
+        Ok(ids)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompletedBackfillOrder {
+    pub event_id: Uuid,
+    pub unified_index: i32,
+    pub title: String,
+    pub market_title: String,
+    pub end_date: Option<chrono::DateTime<chrono::Utc>>,
+    pub estimated_cost: Decimal,
+    pub fills: Value,
+    pub condition_id: String,
+    pub option_id: String,
+    pub legs: Vec<CompletedBackfillLeg>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompletedBackfillLeg {
+    pub platform: String,
+    pub token_id: String,
+    pub label: String,
+    pub funder: Option<String>,
+    pub wallet: Option<String>,
+    pub service: Option<String>,
+    pub price: Decimal,
+    pub shares: Decimal,
+    pub fee: Decimal,
+    pub client_order_id: String,
+    pub submitted_at: chrono::DateTime<chrono::Utc>,
+    pub last_order_info: Option<Value>,
 }
 
 fn leg_open(status: &str) -> bool {

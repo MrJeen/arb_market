@@ -31,8 +31,18 @@ use rust_decimal::Decimal;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+/// 这场英超的持仓由回填订单接管。只跳过新套利计算，止盈和再平衡仍扫描已完成订单。
+pub fn arb_calc_excluded(event_id: Uuid) -> bool {
+    static EXCLUDED: LazyLock<Uuid> = LazyLock::new(|| {
+        Uuid::parse_str("019f2452-6b31-7c38-8c53-4d5867edd46d")
+            .expect("backfill event id is a valid uuid")
+    });
+    event_id == *EXCLUDED
+}
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 pub struct Engine {
@@ -501,6 +511,13 @@ impl Engine {
             self.stats.no_topic();
             return Ok(());
         };
+        if arb_calc_excluded(topic_key.event_id) {
+            tracing::debug!(
+                topic = %topic_key.as_str(),
+                "arb calculation excluded for backfilled event"
+            );
+            return Ok(());
+        }
         if self.cfg.stop_arb_before_end {
             let checked_at = chrono::Utc::now();
             if arb_entry_closed(topic.end_date, checked_at) {

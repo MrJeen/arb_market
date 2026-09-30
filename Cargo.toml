@@ -20,6 +20,10 @@ path = "src/bin/place_test.rs"
 name = "settlement-audit"
 path = "src/bin/settlement_audit.rs"
 
+[[bin]]
+name = "backfill-arb"
+path = "src/bin/backfill_arb.rs"
+
 [dependencies]
 alloy-primitives = { version = "1.0", features = ["serde"] }
 alloy-signer = "1.0"
@@ -38,15 +42,37 @@ num-bigint = "0.4"
 num-rational = "0.4"
 num-traits = "0.2"
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
 rmp = "0.8"
 rust_decimal = { version = "1.36", features = ["serde-with-str"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
+serde_json = { version = "1", features = [
+    "preserve_order",
+    "arbitrary_precision",
+] }
 sha2 = "0.10"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "migrate", "chrono", "uuid", "rust_decimal", "json"] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "macros",
+    "migrate",
+    "chrono",
+    "uuid",
+    "rust_decimal",
+    "json",
+] }
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net"] }
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+    "net",
+] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
