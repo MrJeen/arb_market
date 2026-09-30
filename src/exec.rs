@@ -38,7 +38,7 @@ use uuid::Uuid;
 /// 这场英超的持仓由回填订单接管。只跳过新套利计算，止盈和再平衡仍扫描已完成订单。
 pub fn arb_calc_excluded(event_id: Uuid) -> bool {
     static EXCLUDED: LazyLock<Uuid> = LazyLock::new(|| {
-        Uuid::parse_str("019f2452-6b31-7c38-8c53-4d5867edd46d")
+        Uuid::parse_str("fbdc6148-7ac8-44fa-8146-5e4556b81691")
             .expect("backfill event id is a valid uuid")
     });
     event_id == *EXCLUDED
